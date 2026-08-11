@@ -26,6 +26,15 @@ pub enum Error {
     ///
     /// [`Strictness::Strict`]: crate::Strictness::Strict
     EmbeddedNul,
+    /// A boolean or optional-data discriminant was neither 0 nor 1. RFC 4506
+    /// §4.4 defines `bool` as `enum { FALSE = 0, TRUE = 1 }`, and §4.3 makes
+    /// any other value an error. [`Strictness::Strict`] only.
+    ///
+    /// [`Strictness::Strict`]: crate::Strictness::Strict
+    InvalidBool {
+        /// The value found on the wire.
+        value: u32,
+    },
     /// A decoded string was not valid UTF-8.
     Utf8,
     /// Input remained after a value was decoded by
@@ -52,6 +61,9 @@ impl fmt::Display for Error {
             Error::Range => f.write_str("value out of range for target type"),
             Error::NonZeroPadding => f.write_str("non-zero padding byte"),
             Error::EmbeddedNul => f.write_str("embedded NUL in string"),
+            Error::InvalidBool { value } => {
+                write!(f, "boolean discriminant {value} is neither 0 nor 1")
+            }
             Error::Utf8 => f.write_str("invalid UTF-8 in string"),
             Error::TrailingBytes { rest } => {
                 write!(f, "{rest} trailing byte(s) after value")
@@ -101,6 +113,7 @@ mod tests {
             (Error::Range, "out of range"),
             (Error::NonZeroPadding, "non-zero padding"),
             (Error::EmbeddedNul, "embedded NUL"),
+            (Error::InvalidBool { value: 2 }, "2 is neither 0 nor 1"),
             (Error::Utf8, "invalid UTF-8"),
             (Error::TrailingBytes { rest: 7 }, "7 trailing"),
             (Error::Unsupported("map"), "does not support map"),

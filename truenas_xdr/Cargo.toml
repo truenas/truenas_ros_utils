@@ -43,3 +43,14 @@ path = "tests/codec.rs"
 name = "derive"
 path = "tests/derive.rs"
 required-features = ["derive"]
+
+# Conformance to RFC 4506 section by section, including its worked example.
+[[test]]
+name = "rfc4506"
+path = "tests/rfc4506.rs"
+required-features = ["derive"]
+
+# Decoding that borrows from the input rather than copying.
+[[test]]
+name = "zero_copy"
+path = "tests/zero_copy.rs"

@@ -27,8 +27,9 @@
 //!
 //! Three shapes need more than a stock serde call:
 //!
-//! - Variable opaque (`opaque<>`) is [`VarOpaque`]. A bare `Vec<u8>` is a
-//!   sequence, so it would encode one 4-byte unit per byte.
+//! - Variable opaque (`opaque<>`) is [`VarOpaque`], or [`VarOpaqueRef`] to
+//!   borrow. A bare `Vec<u8>` or `&[u8]` is a serde sequence, so it would
+//!   encode one 4-byte unit per byte.
 //! - Fixed opaque (`opaque[N]`) is [`FixedOpaque`], which has no length prefix.
 //! - Enums and unions whose discriminants are not their declaration order need
 //!   [`XdrEnum`] or [`XdrUnion`]; a stock `#[derive(Serialize)]` enum encodes
@@ -38,6 +39,35 @@
 //!
 //! Maps have no XDR representation and are rejected as
 //! [`Error::Unsupported`], as are sequences whose length is not known up front.
+//!
+//! # Borrowing from the input
+//!
+//! Strings and opaque data are the only variable-length payloads, and both can
+//! decode as borrows of the input buffer rather than copies: `&str` for a
+//! string, [`VarOpaqueRef`] for opaque. In a struct they need serde's
+//! `#[serde(borrow)]`.
+//!
+//! ```
+//! # use serde::{Deserialize, Serialize};
+//! # use truenas_xdr::{from_bytes, to_bytes, VarOpaqueRef};
+//! #[derive(Serialize, Deserialize, PartialEq, Debug)]
+//! struct Record<'a> {
+//!     id: u32,
+//!     #[serde(borrow)]
+//!     name: &'a str,
+//!     #[serde(borrow)]
+//!     body: VarOpaqueRef<'a>,
+//! }
+//!
+//! let wire = to_bytes(&Record {
+//!     id: 1,
+//!     name: "example",
+//!     body: VarOpaqueRef(b"payload"),
+//! })?;
+//! let decoded: Record<'_> = from_bytes(&wire)?; // no allocation
+//! assert_eq!(decoded.name, "example");
+//! # Ok::<(), truenas_xdr::Error>(())
+//! ```
 //!
 //! # Decoding
 //!
@@ -58,7 +88,7 @@ mod wrappers;
 pub use de::Deserializer;
 pub use error::{Error, Result};
 pub use strict::Strictness;
-pub use wrappers::{FixedOpaque, VarOpaque};
+pub use wrappers::{FixedOpaque, VarOpaque, VarOpaqueRef};
 
 #[cfg(feature = "derive")]
 pub use truenas_xdr_derive::{XdrEnum, XdrUnion};

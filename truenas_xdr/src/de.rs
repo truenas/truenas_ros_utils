@@ -92,6 +92,21 @@ impl<'de> Deserializer<'de> {
         Ok(data)
     }
 
+    /// Read a boolean discriminant. RFC 4506 §4.4 defines `bool` as
+    /// `enum { FALSE = 0, TRUE = 1 }`, and §4.3 makes any other value an
+    /// error — enforced under [`Strictness::Strict`]; otherwise any non-zero
+    /// value is true.
+    fn read_bool(&mut self) -> Result<bool> {
+        match self.read_u32()? {
+            0 => Ok(false),
+            1 => Ok(true),
+            value if self.mode == Strictness::Strict => {
+                Err(Error::InvalidBool { value })
+            }
+            _ => Ok(true),
+        }
+    }
+
     fn read_str(&mut self) -> Result<&'de str> {
         let bytes = self.read_opaque()?;
         let s = std::str::from_utf8(bytes).map_err(|_| Error::Utf8)?;
@@ -126,7 +141,8 @@ impl<'de> serde::Deserializer<'de> for &mut Deserializer<'de> {
     }
 
     fn deserialize_bool<V: Visitor<'de>>(self, v: V) -> Result<V::Value> {
-        v.visit_bool(self.read_u32()? != 0)
+        let b = self.read_bool()?;
+        v.visit_bool(b)
     }
     fn deserialize_i8<V: Visitor<'de>>(self, v: V) -> Result<V::Value> {
         let w = self.read_u32()? as i32;
@@ -185,12 +201,12 @@ impl<'de> serde::Deserializer<'de> for &mut Deserializer<'de> {
     }
 
     fn deserialize_option<V: Visitor<'de>>(self, v: V) -> Result<V::Value> {
-        // Any non-zero discriminant means present, matching how encoders
-        // written against `bool` treat it.
-        if self.read_u32()? == 0 {
-            v.visit_none()
-        } else {
+        // RFC 4506 §4.19: optional-data is a union switching on a bool, so
+        // the discriminant is validated exactly as one.
+        if self.read_bool()? {
             v.visit_some(self)
+        } else {
+            v.visit_none()
         }
     }
 

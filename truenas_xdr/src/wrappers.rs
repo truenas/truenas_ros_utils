@@ -73,6 +73,84 @@ impl<'de> Deserialize<'de> for VarOpaque {
     }
 }
 
+/// Variable-length opaque borrowed from the input, the zero-copy counterpart
+/// of [`VarOpaque`].
+///
+/// Decoding yields a slice into the caller's buffer, so a large payload costs
+/// nothing to read. Use it for a field that is only inspected, and
+/// [`VarOpaque`] when the bytes must outlive the input.
+///
+/// A bare `&[u8]` will not do: serde encodes one as a sequence, four bytes per
+/// byte, while decoding one reads opaque — so a round trip through `&[u8]`
+/// does not agree with itself. This type encodes and decodes as opaque both
+/// ways.
+///
+/// ```
+/// # use truenas_xdr::{from_bytes, to_bytes, VarOpaqueRef};
+/// let wire = to_bytes(&VarOpaqueRef(&[1, 2, 3]))?;
+/// assert_eq!(wire, [0, 0, 0, 3, 1, 2, 3, 0]);
+///
+/// let decoded: VarOpaqueRef<'_> = from_bytes(&wire)?;
+/// assert_eq!(decoded.0, &[1, 2, 3]);
+/// // The slice points into `wire` rather than at a copy.
+/// assert!(std::ptr::eq(decoded.0.as_ptr(), wire[4..].as_ptr()));
+/// # Ok::<(), truenas_xdr::Error>(())
+/// ```
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct VarOpaqueRef<'a>(
+    /// The borrowed bytes, unpadded.
+    pub &'a [u8],
+);
+
+impl<'a> From<&'a [u8]> for VarOpaqueRef<'a> {
+    fn from(bytes: &'a [u8]) -> VarOpaqueRef<'a> {
+        VarOpaqueRef(bytes)
+    }
+}
+
+impl<'a> From<VarOpaqueRef<'a>> for &'a [u8] {
+    fn from(opaque: VarOpaqueRef<'a>) -> &'a [u8] {
+        opaque.0
+    }
+}
+
+impl AsRef<[u8]> for VarOpaqueRef<'_> {
+    fn as_ref(&self) -> &[u8] {
+        self.0
+    }
+}
+
+impl From<VarOpaqueRef<'_>> for VarOpaque {
+    fn from(opaque: VarOpaqueRef<'_>) -> VarOpaque {
+        VarOpaque(opaque.0.to_vec())
+    }
+}
+
+impl Serialize for VarOpaqueRef<'_> {
+    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_bytes(self.0)
+    }
+}
+
+impl<'de: 'a, 'a> Deserialize<'de> for VarOpaqueRef<'a> {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        struct V<'a>(std::marker::PhantomData<&'a ()>);
+        impl<'de: 'a, 'a> Visitor<'de> for V<'a> {
+            type Value = VarOpaqueRef<'a>;
+            fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                f.write_str("borrowed variable-length opaque bytes")
+            }
+            fn visit_borrowed_bytes<E: de::Error>(
+                self,
+                v: &'de [u8],
+            ) -> Result<VarOpaqueRef<'a>, E> {
+                Ok(VarOpaqueRef(v))
+            }
+        }
+        d.deserialize_bytes(V(std::marker::PhantomData))
+    }
+}
+
 /// Fixed-length opaque, RFC 4506 §4.9 (`opaque[N]`): exactly `N` bytes plus
 /// padding, with no length prefix.
 ///
