@@ -34,7 +34,7 @@
 #![allow(unsafe_code)]
 
 use crate::env::Env;
-use crate::error::{check, Error, Result};
+use crate::error::{Error, Result, check};
 use crate::ffi::*;
 use std::cell::RefCell;
 use std::os::raw::c_void;

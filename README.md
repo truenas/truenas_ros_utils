@@ -13,7 +13,7 @@ other. Depend on the one you want.
 
 ## Requirements
 
-- Rust 1.97 or newer
+- Rust 1.97.1 or newer (edition 2024)
 - `liblmdb-dev` to build `truenas_mdb`, `liblmdb0` to run it
 
 ## Testing

@@ -6,6 +6,9 @@
 //! These values are ABI, taken from `lmdb.h` in `liblmdb-dev` 0.9.31. Tests
 //! pin them, and `MdbCode`'s message table, against the linked library.
 #![allow(non_camel_case_types)]
+// The `unsafe extern` block below is itself an unsafe item, so this module
+// lifts the workspace's `deny(unsafe_code)` as the wrapper modules do.
+#![allow(unsafe_code)]
 
 use std::os::raw::{c_char, c_int, c_uint, c_void};
 
@@ -100,7 +103,9 @@ pub const MDB_NEXT: c_uint = 8;
 /// Position at the first key greater than or equal to the one supplied.
 pub const MDB_SET_RANGE: c_uint = 17;
 
-extern "C" {
+// Every declaration here is `unsafe` to call: raw pointers, no lifetimes, and
+// LMDB's own preconditions. The safe wrappers uphold those.
+unsafe extern "C" {
     pub fn mdb_version(
         major: *mut c_int,
         minor: *mut c_int,

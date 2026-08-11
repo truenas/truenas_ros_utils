@@ -17,7 +17,7 @@
 //!   thread or overlaps another on the same thread.
 #![allow(unsafe_code)]
 
-use crate::error::{check, Result};
+use crate::error::{Result, check};
 use crate::ffi::*;
 use std::collections::HashMap;
 use std::ffi::CString;

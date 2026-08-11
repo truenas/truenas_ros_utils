@@ -11,10 +11,10 @@
 #![allow(unsafe_code)]
 
 use crate::env::Env;
-use crate::error::{check, Error, MdbCode, Result};
+use crate::error::{Error, MdbCode, Result, check};
 use crate::ffi::*;
 use crate::iter::Iter;
-use crate::txn::{empty_val, val_of, CursorGuard, TxnGuard};
+use crate::txn::{CursorGuard, TxnGuard, empty_val, val_of};
 use std::ffi::CString;
 use std::ops::ControlFlow;
 use std::ptr;

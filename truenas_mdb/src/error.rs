@@ -421,8 +421,10 @@ mod tests {
         fn boxed(e: Error) -> Box<dyn error::Error> {
             Box::new(e)
         }
-        assert!(boxed(Error::Mdb(MdbCode::Panic))
-            .to_string()
-            .contains("MDB_PANIC"));
+        assert!(
+            boxed(Error::Mdb(MdbCode::Panic))
+                .to_string()
+                .contains("MDB_PANIC")
+        );
     }
 }

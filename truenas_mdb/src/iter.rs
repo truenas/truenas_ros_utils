@@ -12,7 +12,7 @@
 
 use crate::db::Db;
 use crate::error::Result;
-use crate::ffi::{MDB_dbi, MDB_FIRST, MDB_NEXT, MDB_SET_RANGE};
+use crate::ffi::{MDB_FIRST, MDB_NEXT, MDB_SET_RANGE, MDB_dbi};
 use crate::txn::{CursorGuard, TxnGuard};
 
 /// An iterator over a database's entries in key order, yielding owned
