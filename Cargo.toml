@@ -1,0 +1,30 @@
+# Cargo workspace for the `truenas_ros` satellite crates: pieces that belong
+# with it but cannot live inside it. `truenas_ros` depends only on `libc` and
+# `bitflags` and links no C; each crate here breaks exactly one of those rules
+# for a reason stated in its own manifest.
+#
+# Virtual workspace on purpose — there is no umbrella crate. A key/value store
+# and a wire codec share tooling, not an API, so consumers depend on the member
+# they actually want.
+[workspace]
+resolver = "2"
+members = [
+    "truenas_mdb",
+]
+
+[workspace.package]
+edition = "2021"
+license = "MIT"
+authors = ["iXsystems, Inc., dba TrueNAS <dev@truenas.com>"]
+repository = "https://github.com/truenas/truenas_ros_utils"
+rust-version = "1.97"
+
+# Lint policy shared by every member (each opts in with `lints.workspace =
+# true`). `unsafe_code` is `deny`, not `forbid`: `truenas_mdb` is an FFI
+# binding, so it lifts the deny per-module with `#![allow(unsafe_code)]` and a
+# `// SAFETY:` note on every block. `forbid` cannot be lifted at all, which is
+# right for a protocol crate and wrong for a binding.
+[workspace.lints.rust]
+unsafe_code = "deny"
+missing_docs = "warn"
+missing_debug_implementations = "warn"

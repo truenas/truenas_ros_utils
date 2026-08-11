@@ -1,0 +1,47 @@
+# `truenas_mdb` — bindings to the **system** LMDB (`liblmdb`): a refcounted
+# per-path environment pool and a flat, raw-bytes key/value op-set.
+#
+# The library is deliberately not vendored. LMDB's correctness rests on exactly
+# one copy of it mediating an environment, and these databases are shared with
+# Python (`python3-lmdb`) and C (`truenas_zfsrewrited`) processes that link
+# `liblmdb0`. A statically vendored copy in the same address space would be a
+# second one. Build needs `liblmdb-dev`; runtime needs `liblmdb0`.
+[package]
+name = "truenas_mdb"
+version = "0.1.0"
+description = "Bindings to the system LMDB: a pooled environment and a raw-bytes key/value store"
+categories = ["database", "api-bindings"]
+keywords = ["lmdb", "mdb", "database", "truenas"]
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+# The C ABI: MDB_val's layout, mode_t, and the raw error numbers LMDB passes
+# through from syscalls. No bindgen — the declarations are hand-written in
+# src/ffi.rs, so no libclang and nothing generated at build time.
+libc = "0.2.155"
+# Typed flag sets for the env-open and put flags, matching truenas_ros.
+bitflags = "2.6"
+
+[dev-dependencies]
+tempfile = "3"
+
+[lints]
+workspace = true
+
+# Behavioral tests: the environment pool, the op-set, and the error mapping.
+# Need liblmdb at link time (like the library) but nothing else.
+[[test]]
+name = "mdb"
+path = "tests/mdb.rs"
+
+# Cross-implementation tests against Python's `lmdb` module over one shared
+# environment — the suite that justifies linking the system library rather than
+# vendoring it. Skips automatically when python3 or its lmdb module is missing;
+# set TRUENAS_MDB_REQUIRE_PYTHON=1 (as CI does) to make that a hard failure.
+[[test]]
+name = "python_interop"
+path = "tests/python_interop.rs"

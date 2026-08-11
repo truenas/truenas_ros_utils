@@ -1,0 +1,64 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [ main, master ]
+
+concurrency:
+  group: ci-${{ github.head_ref || github.ref_name }}
+  cancel-in-progress: true
+
+# Some failures only ever reproduce on the runner, and a bare `panicked at
+# file:line` with no frames is not enough to chase one from a log.
+env:
+  RUST_BACKTRACE: "1"
+
+jobs:
+  check:
+    name: fmt + clippy + test
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+
+    # liblmdb-dev links the crate; python3-lmdb is the other implementation the
+    # interop suite tests against. It must be the distro package: it links the
+    # system liblmdb0, which is the whole point. `pip install lmdb` bundles its
+    # own LMDB and would make that suite prove nothing.
+    - name: Install LMDB
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y --no-install-recommends liblmdb-dev python3-lmdb
+        python3 -c "import lmdb; print('py-lmdb', lmdb.__version__, 'liblmdb', lmdb.version())"
+
+    - name: Install Rust toolchain
+      run: |
+        rustup toolchain install stable --profile minimal
+        rustup component add clippy rustfmt
+        rustup default stable
+
+    - name: Cache cargo
+      uses: actions/cache@v4
+      with:
+        path: |
+          ~/.cargo/registry
+          ~/.cargo/git
+          target
+        key: cargo-${{ runner.os }}-${{ hashFiles('**/Cargo.toml') }}
+
+    - name: rustfmt
+      run: cargo fmt --all --check
+
+    - name: clippy
+      run: cargo clippy --workspace --all-targets -- -D warnings
+
+    # The interop suite skips itself when python3-lmdb is missing. We do NOT
+    # want that to pass silently as green — the step above guarantees it is
+    # present, so require it and let a skip be a failure.
+    - name: test
+      run: cargo test --workspace
+      env:
+        TRUENAS_MDB_REQUIRE_PYTHON: "1"
+
+    - name: docs
+      run: cargo doc --workspace --no-deps

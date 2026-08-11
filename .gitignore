@@ -1,0 +1,4 @@
+# Cargo build artifacts
+/target
+
+# Cargo.lock is committed (this workspace ships a binary-relevant CI); keep it.
