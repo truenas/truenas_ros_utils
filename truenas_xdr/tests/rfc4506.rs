@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 //! Conformance to RFC 4506 (STD 67), section by section.
 //!
 //! Each test names the section it comes from and asserts the encoding the

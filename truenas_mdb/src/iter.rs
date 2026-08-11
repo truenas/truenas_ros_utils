@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 //! [`Iter`] — an owning iterator over a database.
 //!
 //! # Safety

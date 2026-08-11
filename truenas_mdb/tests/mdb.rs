@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 //! Behavioral tests for the public API.
 //!
 //! These take LMDB's storage as given and cover this crate's own decisions:

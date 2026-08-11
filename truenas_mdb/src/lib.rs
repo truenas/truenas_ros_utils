@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 //! Bindings to the system LMDB (`liblmdb`): a pooled environment and a
 //! byte-oriented key/value store.
 //!

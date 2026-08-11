@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 //! [`Error`] and this crate's [`Result`].
 
 use serde::{de, ser};

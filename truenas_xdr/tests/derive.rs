@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 //! The `XdrEnum` and `XdrUnion` derive macros.
 //!
 //! The point of both is that the discriminant on the wire is the one written

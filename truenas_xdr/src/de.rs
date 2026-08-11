@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 //! The XDR [`serde::Deserializer`].
 //!
 //! Decoding is type-driven: the wire carries no tags, so each `deserialize_*`

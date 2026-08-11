@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 //! [`Db`] — one database in an [`Env`], and the operations on it.
 //!
 //! # Safety

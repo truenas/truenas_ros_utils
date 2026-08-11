@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 //! The XDR [`serde::Serializer`].
 //!
 //! Encoding does not depend on [`Strictness`](crate::Strictness): canonical

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 //! Internal RAII wrappers for transactions and cursors, and the `MDB_val`
 //! helpers.
 //!

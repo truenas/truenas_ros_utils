@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 //! Decode strictness.
 
 /// How strictly the decoder treats input that RFC 4506 does not permit an

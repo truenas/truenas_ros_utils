@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 //! [`Env`] — an open LMDB environment, and the pool keeping one per path.
 //!
 //! # Safety

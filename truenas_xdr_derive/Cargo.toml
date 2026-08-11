@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: MIT
 # `truenas_xdr_derive` — the `XdrEnum` and `XdrUnion` derive macros for
 # `truenas_xdr`. A proc-macro needs its own crate; depend on `truenas_xdr` with
 # its `derive` feature rather than on this directly.

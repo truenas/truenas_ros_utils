@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: MIT
 # `truenas_xdr` — a byte-exact serde codec for XDR (RFC 4506).
 #
 # `serde` is a traits-only dependency: this crate implements `Serializer` and

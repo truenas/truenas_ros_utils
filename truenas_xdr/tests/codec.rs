@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 //! Codec tests: canonical byte layouts, round-trips, and the error paths.
 //!
 //! Expected encodings are written out by hand from RFC 4506 rather than

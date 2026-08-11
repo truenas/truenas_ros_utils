@@ -15,6 +15,17 @@ with `#![allow(unsafe_code)]`. Every `unsafe` block carries a `// SAFETY:` note
 naming the invariant it relies on. A crate with no FFI sets
 `#![forbid(unsafe_code)]` at its own root instead.
 
+## Licensing
+
+MIT throughout. [`LICENSE`](LICENSE) holds the text and every member inherits
+`license.workspace = true`.
+
+Each source file, manifest, and workflow starts with an SPDX identifier on its
+first line — `// SPDX-License-Identifier: MIT` in Rust, `#` elsewhere — so the
+license travels with the file rather than only with the repository. A new file
+gets one when it is created. Prose files (`README.md`, `CLAUDE.md`) and
+`LICENSE` itself do not.
+
 ## Documentation and comments
 
 Terse and factual. No marketing, no persuasion, no weighing the design against

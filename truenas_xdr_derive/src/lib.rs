@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 //! Derive macros for the `truenas_xdr` codec.
 //!
 //! RFC 4506 encodes an enum or a union's discriminant as the value written in

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 //! Wrapper types for the XDR shapes a stock serde call would encode wrongly.
 
 use serde::de::{self, Visitor};

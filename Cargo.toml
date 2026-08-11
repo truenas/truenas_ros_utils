@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: MIT
 # Cargo workspace for the `truenas_ros` satellite crates: pieces that belong
 # with it but cannot live inside it, because `truenas_ros` depends only on
 # `libc` and `bitflags` and links no C.

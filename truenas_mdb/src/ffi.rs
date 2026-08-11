@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 //! Declarations for the parts of `liblmdb` this crate uses.
 //!
 //! Plain declarations; the `unsafe` calls and their `// SAFETY:` notes live in

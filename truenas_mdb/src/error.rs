@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 //! [`Error`], [`MdbCode`], and this crate's [`Result`].
 //!
 //! LMDB returns one `int` per call, drawn from two disjoint spaces: its own

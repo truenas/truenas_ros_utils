@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 //! Decoding that borrows from the input buffer instead of copying it.
 //!
 //! Strings and opaque fields are the only variable-length payloads XDR has, so

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 //! A byte-exact serde codec for XDR (RFC 4506).
 //!
 //! XDR carries no type tags, so this is a type-driven codec: encoding walks a
