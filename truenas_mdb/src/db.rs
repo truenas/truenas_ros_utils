@@ -1,3 +1,4 @@
+// SPDX-FileCopyrightText: 2026 iXsystems, Inc, DBA TrueNAS
 // SPDX-License-Identifier: MIT
 //! [`Db`] — one database in an [`Env`], and the operations on it.
 //!

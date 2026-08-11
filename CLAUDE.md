@@ -20,11 +20,18 @@ naming the invariant it relies on. A crate with no FFI sets
 MIT throughout. [`LICENSE`](LICENSE) holds the text and every member inherits
 `license.workspace = true`.
 
-Each source file, manifest, and workflow starts with an SPDX identifier on its
-first line — `// SPDX-License-Identifier: MIT` in Rust, `#` elsewhere — so the
-license travels with the file rather than only with the repository. A new file
-gets one when it is created. Prose files (`README.md`, `CLAUDE.md`) and
-`LICENSE` itself do not.
+Each source file, manifest, and workflow opens with a two-line SPDX header, so
+the license and its holder travel with the file rather than only with the
+repository:
+
+```rust
+// SPDX-FileCopyrightText: 2026 iXsystems, Inc, DBA TrueNAS
+// SPDX-License-Identifier: MIT
+```
+
+`#` replaces `//` in TOML and YAML. The copyright line matches `LICENSE`
+verbatim; keep the two in step. A new file gets the header when it is created.
+Prose files (`README.md`, `CLAUDE.md`) and `LICENSE` itself do not carry one.
 
 ## Documentation and comments
 

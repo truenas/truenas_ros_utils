@@ -1,3 +1,4 @@
+// SPDX-FileCopyrightText: 2026 iXsystems, Inc, DBA TrueNAS
 // SPDX-License-Identifier: MIT
 //! Cross-implementation tests against Python's `lmdb` module over one shared
 //! environment.

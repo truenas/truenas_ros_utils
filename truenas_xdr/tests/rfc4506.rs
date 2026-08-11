@@ -1,3 +1,4 @@
+// SPDX-FileCopyrightText: 2026 iXsystems, Inc, DBA TrueNAS
 // SPDX-License-Identifier: MIT
 //! Conformance to RFC 4506 (STD 67), section by section.
 //!

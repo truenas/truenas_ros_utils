@@ -1,3 +1,4 @@
+# SPDX-FileCopyrightText: 2026 iXsystems, Inc, DBA TrueNAS
 # SPDX-License-Identifier: MIT
 # `truenas_xdr` — a byte-exact serde codec for XDR (RFC 4506).
 #

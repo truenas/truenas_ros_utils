@@ -1,3 +1,4 @@
+# SPDX-FileCopyrightText: 2026 iXsystems, Inc, DBA TrueNAS
 # SPDX-License-Identifier: MIT
 # Cargo workspace for the `truenas_ros` satellite crates: pieces that belong
 # with it but cannot live inside it, because `truenas_ros` depends only on

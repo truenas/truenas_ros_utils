@@ -1,3 +1,4 @@
+// SPDX-FileCopyrightText: 2026 iXsystems, Inc, DBA TrueNAS
 // SPDX-License-Identifier: MIT
 //! [`Error`] and this crate's [`Result`].
 
