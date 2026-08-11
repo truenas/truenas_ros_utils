@@ -1,0 +1,13 @@
+# SPDX-FileCopyrightText: 2026 iXsystems, Inc, DBA TrueNAS
+# SPDX-License-Identifier: MIT
+# One PAM_TEXT_INFO message, then success. `@CONFDIR@` is rewritten to the
+# directory the suite assembles, because pam_echo takes an absolute path.
+#
+# The message uses pam_echo's expansions: %u is PAM_USER, %s PAM_SERVICE, and
+# %H PAM_RHOST, so what arrives is what the stack was given.
+auth      required  pam_echo.so file=@CONFDIR@/echo.txt
+auth      required  pam_permit.so
+account   required  pam_permit.so
+password  required  pam_permit.so
+session   required  pam_echo.so file=@CONFDIR@/echo.txt
+session   required  pam_permit.so

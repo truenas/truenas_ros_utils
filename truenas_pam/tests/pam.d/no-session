@@ -1,0 +1,7 @@
+# SPDX-FileCopyrightText: 2026 iXsystems, Inc, DBA TrueNAS
+# SPDX-License-Identifier: MIT
+# Authenticates and grants credentials, and will not open a session.
+auth      required  pam_stress.so
+account   required  pam_permit.so
+password  required  pam_permit.so
+session   required  pam_debug.so open_session=session_err close_session=success

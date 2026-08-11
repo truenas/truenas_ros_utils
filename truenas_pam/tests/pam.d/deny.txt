@@ -1,0 +1,1 @@
+Sorry %u, there is no room at the inn.

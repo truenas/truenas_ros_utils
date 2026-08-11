@@ -1,0 +1,9 @@
+# SPDX-FileCopyrightText: 2026 iXsystems, Inc, DBA TrueNAS
+# SPDX-License-Identifier: MIT
+# Succeeds at everything, asks nothing.
+#
+# pam_permit sets PAM_USER to `nobody` when the application supplied no name.
+auth      required  pam_permit.so
+account   required  pam_permit.so
+password  required  pam_permit.so
+session   required  pam_permit.so

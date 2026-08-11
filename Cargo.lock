@@ -171,6 +171,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "truenas_pam"
+version = "0.1.0"
+dependencies = [
+ "bitflags",
+ "libc",
+ "tempfile",
+]
+
+[[package]]
 name = "truenas_xdr"
 version = "0.1.0"
 dependencies = [

@@ -1,0 +1,8 @@
+# SPDX-FileCopyrightText: 2026 iXsystems, Inc, DBA TrueNAS
+# SPDX-License-Identifier: MIT
+# The fallback for a service with no file of its own. It denies, so naming a
+# service that is not here fails rather than quietly succeeding.
+auth      required  pam_deny.so
+account   required  pam_deny.so
+password  required  pam_deny.so
+session   required  pam_deny.so

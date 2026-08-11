@@ -31,13 +31,16 @@ jobs:
     # liblmdb-dev links truenas_mdb. python3-lmdb is the second implementation
     # its interop suite runs against, and must be the distro package, which
     # links the system liblmdb0 — `pip install lmdb` bundles its own copy and
-    # would test something else. valgrind backs the memcheck step below.
+    # would test something else. libpam0g-dev links truenas_pam, and
+    # libpam-modules supplies the modules its service files name. valgrind
+    # backs the memcheck step below.
     - name: Install system dependencies
       run: |
         sudo apt-get update
         sudo apt-get install -y --no-install-recommends \
-          liblmdb-dev python3-lmdb valgrind
+          liblmdb-dev python3-lmdb libpam0g-dev libpam-modules valgrind
         python3 -c "import lmdb; print('py-lmdb', lmdb.__version__, 'liblmdb', lmdb.version())"
+        dpkg-query -W libpam0g-dev libpam-modules
         valgrind --version
 
     - name: Install Rust toolchain
@@ -65,13 +68,15 @@ jobs:
     - name: clippy
       run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
-    # The interop suite skips itself when python3-lmdb is missing. We do NOT
-    # want that to pass silently as green — the install step guarantees it is
-    # present, so require it and let a skip be a failure.
+    # The interop suite skips itself when python3-lmdb is missing, and the PAM
+    # suites when a module they name is. We do NOT want either to pass silently
+    # as green — the install step guarantees both are present, so require them
+    # and let a skip be a failure.
     - name: test
       run: cargo test --workspace --locked
       env:
         TRUENAS_MDB_REQUIRE_PYTHON: "1"
+        TRUENAS_PAM_REQUIRE_MODULES: "1"
 
     # `truenas_xdr`'s `derive` feature is on by default; prove the codec still
     # builds and passes without the proc-macro crate.
@@ -81,14 +86,17 @@ jobs:
     # Correctness at an FFI boundary is a memory-safety property, so the suites
     # run again under memcheck. Only `definite` leaks count as errors: the
     # environment pool is a process-lifetime static, which memcheck reports as
-    # possibly lost.
+    # possibly lost. `--keep-debuginfo=yes` is for truenas_pam: libpam unloads
+    # each module at the end of a transaction, and a report from inside one
+    # would otherwise have no symbols left to name.
     - name: valgrind
       run: cargo test --workspace --locked
       env:
         CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER: >-
           valgrind --error-exitcode=99 --leak-check=full
-          --errors-for-leak-kinds=definite --quiet
+          --errors-for-leak-kinds=definite --keep-debuginfo=yes --quiet
         TRUENAS_MDB_REQUIRE_PYTHON: "1"
+        TRUENAS_PAM_REQUIRE_MODULES: "1"
 
     - name: docs
       run: cargo doc --workspace --no-deps --locked
@@ -107,7 +115,8 @@ jobs:
     - name: Install system dependencies
       run: |
         sudo apt-get update
-        sudo apt-get install -y --no-install-recommends liblmdb-dev python3-lmdb
+        sudo apt-get install -y --no-install-recommends \
+          liblmdb-dev python3-lmdb libpam0g-dev libpam-modules
 
     - name: Install Rust toolchain
       run: |
@@ -133,3 +142,4 @@ jobs:
       run: cargo test --workspace --locked
       env:
         TRUENAS_MDB_REQUIRE_PYTHON: "1"
+        TRUENAS_PAM_REQUIRE_MODULES: "1"
