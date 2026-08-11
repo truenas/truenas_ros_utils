@@ -20,8 +20,15 @@ use crate::txn::{CursorGuard, TxnGuard};
 ///
 /// Created by [`Db::iter`], [`Db::iter_from`], or [`Db::iter_prefix`]. It
 /// holds a read transaction open for its lifetime, so it iterates a consistent
-/// snapshot but occupies a reader slot and prevents superseded pages from
-/// being reused; drop it promptly.
+/// snapshot, and it prevents superseded pages from being reused; drop it
+/// promptly.
+///
+/// While it is alive this thread holds the environment's one transaction slot,
+/// so any other operation on that environment from this thread — including a
+/// second iterator — fails with `EDEADLK`. Collect what is needed and drop the
+/// iterator before writing back. Other threads and other environments are
+/// unaffected; the iterator itself is neither `Send` nor `Sync`, because LMDB
+/// ties a read transaction to the thread that began it.
 ///
 /// Iteration stops after the first error, and after a yielded `Err` the
 /// iterator is exhausted.

@@ -50,8 +50,6 @@ pub struct MDB_stat {
 pub const MDB_NOSYNC: c_uint = 0x10000;
 /// Flush data but not the meta page on commit.
 pub const MDB_NOMETASYNC: c_uint = 0x40000;
-/// No per-thread reader slot; a read transaction owns its slot instead.
-pub const MDB_NOTLS: c_uint = 0x200000;
 /// No readahead.
 pub const MDB_NORDAHEAD: c_uint = 0x800000;
 

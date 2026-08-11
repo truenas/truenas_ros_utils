@@ -38,6 +38,35 @@
 //! [`Db::scan`] pass borrowed slices to a callback that runs inside the
 //! transaction, and copy nothing.
 //!
+//! # One transaction per thread
+//!
+//! LMDB allows a thread only one transaction on an environment at a time.
+//! Two of this crate's APIs hold one open across caller code — the closures
+//! given to [`Db::scan`] and [`Db::with_value`], and a live [`Iter`] — and
+//! while either is in flight, any further operation on that environment from
+//! the same thread returns `EDEADLK` instead of proceeding. Left to LMDB it
+//! would be an unexplained `MDB_BAD_RSLOT` for a read, or a self-deadlock on
+//! the writer mutex for a write.
+//!
+//! So this reads and writes back in two steps rather than one:
+//!
+//! ```
+//! # use truenas_mdb::{Db, Env};
+//! # let dir = tempfile::tempdir().unwrap();
+//! # let env = Env::open(dir.path().join("env"))?;
+//! # let src = Db::create(&env, "src")?;
+//! # let dst = Db::create(&env, "dst")?;
+//! # src.put("k", "v")?;
+//! let batch = src.iter()?.collect::<Result<Vec<_>, _>>()?; // iterator dropped
+//! for (key, value) in batch {
+//!     dst.put(key, value)?;
+//! }
+//! # Ok::<(), truenas_mdb::Error>(())
+//! ```
+//!
+//! Other threads and other environments are never blocked by this: the limit
+//! is per thread per environment, and [`Env`] and [`Db`] are `Send + Sync`.
+//!
 //! # One environment per path, per process
 //!
 //! LMDB corrupts its lock table if one process opens the same environment

@@ -10,8 +10,10 @@
 //! - LMDB corrupts its lock table if one process opens the same environment
 //!   twice, so every [`Env::open`] of a path shares one handle, reference
 //!   counted, closed exactly once when the last handle drops.
-//! - The handle is opened with `MDB_NOTLS` and LMDB serializes its own writers,
-//!   so it is sound to send and share across threads.
+//! - An `MDB_env` may be used from any thread and LMDB serializes its own
+//!   writers, so the handle is sound to send and share. What is thread-bound is
+//!   a *transaction*, and [`crate::txn`] enforces that one never crosses a
+//!   thread or overlaps another on the same thread.
 #![allow(unsafe_code)]
 
 use crate::error::{check, Result};
@@ -29,10 +31,12 @@ bitflags::bitflags! {
     /// Environment flags for [`Env::open_with`], fixed for the environment's
     /// lifetime by whichever process opens it first.
     ///
-    /// Deliberately incomplete. `MDB_WRITEMAP`/`MDB_MAPASYNC` are omitted
-    /// because `lmdb.h` forbids mixing processes with and without them on one
-    /// environment; `MDB_NOSUBDIR` because this crate always uses the directory
-    /// layout; `MDB_NOLOCK` because it hands locking to the caller.
+    /// Only durability and readahead are exposed. `MDB_WRITEMAP` and
+    /// `MDB_MAPASYNC` are omitted because `lmdb.h` forbids mixing processes
+    /// with and without them on one environment; `MDB_NOSUBDIR` because the
+    /// directory layout is fixed; `MDB_NOLOCK` because it hands locking to the
+    /// caller; and `MDB_NOTLS` because LMDB's per-thread reader slots are what
+    /// make [`crate::txn`]'s one-transaction-per-thread rule enforceable.
     #[derive(Copy, Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
     #[repr(transparent)]
     pub struct EnvFlags: u32 {
@@ -42,9 +46,6 @@ bitflags::bitflags! {
         /// Flush data but not the meta page on commit. A crash loses at most
         /// the last transaction.
         const NOMETASYNC = MDB_NOMETASYNC;
-        /// No per-thread reader slot. Set by default; see
-        /// [`EnvOptions::flags`].
-        const NOTLS = MDB_NOTLS;
         /// No readahead. Useful when the database exceeds RAM.
         const NORDAHEAD = MDB_NORDAHEAD;
     }
@@ -81,18 +82,19 @@ pub struct EnvOptions {
     /// [`MdbCode::DbsFull`](crate::MdbCode::DbsFull); the main database does
     /// not count.
     pub max_dbs: u32,
-    /// Concurrent read transactions allowed. `0` (the default) keeps LMDB's
-    /// own limit of 126.
+    /// Reader lock-table slots. `0` (the default) keeps LMDB's own limit of
+    /// 126.
+    ///
+    /// A slot is tied to the thread that first reads, and is released when
+    /// that thread exits, so this bounds the number of *threads* that ever
+    /// read from the environment, not the number of concurrent reads.
     pub max_readers: u32,
     /// Mode for the environment's files before `umask`, default `0o600`.
     pub mode: libc::mode_t,
     /// Mode for the environment directory if this call creates it, before
     /// `umask`. Default `0o700`.
     pub dir_mode: libc::mode_t,
-    /// Environment flags, default [`EnvFlags::NOTLS`]. Without `NOTLS` a
-    /// reader slot is held per thread until the thread exits, so a pool larger
-    /// than `max_readers` eventually blocks; with it a slot lasts only as long
-    /// as the transaction.
+    /// Environment flags, empty by default (durable commits, readahead on).
     pub flags: EnvFlags,
 }
 
@@ -104,7 +106,7 @@ impl Default for EnvOptions {
             max_readers: 0,
             mode: 0o600,
             dir_mode: 0o700,
-            flags: EnvFlags::NOTLS,
+            flags: EnvFlags::empty(),
         }
     }
 }
@@ -149,9 +151,10 @@ pub struct Env {
     dbi_lock: Arc<Mutex<()>>,
 }
 
-// SAFETY: opened with MDB_NOTLS so read transactions are not thread-pinned, and
-// LMDB serializes writers; the pointer is never exposed and is closed only
-// under the pool mutex when the last handle drops.
+// SAFETY: an MDB_env may be used from any thread (LMDB serializes writers
+// itself); only transactions are thread-bound, and `crate::txn` keeps every one
+// of them inside the thread and call that created it. The pointer is never
+// exposed and is closed only under the pool mutex when the last handle drops.
 unsafe impl Send for Env {}
 unsafe impl Sync for Env {}
 

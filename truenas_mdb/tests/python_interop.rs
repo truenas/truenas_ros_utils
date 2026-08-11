@@ -30,7 +30,7 @@ const OPTS: EnvOptions = EnvOptions {
     max_readers: 0,
     mode: 0o600,
     dir_mode: 0o700,
-    flags: EnvFlags::NOTLS,
+    flags: EnvFlags::empty(),
 };
 
 /// Whether a missing `python3-lmdb` should fail rather than skip.

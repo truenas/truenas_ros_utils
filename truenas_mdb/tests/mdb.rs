@@ -18,7 +18,7 @@ const SMALL: EnvOptions = EnvOptions {
     max_readers: 0,
     mode: 0o600,
     dir_mode: 0o700,
-    flags: EnvFlags::NOTLS,
+    flags: EnvFlags::empty(),
 };
 
 /// A fresh environment and a named database in it. The `TempDir` is returned
@@ -103,12 +103,12 @@ fn default_options_are_the_documented_ones() {
     assert_eq!(d.max_readers, 0);
     assert_eq!(d.mode, 0o600);
     assert_eq!(d.dir_mode, 0o700);
-    assert_eq!(d.flags, EnvFlags::NOTLS);
+    assert_eq!(d.flags, EnvFlags::empty());
 }
 
 #[test]
 fn sync_is_callable_on_both_durability_settings() {
-    for flags in [EnvFlags::NOTLS, EnvFlags::NOTLS | EnvFlags::NOSYNC] {
+    for flags in [EnvFlags::empty(), EnvFlags::NOSYNC] {
         let (_dir, env) = scratch_env(EnvOptions { flags, ..SMALL });
         let db = Db::create(&env, "state").unwrap();
         db.put("k", "v").unwrap();
@@ -575,9 +575,11 @@ fn iter_is_fused_and_composes() {
     assert_eq!(rest, 5);
 
     // Exhausted iterators keep returning None.
-    let mut done = db.iter_prefix("zzz").unwrap();
-    assert!(done.next().is_none());
-    assert!(done.next().is_none());
+    {
+        let mut done = db.iter_prefix("zzz").unwrap();
+        assert!(done.next().is_none());
+        assert!(done.next().is_none());
+    }
 
     // Ordinary Iterator adapters work.
     let bs: Vec<Vec<u8>> = db
@@ -596,12 +598,20 @@ fn iter_is_fused_and_composes() {
 #[test]
 fn an_iterator_reads_a_snapshot() {
     // It holds a read transaction, so writes committed after it was created
-    // are invisible to it, and it must not observe a torn view.
+    // are invisible to it, and it must not observe a torn view. The writes go
+    // on another thread because this one's transaction slot is taken.
     let (_dir, _env, db) = ordered();
     let iter = db.iter().unwrap();
 
-    db.put("zz", "added after the iterator started").unwrap();
-    db.del("aa").unwrap();
+    let writer = db.clone();
+    std::thread::spawn(move || {
+        writer
+            .put("zz", "added after the iterator started")
+            .unwrap();
+        writer.del("aa").unwrap();
+    })
+    .join()
+    .unwrap();
 
     let keys: Vec<Vec<u8>> = drain(iter).into_iter().map(|(k, _)| k).collect();
     assert_eq!(
@@ -629,17 +639,130 @@ fn an_iterator_keeps_its_environment_alive() {
 }
 
 #[test]
-fn many_iterators_can_be_open_at_once() {
-    // Each holds a reader slot; the default limit is 126, so a few dozen is
-    // well inside it and proves the slots are released on drop.
+fn iterators_are_reusable_one_at_a_time() {
+    // Sequentially is fine: each drops before the next begins, releasing this
+    // thread's transaction slot and its reader lock-table entry.
     let (_dir, _env, db) = ordered();
-    for _ in 0..8 {
-        let open: Vec<Iter> = (0..16).map(|_| db.iter().unwrap()).collect();
-        assert_eq!(open.len(), 16);
-        for iter in open {
-            assert_eq!(drain(iter).len(), 6);
-        }
+    for _ in 0..128 {
+        assert_eq!(drain(db.iter().unwrap()).len(), 6);
     }
+}
+
+// --- one transaction per thread ------------------------------------------
+//
+// LMDB allows a thread one transaction on an environment at a time. Left to
+// LMDB, breaking that is MDB_BAD_RSLOT for a read and a self-deadlock on the
+// non-recursive writer mutex for a write, so the crate refuses up front.
+
+#[test]
+fn a_second_iterator_on_one_thread_is_refused() {
+    let (_dir, _env, db) = ordered();
+    let first = db.iter().unwrap();
+    assert_eq!(db.iter().unwrap_err(), Error::Os(libc::EDEADLK));
+    assert_eq!(db.iter_prefix("a").unwrap_err(), Error::Os(libc::EDEADLK));
+
+    // Dropping it hands the slot back.
+    drop(first);
+    assert_eq!(drain(db.iter().unwrap()).len(), 6);
+}
+
+#[test]
+fn operations_are_refused_while_an_iterator_is_alive() {
+    let (_dir, _env, db) = ordered();
+    let iter = db.iter().unwrap();
+
+    let deadlock = Error::Os(libc::EDEADLK);
+    assert_eq!(db.get("aa").unwrap_err(), deadlock);
+    assert_eq!(db.put("k", "v").unwrap_err(), deadlock);
+    assert_eq!(db.del("aa").unwrap_err(), deadlock);
+    assert_eq!(db.len().unwrap_err(), deadlock);
+    assert_eq!(db.clear().unwrap_err(), deadlock);
+    assert_eq!(db.contains_key("aa").unwrap_err(), deadlock);
+    assert_eq!(db.put_if_absent("k", "v").unwrap_err(), deadlock);
+    assert_eq!(
+        db.scan(|_, _| ControlFlow::Break(())).unwrap_err(),
+        deadlock
+    );
+    assert_eq!(db.with_value("aa", |_| ()).unwrap_err(), deadlock);
+
+    drop(iter);
+    db.put("k", "v").unwrap();
+    assert_eq!(db.len().unwrap(), 7);
+}
+
+#[test]
+fn operations_are_refused_inside_a_scan_callback() {
+    let (_dir, _env, db) = ordered();
+    let deadlock = Error::Os(libc::EDEADLK);
+
+    let mut seen = Vec::new();
+    db.scan(|k, _| {
+        seen.push(k.to_vec());
+        assert_eq!(db.get("aa").unwrap_err(), deadlock);
+        assert_eq!(db.put("k", "v").unwrap_err(), deadlock);
+        assert_eq!(db.iter().unwrap_err(), deadlock);
+        ControlFlow::Break(())
+    })
+    .unwrap();
+    assert_eq!(seen.len(), 1, "the callback still ran normally");
+
+    // The slot is released when the scan returns, however it ended.
+    db.put("k", "v").unwrap();
+    assert!(db.with_value("k", |v| v.is_some()).unwrap());
+}
+
+#[test]
+fn the_slot_is_released_when_a_callback_panics() {
+    let (_dir, _env, db) = ordered();
+    let caught = std::panic::catch_unwind({
+        let db = db.clone();
+        move || {
+            db.scan(|_, _| -> ControlFlow<()> { panic!("from the callback") })
+        }
+    });
+    assert!(caught.is_err(), "the panic propagated");
+
+    // Unwinding drops the guard, so the thread is usable again.
+    db.put("after", "panic").unwrap();
+    assert_eq!(db.len().unwrap(), 7);
+}
+
+#[test]
+fn a_second_environment_is_unaffected() {
+    // The limit is per environment: separate reader tables, separate writer
+    // mutexes.
+    let (_dir_a, _env_a, a) = ordered();
+    let (_dir_b, _env_b, b) = scratch();
+
+    let iter = a.iter().unwrap();
+    b.put("k", "v").unwrap();
+    assert_eq!(b.get("k").unwrap().as_deref(), Some(&b"v"[..]));
+    let inner = b.iter().unwrap();
+    assert_eq!(drain(inner).len(), 1);
+    assert_eq!(drain(iter).len(), 6);
+}
+
+#[test]
+fn other_threads_are_unaffected() {
+    let (_dir, _env, db) = ordered();
+    let iter = db.iter().unwrap();
+
+    // This thread's slot is taken, but every other thread has its own. Each
+    // writes its own key, so the database grows as they go.
+    let handles: Vec<_> = (0..4u8)
+        .map(|t| {
+            let db = db.clone();
+            std::thread::spawn(move || {
+                assert!(drain(db.iter().unwrap()).len() >= 6);
+                db.put([b'z', t], "v").unwrap();
+            })
+        })
+        .collect();
+    for h in handles {
+        h.join().unwrap();
+    }
+    assert_eq!(drain(iter).len(), 6, "this thread's snapshot is unchanged");
+    assert_eq!(db.len().unwrap(), 10, "...but the writes all landed");
 }
 
 // --- errors --------------------------------------------------------------

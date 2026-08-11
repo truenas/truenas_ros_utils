@@ -31,6 +31,12 @@ use std::ptr;
 /// serializes writers itself: a write blocks while another thread's write to
 /// the same environment is in flight. Reads never block.
 ///
+/// A thread may hold only one transaction on an environment at a time, so an
+/// operation attempted while this thread is inside a [`scan`](Db::scan) or
+/// [`with_value`](Db::with_value) callback, or while it holds a live
+/// [`Iter`], fails with `EDEADLK` rather than deadlocking. Other environments,
+/// and other threads, are unaffected.
+///
 /// Keys must be 1..=511 bytes. Values are stored byte for byte, with no
 /// header or encoding added.
 #[derive(Clone)]
@@ -109,7 +115,8 @@ impl Db {
     /// what it returns.
     ///
     /// The slice borrows the mmap directly, so nothing is copied. `f` runs
-    /// inside the read transaction and must not use this database.
+    /// inside the read transaction, so it must not touch this environment:
+    /// any operation on it from within `f` fails with `EDEADLK`.
     ///
     /// ```
     /// # use truenas_mdb::{Db, Env};
@@ -204,8 +211,9 @@ impl Db {
     ///
     /// Return [`ControlFlow::Break`] to stop early with a value; `Ok(None)`
     /// means every entry was visited. The slices borrow the mmap directly, so
-    /// a scan copies nothing; they cannot be kept, and `f` runs inside the
-    /// read transaction and must not use this database.
+    /// a scan copies nothing, and they cannot be kept past the call. `f` runs
+    /// inside the read transaction, so it must not touch this environment:
+    /// any operation on it from within `f` fails with `EDEADLK`.
     ///
     /// [`iter`](Db::iter) is the allocating equivalent, usable with `for`.
     ///
@@ -257,10 +265,12 @@ impl Db {
 
     /// An iterator over every entry in key order, yielding owned pairs.
     ///
-    /// Holds a read transaction open for its lifetime: it sees a consistent
-    /// snapshot, but it also occupies a reader slot and keeps superseded pages
-    /// from being reused, so it should be dropped promptly. [`scan`](Db::scan)
-    /// is the non-allocating equivalent.
+    /// Holds a read transaction open for its lifetime, so it iterates a
+    /// consistent snapshot — and so this thread cannot touch this environment
+    /// again until it is dropped: any operation meanwhile fails with
+    /// `EDEADLK`. Drop it promptly, since it also keeps superseded pages from
+    /// being reused. [`scan`](Db::scan) is the non-allocating equivalent, and
+    /// collecting the iterator first is the way to write back what it yields.
     ///
     /// ```
     /// # use truenas_mdb::{Db, Env};
