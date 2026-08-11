@@ -13,29 +13,37 @@ concurrency:
 # file:line` with no frames is not enough to chase one from a log.
 env:
   RUST_BACKTRACE: "1"
+  CARGO_TERM_COLOR: always
+
+# Every cargo step passes --locked: Cargo.lock is committed, so a lockfile that
+# has drifted from the manifests fails here rather than being rewritten in
+# place and hiding the drift.
 
 jobs:
   check:
-    name: fmt + clippy + test
+    name: build + test (stable)
     runs-on: ubuntu-latest
     steps:
     - uses: actions/checkout@v4
 
-    # liblmdb-dev links the crate; python3-lmdb is the second implementation
-    # the interop suite runs against. It must be the distro package, which
+    # liblmdb-dev links truenas_mdb. python3-lmdb is the second implementation
+    # its interop suite runs against, and must be the distro package, which
     # links the system liblmdb0 — `pip install lmdb` bundles its own copy and
-    # would test something else.
-    - name: Install LMDB
+    # would test something else. valgrind backs the memcheck step below.
+    - name: Install system dependencies
       run: |
         sudo apt-get update
-        sudo apt-get install -y --no-install-recommends liblmdb-dev python3-lmdb
+        sudo apt-get install -y --no-install-recommends \
+          liblmdb-dev python3-lmdb valgrind
         python3 -c "import lmdb; print('py-lmdb', lmdb.__version__, 'liblmdb', lmdb.version())"
+        valgrind --version
 
     - name: Install Rust toolchain
       run: |
         rustup toolchain install stable --profile minimal
         rustup component add clippy rustfmt
         rustup default stable
+        cargo --version && rustc --version
 
     - name: Cache cargo
       uses: actions/cache@v4
@@ -44,35 +52,36 @@ jobs:
           ~/.cargo/registry
           ~/.cargo/git
           target
-        key: cargo-${{ runner.os }}-${{ hashFiles('**/Cargo.toml') }}
+        key: cargo-${{ runner.os }}-stable-${{ hashFiles('**/Cargo.lock', '**/Cargo.toml') }}
 
     - name: rustfmt
       run: cargo fmt --all --check
 
+    - name: build
+      run: cargo build --workspace --all-targets --locked
+
     - name: clippy
-      run: cargo clippy --workspace --all-targets -- -D warnings
+      run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
     # The interop suite skips itself when python3-lmdb is missing. We do NOT
-    # want that to pass silently as green — the step above guarantees it is
+    # want that to pass silently as green — the install step guarantees it is
     # present, so require it and let a skip be a failure.
     - name: test
-      run: cargo test --workspace
+      run: cargo test --workspace --locked
       env:
         TRUENAS_MDB_REQUIRE_PYTHON: "1"
 
     # `truenas_xdr`'s `derive` feature is on by default; prove the codec still
     # builds and passes without the proc-macro crate.
     - name: test without default features
-      run: cargo test -p truenas_xdr --no-default-features
+      run: cargo test -p truenas_xdr --no-default-features --locked
 
-    # The crate's correctness at the FFI boundary is a memory-safety property,
-    # so the suites run again under memcheck. Only `definite` leaks count as
-    # errors: the environment pool is a process-lifetime static, which memcheck
-    # reports as possibly lost.
+    # Correctness at an FFI boundary is a memory-safety property, so the suites
+    # run again under memcheck. Only `definite` leaks count as errors: the
+    # environment pool is a process-lifetime static, which memcheck reports as
+    # possibly lost.
     - name: valgrind
-      run: |
-        sudo apt-get install -y --no-install-recommends valgrind
-        cargo test --workspace
+      run: cargo test --workspace --locked
       env:
         CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER: >-
           valgrind --error-exitcode=99 --leak-check=full
@@ -80,4 +89,45 @@ jobs:
         TRUENAS_MDB_REQUIRE_PYTHON: "1"
 
     - name: docs
-      run: cargo doc --workspace --no-deps
+      run: cargo doc --workspace --no-deps --locked
+      env:
+        RUSTDOCFLAGS: "-D warnings"
+
+  # `rust-version` in [workspace.package] is a promise to consumers. Build and
+  # test on exactly that toolchain so raising the floor is a deliberate edit
+  # rather than something that happens when a newer feature is used by accident.
+  msrv:
+    name: build + test (MSRV 1.97.1)
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Install system dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y --no-install-recommends liblmdb-dev python3-lmdb
+
+    - name: Install Rust toolchain
+      run: |
+        msrv=$(grep -m1 '^rust-version' Cargo.toml | cut -d'"' -f2)
+        echo "Declared MSRV: $msrv"
+        rustup toolchain install "$msrv" --profile minimal
+        rustup default "$msrv"
+        cargo --version && rustc --version
+
+    - name: Cache cargo
+      uses: actions/cache@v4
+      with:
+        path: |
+          ~/.cargo/registry
+          ~/.cargo/git
+          target
+        key: cargo-${{ runner.os }}-msrv-${{ hashFiles('**/Cargo.lock', '**/Cargo.toml') }}
+
+    - name: build
+      run: cargo build --workspace --all-targets --locked
+
+    - name: test
+      run: cargo test --workspace --locked
+      env:
+        TRUENAS_MDB_REQUIRE_PYTHON: "1"
