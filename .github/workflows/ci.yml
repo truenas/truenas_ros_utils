@@ -21,10 +21,10 @@ jobs:
     steps:
     - uses: actions/checkout@v4
 
-    # liblmdb-dev links the crate; python3-lmdb is the other implementation the
-    # interop suite tests against. It must be the distro package: it links the
-    # system liblmdb0, which is the whole point. `pip install lmdb` bundles its
-    # own LMDB and would make that suite prove nothing.
+    # liblmdb-dev links the crate; python3-lmdb is the second implementation
+    # the interop suite runs against. It must be the distro package, which
+    # links the system liblmdb0 — `pip install lmdb` bundles its own copy and
+    # would test something else.
     - name: Install LMDB
       run: |
         sudo apt-get update
@@ -58,6 +58,19 @@ jobs:
     - name: test
       run: cargo test --workspace
       env:
+        TRUENAS_MDB_REQUIRE_PYTHON: "1"
+
+    # An FFI wrapper's bugs show up as memory errors, so the suites run again
+    # under memcheck. Only `definite` leaks are errors: the environment pool is
+    # a process-lifetime static, which memcheck reports as possibly lost.
+    - name: valgrind
+      run: |
+        sudo apt-get install -y --no-install-recommends valgrind
+        cargo test --workspace
+      env:
+        CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER: >-
+          valgrind --error-exitcode=99 --leak-check=full
+          --errors-for-leak-kinds=definite --quiet
         TRUENAS_MDB_REQUIRE_PYTHON: "1"
 
     - name: docs

@@ -1,11 +1,10 @@
-# `truenas_mdb` — bindings to the **system** LMDB (`liblmdb`): a refcounted
-# per-path environment pool and a flat, raw-bytes key/value op-set.
+# `truenas_mdb` — bindings to the system LMDB (`liblmdb`): a pooled environment
+# and a byte-oriented key/value store.
 #
-# The library is deliberately not vendored. LMDB's correctness rests on exactly
-# one copy of it mediating an environment, and these databases are shared with
-# Python (`python3-lmdb`) and C (`truenas_zfsrewrited`) processes that link
-# `liblmdb0`. A statically vendored copy in the same address space would be a
-# second one. Build needs `liblmdb-dev`; runtime needs `liblmdb0`.
+# The library is linked, not vendored: exactly one copy of LMDB may mediate an
+# environment within a process, and these databases are shared with other
+# processes linking `liblmdb0`. A statically bundled copy alongside it would be
+# a second. Build needs `liblmdb-dev`; runtime needs `liblmdb0`.
 [package]
 name = "truenas_mdb"
 version = "0.1.0"

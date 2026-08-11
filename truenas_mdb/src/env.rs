@@ -1,18 +1,15 @@
-//! [`Env`] — an open LMDB environment, and the process-wide pool that keeps
-//! there being exactly one of them per path.
+//! [`Env`] — an open LMDB environment, and the pool keeping one per path.
 //!
-//! # Safety model
+//! # Safety
 //!
-//! This module calls into `liblmdb`, so it lifts the workspace's
-//! `deny(unsafe_code)`; every block carries a `// SAFETY:` note. The invariants
-//! it upholds:
+//! This module calls `liblmdb`, so it lifts the workspace's
+//! `deny(unsafe_code)`; every block carries a `// SAFETY:` note. Invariants:
 //!
-//! - A `*mut MDB_env` is created by `mdb_env_create`, never handed out, and is
+//! - A `*mut MDB_env` comes from `mdb_env_create`, is never handed out, and is
 //!   created and closed only while the pool mutex is held.
-//! - LMDB forbids opening the *same* environment twice in one process — doing
-//!   so corrupts the lock table — so every [`Env::open`] of a path shares one
-//!   handle, reference-counted, closed (and force-synced) exactly once when the
-//!   last handle for it drops.
+//! - LMDB corrupts its lock table if one process opens the same environment
+//!   twice, so every [`Env::open`] of a path shares one handle, reference
+//!   counted, closed exactly once when the last handle drops.
 //! - The handle is opened with `MDB_NOTLS` and LMDB serializes its own writers,
 //!   so it is sound to send and share across threads.
 #![allow(unsafe_code)]
@@ -29,93 +26,82 @@ use std::ptr;
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 
 bitflags::bitflags! {
-    /// Environment-level flags for [`Env::open`], fixed for the lifetime of the
-    /// environment by whichever process opens it first.
+    /// Environment flags for [`Env::open_with`], fixed for the environment's
+    /// lifetime by whichever process opens it first.
     ///
-    /// Deliberately incomplete. `MDB_WRITEMAP` and `MDB_MAPASYNC` are absent
-    /// because `lmdb.h` warns "Do not mix processes with and without
-    /// MDB_WRITEMAP on the same environment", and these environments are shared
-    /// with Python and C processes that do not use it. `MDB_NOSUBDIR` is absent
-    /// because the directory layout is part of the interop contract, and
-    /// `MDB_NOLOCK` because nothing here should be inventing its own locking.
+    /// Deliberately incomplete. `MDB_WRITEMAP`/`MDB_MAPASYNC` are omitted
+    /// because `lmdb.h` forbids mixing processes with and without them on one
+    /// environment; `MDB_NOSUBDIR` because this crate always uses the directory
+    /// layout; `MDB_NOLOCK` because it hands locking to the caller.
     #[derive(Copy, Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
     #[repr(transparent)]
     pub struct EnvFlags: u32 {
-        /// Skip the fsync after each commit. Much faster, and a crash can lose
-        /// the most recent transactions — but never corrupt the database.
+        /// No fsync on commit. Faster; a crash can lose recent transactions
+        /// but not corrupt the database.
         const NOSYNC = MDB_NOSYNC;
-        /// Flush data but not the meta page on commit. A middle ground: a crash
-        /// loses at most the last transaction.
+        /// Flush data but not the meta page on commit. A crash loses at most
+        /// the last transaction.
         const NOMETASYNC = MDB_NOMETASYNC;
-        /// Don't tie a read transaction to a thread-local reader slot. On by
-        /// default here — see [`EnvOptions::flags`].
+        /// No per-thread reader slot. Set by default; see
+        /// [`EnvOptions::flags`].
         const NOTLS = MDB_NOTLS;
-        /// Turn off readahead. Worth setting when the database is larger than
-        /// RAM and access is random.
+        /// No readahead. Useful when the database exceeds RAM.
         const NORDAHEAD = MDB_NORDAHEAD;
     }
 }
 
-/// How to open an [`Env`].
-///
-/// Defaults match `truenas_zfsrewrited`'s state environments so the two agree
-/// on any database they share: a 1 GiB map, mode `0600` files under a `0700`
-/// directory. Construct with `..Default::default()` and override what differs.
+/// Options for [`Env::open_with`].
 ///
 /// ```no_run
 /// use truenas_mdb::{Env, EnvOptions};
 ///
-/// let env = Env::open(
-///     "/var/db/myservice".as_ref(),
+/// let env = Env::open_with(
+///     "/var/db/example",
 ///     &EnvOptions { max_dbs: 4, ..Default::default() },
 /// )?;
 /// # Ok::<(), truenas_mdb::Error>(())
 /// ```
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct EnvOptions {
-    /// Size of the memory map, and so the hard ceiling on the database.
+    /// Size of the memory map, and so the ceiling on the database. Default
+    /// 1 GiB.
     ///
-    /// This is a **cross-process contract, not a local preference**. LMDB does
-    /// record it in the meta page, but a process that configures its own wins
-    /// over that — the stored value is only consulted when none was set, and
-    /// the map is merely raised to at least the committed data size. So an
-    /// undersized process still *opens* the environment and reads what is
-    /// there; it then hits [`MdbCode::MapFull`] long before the others do, and
-    /// [`MdbCode::MapResized`] when another process grows past its map.
-    ///
-    /// Python's `lmdb` module defaults to 10 MiB, far below the 1 GiB default
-    /// here, so whoever opens the same environment must be told the number. It
-    /// costs address space, not memory, so err high.
+    /// Shared with every other process on the environment. LMDB records it in
+    /// the meta page, but a process configuring its own overrides that (the
+    /// stored value is used only when none was set, and the map is raised to
+    /// at least the committed data size). So an undersized process still opens
+    /// and reads, then hits [`MdbCode::MapFull`] early, or
+    /// [`MdbCode::MapResized`] when another process grows past its map. Costs
+    /// address space, not memory.
     ///
     /// [`MdbCode::MapResized`]: crate::MdbCode::MapResized
     /// [`MdbCode::MapFull`]: crate::MdbCode::MapFull
     pub map_size: usize,
-    /// How many named databases the environment may hold. Opening more than
-    /// this fails with [`MdbCode::DbsFull`](crate::MdbCode::DbsFull); the
-    /// unnamed main database does not count.
+    /// Named databases the environment may hold, default 8. Exceeding it gives
+    /// [`MdbCode::DbsFull`](crate::MdbCode::DbsFull); the main database does
+    /// not count.
     pub max_dbs: u32,
-    /// How many concurrent read transactions the environment allows. `0` keeps
-    /// LMDB's own default of 126.
+    /// Concurrent read transactions allowed. `0` (the default) keeps LMDB's
+    /// own limit of 126.
     pub max_readers: u32,
-    /// Mode for the environment's files, before `umask`.
+    /// Mode for the environment's files before `umask`, default `0o600`.
     pub mode: libc::mode_t,
-    /// Mode for the environment directory when this call creates it, before
-    /// `umask`.
+    /// Mode for the environment directory if this call creates it, before
+    /// `umask`. Default `0o700`.
     pub dir_mode: libc::mode_t,
-    /// Environment flags. The default is [`EnvFlags::NOTLS`]: without it LMDB
-    /// parks each reader in a thread-local slot that is only released when the
-    /// thread exits, so a thread pool larger than `max_readers` eventually
-    /// deadlocks. With it, a slot is held only for the life of a transaction —
-    /// which suits this crate, whose transactions never outlive one call.
+    /// Environment flags, default [`EnvFlags::NOTLS`]. Without `NOTLS` a
+    /// reader slot is held per thread until the thread exits, so a pool larger
+    /// than `max_readers` eventually blocks; with it a slot lasts only as long
+    /// as the transaction.
     pub flags: EnvFlags,
 }
 
 impl Default for EnvOptions {
     fn default() -> EnvOptions {
         EnvOptions {
-            map_size: 1024 * 1024 * 1024, // 1 GiB, = STATE_ENV_MAPSIZE
+            map_size: 1024 * 1024 * 1024,
             max_dbs: 8,
-            max_readers: 0, // LMDB's own default (126)
+            max_readers: 0,
             mode: 0o600,
             dir_mode: 0o700,
             flags: EnvFlags::NOTLS,
@@ -123,8 +109,8 @@ impl Default for EnvOptions {
     }
 }
 
-/// One pooled environment: the raw handle, a count of the live [`Env`] handles
-/// sharing it, and the mutex serializing `mdb_dbi_open` on it.
+/// A pooled environment: the handle, the count of live [`Env`]s sharing it, and
+/// the mutex serializing `mdb_dbi_open` on it.
 struct EnvSlot {
     env: *mut MDB_env,
     refcnt: usize,
@@ -132,60 +118,63 @@ struct EnvSlot {
 }
 
 // SAFETY: the handle is created and closed only under the pool mutex, is never
-// exposed, and is used exactly as in `Env` (opened with MDB_NOTLS; LMDB
-// serializes writers). So a slot is safe to keep in the shared pool.
+// exposed, and is used exactly as in `Env`.
 unsafe impl Send for EnvSlot {}
 
-/// The process-wide pool: canonical directory → its one open environment.
+/// Canonical directory -> its one open environment.
 fn env_pool() -> &'static Mutex<HashMap<PathBuf, EnvSlot>> {
     static POOL: OnceLock<Mutex<HashMap<PathBuf, EnvSlot>>> = OnceLock::new();
     POOL.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-/// Lock the pool, recovering from poisoning — a panic mid-update leaves the map
-/// itself intact, and a poisoned pool would make every later open fail.
+/// Lock the pool, recovering from poisoning: a panic mid-update leaves the map
+/// consistent, and a poisoned pool would break every later open.
 fn lock_pool() -> MutexGuard<'static, HashMap<PathBuf, EnvSlot>> {
     env_pool().lock().unwrap_or_else(|e| e.into_inner())
 }
 
-/// An open LMDB environment: one directory holding `data.mdb` and `lock.mdb`,
-/// with one writer and many readers.
+/// An open environment: a directory holding `data.mdb` and `lock.mdb`, with one
+/// writer and many readers.
 ///
-/// Reference-counted through a process-wide per-path pool. Cloning shares the
-/// one handle; dropping the last one force-syncs and closes it. Opening the
-/// same path twice therefore does the right thing rather than corrupting the
-/// lock table, which is what LMDB does if you actually open it twice.
+/// Reference counted per canonical path. Cloning shares the handle; the last
+/// drop syncs and closes it. Opening a path twice therefore shares rather than
+/// corrupting the lock table.
 pub struct Env {
-    /// Canonical pool key, and this environment's directory.
+    /// Canonical pool key, and the environment's directory.
     key: PathBuf,
-    /// The pooled handle, valid while this `Env` lives (its existence holds the
-    /// slot's `refcnt` at 1 or more).
+    /// The pooled handle, valid while this `Env` lives.
     env: *mut MDB_env,
-    /// Serializes `mdb_dbi_open` on this environment — `lmdb.h` requires that
-    /// it not run in concurrent transactions in one process.
+    /// Serializes `mdb_dbi_open`, which `lmdb.h` forbids running in concurrent
+    /// transactions in one process.
     dbi_lock: Arc<Mutex<()>>,
 }
 
-// SAFETY: `env` is opened with MDB_NOTLS (read transactions are not pinned to
-// the thread that made them) and LMDB serializes writers; the pointer is never
-// exposed and is closed only under the pool mutex when the last handle drops.
+// SAFETY: opened with MDB_NOTLS so read transactions are not thread-pinned, and
+// LMDB serializes writers; the pointer is never exposed and is closed only
+// under the pool mutex when the last handle drops.
 unsafe impl Send for Env {}
 unsafe impl Sync for Env {}
 
 impl Env {
+    /// Open the environment at `path` with [`EnvOptions::default`], creating
+    /// the directory if needed.
+    pub fn open(path: impl AsRef<Path>) -> Result<Env> {
+        Env::open_with(path, &EnvOptions::default())
+    }
+
     /// Open the environment at `path`, creating the directory if needed.
     ///
-    /// If this process already has that path open, this shares the existing
-    /// handle and **`opts` is ignored** — environment-level parameters are
-    /// fixed by the first open, and a later one only bumps the reference count.
-    pub fn open(path: &Path, opts: &EnvOptions) -> Result<Env> {
+    /// If this process already has that path open, the existing handle is
+    /// shared and `opts` is ignored: environment parameters are fixed by the
+    /// first open.
+    pub fn open_with(path: impl AsRef<Path>, opts: &EnvOptions) -> Result<Env> {
+        let path = path.as_ref();
         DirBuilder::new()
             .recursive(true)
             .mode(opts.dir_mode)
             .create(path)
             .map_err(io_to_error)?;
-        // Canonicalize so two spellings of one directory share a pool slot
-        // rather than opening the environment twice.
+        // Canonicalize so two spellings of one directory share a pool slot.
         let key = std::fs::canonicalize(path).map_err(io_to_error)?;
 
         let mut pool = lock_pool();
@@ -204,9 +193,8 @@ impl Env {
         // SAFETY: out-param for a freshly created handle.
         check(unsafe { mdb_env_create(&mut env) })?;
 
-        // Configure, then open. Everything before `mdb_env_open` must happen
-        // on a created-but-unopened handle, which is what we have here.
-        // SAFETY: `env` is a valid, not-yet-opened handle for each call.
+        // SAFETY: `env` is valid and not yet opened, which is what each of
+        // these configuration calls requires.
         let configured =
             check(unsafe { mdb_env_set_maxdbs(env, opts.max_dbs) })
                 .and_then(|()| {
@@ -228,8 +216,7 @@ impl Env {
                 });
         if let Err(e) = configured {
             // Nothing was pooled, so this handle is ours alone to close.
-            // SAFETY: `env` came from `mdb_env_create`, is non-null, and is
-            // closed exactly once here.
+            // SAFETY: from `mdb_env_create`, non-null, closed exactly once.
             unsafe { mdb_env_close(env) };
             return Err(e);
         }
@@ -246,9 +233,7 @@ impl Env {
         Ok(Env { key, env, dbi_lock })
     }
 
-    /// Flush the environment to disk.
-    ///
-    /// Only meaningful for an environment opened with [`EnvFlags::NOSYNC`] or
+    /// Flush to disk. Only meaningful with [`EnvFlags::NOSYNC`] or
     /// [`EnvFlags::NOMETASYNC`]; otherwise every commit has already synced.
     /// `force` requests a synchronous flush.
     pub fn sync(&self, force: bool) -> Result<()> {
@@ -256,7 +241,7 @@ impl Env {
         check(unsafe { mdb_env_sync(self.env, force as std::os::raw::c_int) })
     }
 
-    /// This environment's directory, canonicalized.
+    /// The environment's directory, canonicalized.
     pub fn path(&self) -> &Path {
         &self.key
     }
@@ -273,7 +258,7 @@ impl Env {
 impl Clone for Env {
     fn clone(&self) -> Env {
         let mut pool = lock_pool();
-        // A live `self` guarantees the slot exists — its refcount counts us.
+        // A live `self` guarantees the slot exists; its refcount counts us.
         if let Some(slot) = pool.get_mut(&self.key) {
             slot.refcnt += 1;
         }
@@ -295,12 +280,11 @@ impl Drop for Env {
         if slot.refcnt != 0 {
             return;
         }
-        // Last handle for this path. Force a final flush (which matters for a
-        // NOSYNC environment) and close — both under the pool lock, so a
-        // concurrent open of this path cannot observe a half-closed
-        // environment: it blocks, finds the slot gone, and opens a fresh one.
-        // SAFETY: `slot.env == self.env`, a valid open environment, closed
-        // exactly once here.
+        // Last handle: sync (which matters under NOSYNC) and close, both under
+        // the pool lock, so a concurrent open of this path blocks, finds the
+        // slot gone, and opens a fresh environment instead of observing a
+        // half-closed one.
+        // SAFETY: `slot.env == self.env`, valid and open, closed exactly once.
         unsafe {
             mdb_env_sync(self.env, 1);
             mdb_env_close(self.env);
@@ -311,25 +295,20 @@ impl Drop for Env {
 
 impl std::fmt::Debug for Env {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        // The raw handle is deliberately not shown: it is an implementation
-        // detail and printing a pointer invites someone to use it.
         f.debug_struct("Env")
             .field("path", &self.key)
             .finish_non_exhaustive()
     }
 }
 
-/// Map an `io::Error` from the directory work onto this crate's error. Every
-/// failure here is a real syscall failure, so it always has an `errno`.
+/// Map an `io::Error` from the directory work onto this crate's error. These
+/// are syscall failures, so they always carry an `errno`.
 fn io_to_error(e: std::io::Error) -> crate::Error {
     crate::Error::Os(e.raw_os_error().unwrap_or(libc::EIO))
 }
 
 #[cfg(test)]
 mod tests {
-    //! The per-path pool: one `MDB_env` per path per process, reference
-    //! counted, closed on last drop. Mirrors the pool in
-    //! `truenas_zfsrewrited/src/ext/lmdb_utils.c`, including its concurrency.
     use super::*;
 
     /// This path's refcount, or `None` if nothing is pooled for it.
@@ -351,40 +330,36 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("env");
 
-        let a = Env::open(&path, &opts()).unwrap();
+        let a = Env::open_with(&path, &opts()).unwrap();
         assert_eq!(refcnt(&path), Some(1));
 
-        // A second open of the same path shares the one handle — this is the
-        // whole point, since opening it twice for real corrupts the lock table.
-        let b = Env::open(&path, &opts()).unwrap();
+        let b = Env::open_with(&path, &opts()).unwrap();
         assert_eq!(refcnt(&path), Some(2));
         assert_eq!(a.ptr(), b.ptr());
 
         drop(a);
-        assert_eq!(refcnt(&path), Some(1), "one handle left, env stays open");
+        assert_eq!(refcnt(&path), Some(1));
         drop(b);
-        assert_eq!(refcnt(&path), None, "last drop closes and unpools it");
+        assert_eq!(refcnt(&path), None);
 
         // Reopening after a full close gives a fresh environment.
-        let c = Env::open(&path, &opts()).unwrap();
+        let c = Env::open_with(&path, &opts()).unwrap();
         assert_eq!(refcnt(&path), Some(1));
         drop(c);
         assert_eq!(refcnt(&path), None);
     }
 
     #[test]
-    fn a_different_spelling_of_the_same_directory_shares_the_slot() {
+    fn a_different_spelling_of_one_directory_shares_the_slot() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("env");
-        let a = Env::open(&path, &opts()).unwrap();
+        let a = Env::open_with(&path, &opts()).unwrap();
 
-        // ./env and env/../env are the same directory; canonicalizing the key
-        // is what keeps them from becoming two environments.
         let indirect = path.join("..").join("env");
-        let b = Env::open(&indirect, &opts()).unwrap();
+        let b = Env::open_with(&indirect, &opts()).unwrap();
         assert_eq!(refcnt(&path), Some(2));
         assert_eq!(a.ptr(), b.ptr());
-        assert_eq!(a.path(), b.path(), "both canonicalize to one path");
+        assert_eq!(a.path(), b.path());
     }
 
     #[test]
@@ -392,7 +367,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("env");
 
-        let a = Env::open(&path, &opts()).unwrap();
+        let a = Env::open_with(&path, &opts()).unwrap();
         let b = a.clone();
         assert_eq!(refcnt(&path), Some(2));
         assert_eq!(a.ptr(), b.ptr());
@@ -405,9 +380,6 @@ mod tests {
 
     #[test]
     fn concurrent_open_and_close_is_race_free() {
-        // Mirrors the reference's multithreaded test: threads hammer
-        // open -> use -> drop on one path. The pool must keep the refcount
-        // consistent and never double-open or double-close.
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("env");
 
@@ -416,8 +388,8 @@ mod tests {
             let p = path.clone();
             handles.push(std::thread::spawn(move || {
                 for _ in 0..50 {
-                    let e = Env::open(&p, &opts()).unwrap();
-                    e.sync(false).unwrap(); // touch the shared handle
+                    let e = Env::open_with(&p, &opts()).unwrap();
+                    e.sync(false).unwrap();
                     drop(e);
                 }
             }));
@@ -425,16 +397,36 @@ mod tests {
         for h in handles {
             h.join().unwrap();
         }
-        assert_eq!(refcnt(&path), None, "every handle was released");
+        assert_eq!(refcnt(&path), None);
     }
 
     #[test]
-    fn opening_a_path_that_cannot_be_created_reports_the_errno() {
-        // /proc is not writable, so the directory step fails before LMDB is
-        // reached — and the failure must surface as the real errno.
-        let err = Env::open(Path::new("/proc/truenas_mdb_test"), &opts())
-            .expect_err("must not be able to create a directory under /proc");
+    fn a_failed_open_pools_nothing() {
+        // /proc is not writable, so the directory step fails before LMDB.
+        let path = Path::new("/proc/truenas_mdb_test");
+        let err = Env::open_with(path, &opts()).unwrap_err();
         assert!(matches!(err, crate::Error::Os(_)), "{err:?}");
         assert_eq!(err.as_mdb(), None);
+        assert_eq!(refcnt(path), None);
+    }
+
+    #[test]
+    fn a_failed_lmdb_open_pools_nothing() {
+        // map_size 0 is rejected by mdb_env_open, after the handle exists, so
+        // this exercises the close-and-return path rather than the directory
+        // one. Whatever it returns, nothing may be left pooled.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("env");
+        let bad = EnvOptions {
+            map_size: 0,
+            ..Default::default()
+        };
+        let _ = Env::open_with(&path, &bad);
+        assert_eq!(refcnt(&path), None, "a failed open must pool nothing");
+
+        // ...and the path is still usable afterwards.
+        let ok = Env::open_with(&path, &opts()).unwrap();
+        assert_eq!(refcnt(&path), Some(1));
+        drop(ok);
     }
 }

@@ -1,19 +1,18 @@
-//! Hand-written declarations for the parts of `liblmdb` this crate uses.
+//! Declarations for the parts of `liblmdb` this crate uses.
 //!
-//! Bound directly rather than generated: no `bindgen`, so no `libclang` at
-//! build time and nothing to re-check after a toolchain bump. Everything here
-//! is a plain declaration — the `unsafe` calls, and their `// SAFETY:` notes,
-//! live in the safe wrappers in [`env`](crate::env) and [`db`](crate::db).
+//! Hand-written rather than generated, so there is no `bindgen`/`libclang`
+//! build dependency. These are plain declarations; the `unsafe` calls and their
+//! `// SAFETY:` notes live in the safe wrappers.
 //!
-//! Verified against `/usr/include/lmdb.h` from Debian's `liblmdb-dev` 0.9.31.
-//! The values are stable across the 0.9 series (the vendored 0.9.35 in
-//! `truenas_jsonrpc` agrees), but they are ABI, so any change here must be
-//! checked against the header rather than remembered.
+//! Checked against `lmdb.h` from `liblmdb-dev` 0.9.31. The values are ABI: a
+//! change here must be read off the header, not recalled. `MdbCode::message`'s
+//! table and these constants are both pinned by tests against the linked
+//! library.
 #![allow(non_camel_case_types)]
 
 use std::os::raw::{c_char, c_int, c_uint, c_void};
 
-// Opaque C handles — only ever held behind a pointer.
+// Opaque handles, only held behind a pointer.
 pub enum MDB_env {}
 pub enum MDB_txn {}
 pub enum MDB_cursor {}
@@ -21,48 +20,59 @@ pub enum MDB_cursor {}
 /// A database handle: a small integer, valid within its environment.
 pub type MDB_dbi = c_uint;
 
-/// `lmdb.h:178` — `typedef mode_t mdb_mode_t` on Unix.
+/// `mode_t` on Unix.
 pub type mdb_mode_t = libc::mode_t;
 
-/// A key or value: a length and a pointer. On the way in it borrows the
-/// caller's buffer; on the way out it points into the environment's mmap and
-/// is valid only until the transaction ends.
+/// A key or value: length plus pointer. Borrows the caller's buffer on the way
+/// in; points into the environment's mmap on the way out, valid only until the
+/// transaction ends.
 #[repr(C)]
 pub struct MDB_val {
-    pub mv_size: usize, // size_t
+    pub mv_size: usize,
     pub mv_data: *mut c_void,
 }
 
-// --- mdb_env_open flags (lmdb.h:285-305) ---------------------------------
+/// Statistics for a database (`mdb_stat`).
+#[derive(Default)]
+#[repr(C)]
+pub struct MDB_stat {
+    pub ms_psize: c_uint,
+    pub ms_depth: c_uint,
+    pub ms_branch_pages: usize,
+    pub ms_leaf_pages: usize,
+    pub ms_overflow_pages: usize,
+    pub ms_entries: usize,
+}
 
-/// Don't fsync after commit; a crash can lose the most recent transactions.
+// --- mdb_env_open flags --------------------------------------------------
+
+/// No fsync after commit.
 pub const MDB_NOSYNC: c_uint = 0x10000;
 /// Flush data but not the meta page on commit.
 pub const MDB_NOMETASYNC: c_uint = 0x40000;
-/// Don't use a per-thread reader slot — a read transaction is tied to the
-/// transaction object instead of the thread that created it.
+/// No per-thread reader slot; a read transaction owns its slot instead.
 pub const MDB_NOTLS: c_uint = 0x200000;
-/// Turn off readahead. Helps when the database is larger than RAM.
+/// No readahead.
 pub const MDB_NORDAHEAD: c_uint = 0x800000;
 
-// --- mdb_dbi_open flags (lmdb.h:325) -------------------------------------
+// --- mdb_dbi_open flags --------------------------------------------------
 
-/// Create the named database if it does not already exist.
+/// Create the named database if absent.
 pub const MDB_CREATE: c_uint = 0x40000;
 
-// --- mdb_txn_begin flags (lmdb.h:291) ------------------------------------
+// --- mdb_txn_begin flags -------------------------------------------------
 
-/// Begin a read-only transaction.
+/// Read-only transaction.
 pub const MDB_RDONLY: c_uint = 0x20000;
 
-// --- mdb_put flags (lmdb.h:332) ------------------------------------------
+// --- mdb_put flags -------------------------------------------------------
 
-/// Fail with `MDB_KEYEXIST` rather than overwriting an existing key.
+/// Fail with `MDB_KEYEXIST` instead of overwriting.
 pub const MDB_NOOVERWRITE: c_uint = 0x10;
 
-// --- return codes (lmdb.h:401-450) ---------------------------------------
-// Anything outside this range and above zero is a system errno LMDB passed
-// through from a syscall.
+// --- return codes --------------------------------------------------------
+// LMDB's own codes occupy a contiguous block. Anything else non-zero is a
+// system errno passed through from a syscall.
 
 pub const MDB_SUCCESS: c_int = 0;
 pub const MDB_KEYEXIST: c_int = -30799;
@@ -86,12 +96,14 @@ pub const MDB_BAD_TXN: c_int = -30782;
 pub const MDB_BAD_VALSIZE: c_int = -30781;
 pub const MDB_BAD_DBI: c_int = -30780;
 
-// --- MDB_cursor_op ordinals (lmdb.h's enum, in declaration order) --------
+// --- MDB_cursor_op ordinals ----------------------------------------------
 
-/// Position at the first key/value pair.
+/// Position at the first pair.
 pub const MDB_FIRST: c_uint = 0;
 /// Position at the next pair.
 pub const MDB_NEXT: c_uint = 8;
+/// Position at the first key greater than or equal to the one supplied.
+pub const MDB_SET_RANGE: c_uint = 17;
 
 extern "C" {
     pub fn mdb_version(
@@ -100,11 +112,8 @@ extern "C" {
         patch: *mut c_int,
     ) -> *const c_char;
 
-    /// Used only by the test that pins [`MdbCode::message`] to the linked
-    /// library — the crate renders errors from its own table so that nothing
-    /// on the normal path has to cross the FFI boundary.
-    ///
-    /// [`MdbCode::message`]: crate::MdbCode::message
+    /// Used only by the test pinning `MdbCode::message` to the linked library;
+    /// errors are rendered from this crate's own table.
     #[allow(dead_code)]
     pub fn mdb_strerror(err: c_int) -> *const c_char;
 
@@ -127,8 +136,8 @@ extern "C" {
         flags: c_uint,
         txn: *mut *mut MDB_txn,
     ) -> c_int;
-    /// Frees the handle whatever it returns — the transaction must not be
-    /// touched again, not even to abort it.
+    /// Frees the handle whatever it returns: the transaction must not be
+    /// touched afterwards, not even to abort it.
     pub fn mdb_txn_commit(txn: *mut MDB_txn) -> c_int;
     pub fn mdb_txn_abort(txn: *mut MDB_txn);
 
@@ -137,6 +146,11 @@ extern "C" {
         name: *const c_char,
         flags: c_uint,
         dbi: *mut MDB_dbi,
+    ) -> c_int;
+    pub fn mdb_stat(
+        txn: *mut MDB_txn,
+        dbi: MDB_dbi,
+        stat: *mut MDB_stat,
     ) -> c_int;
     pub fn mdb_drop(txn: *mut MDB_txn, dbi: MDB_dbi, del: c_int) -> c_int;
 

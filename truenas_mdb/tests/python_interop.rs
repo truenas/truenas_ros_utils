@@ -1,32 +1,44 @@
-//! Cross-implementation tests: this crate and Python's `lmdb` module over one
-//! shared environment.
+//! Cross-implementation tests against Python's `lmdb` module over one shared
+//! environment.
 //!
-//! This is the suite that justifies linking the system `liblmdb` instead of
-//! vendoring one. `truenas_zfsrewrited`'s C extension is not available here (or
-//! in CI), so Debian's `python3-lmdb` — which links the same `liblmdb0` —
-//! stands in for it, exercising the same on-disk contract: the directory
-//! layout, named sub-databases, byte-exact values, and the shared `map_size`.
+//! These check that this crate's on-disk behaviour is plain LMDB and nothing
+//! else: an independent implementation, linking the same `liblmdb`, must read
+//! and write the same databases with byte-identical results. That is the
+//! property that would break first if the wrapper ever added an envelope,
+//! mangled a value, or opened an environment with incompatible flags.
 //!
 //! Skips when `python3` or its `lmdb` module is missing. Set
-//! `TRUENAS_MDB_REQUIRE_PYTHON=1` (as CI does) to turn that skip into a
-//! failure, so the suite cannot go green by quietly doing nothing.
+//! `TRUENAS_MDB_REQUIRE_PYTHON=1` to turn that skip into a failure, so the
+//! suite cannot go green by doing nothing.
+//!
+//! Debian's `python3-lmdb` links the system `liblmdb0` and is what this
+//! expects. `pip install lmdb` bundles its own copy and would test something
+//! else.
 
-use std::ops::ControlFlow;
 use std::path::Path;
 use std::process::Command;
 
-use truenas_mdb::{Db, Env, EnvOptions, PutFlags};
+use truenas_mdb::{Db, Env, EnvFlags, EnvOptions};
 
-/// Map size used on both sides. Well above py-lmdb's 10 MiB default so the
-/// number has to be passed across deliberately rather than coinciding.
+/// Map size used on both sides, well above py-lmdb's 10 MiB default so the
+/// value has to be passed across deliberately rather than coinciding.
 const MAP_SIZE: usize = 64 * 1024 * 1024;
+
+const OPTS: EnvOptions = EnvOptions {
+    map_size: MAP_SIZE,
+    max_dbs: 8,
+    max_readers: 0,
+    mode: 0o600,
+    dir_mode: 0o700,
+    flags: EnvFlags::NOTLS,
+};
 
 /// Whether a missing `python3-lmdb` should fail rather than skip.
 fn python_required() -> bool {
     std::env::var_os("TRUENAS_MDB_REQUIRE_PYTHON").is_some_and(|v| v == "1")
 }
 
-/// `Some(())` when the suite can run; `None` to skip (unless required).
+/// `Some(())` when the suite can run; `None` to skip.
 fn python_lmdb() -> Option<()> {
     let ok = Command::new("python3")
         .args(["-c", "import lmdb"])
@@ -37,15 +49,14 @@ fn python_lmdb() -> Option<()> {
     }
     assert!(
         !python_required(),
-        "TRUENAS_MDB_REQUIRE_PYTHON=1 but `python3 -c 'import lmdb'` failed \
-         (install python3-lmdb; note that `pip install lmdb` bundles its own \
-         LMDB and is not a substitute)"
+        "TRUENAS_MDB_REQUIRE_PYTHON=1 but `python3 -c 'import lmdb'` failed; \
+         install python3-lmdb"
     );
     None
 }
 
-/// Run a Python snippet, returning its stdout. A failure prints the script and
-/// the interpreter's stderr, because a traceback is the whole diagnostic here.
+/// Run a Python snippet and return its stdout, printing the script and stderr
+/// on failure.
 fn py(script: &str) -> String {
     let out = Command::new("python3")
         .arg("-c")
@@ -61,8 +72,8 @@ fn py(script: &str) -> String {
     String::from_utf8_lossy(&out.stdout).into_owned()
 }
 
-/// The preamble every snippet shares: open the same environment the Rust side
-/// does, with the flags the interop contract requires.
+/// Open the same environment the Rust side does, with the flags the shared
+/// layout requires.
 fn preamble(path: &Path, readonly: bool) -> String {
     format!(
         "import lmdb\n\
@@ -72,14 +83,6 @@ fn preamble(path: &Path, readonly: bool) -> String {
         path = path.to_str().unwrap(),
         readonly = if readonly { "True" } else { "False" },
     )
-}
-
-fn options() -> EnvOptions {
-    EnvOptions {
-        map_size: MAP_SIZE,
-        max_dbs: 8,
-        ..Default::default()
-    }
 }
 
 #[test]
@@ -95,9 +98,8 @@ fn both_sides_link_the_same_liblmdb() {
     assert_eq!(
         vec![ours.0, ours.1, ours.2],
         theirs,
-        "this crate and python3-lmdb report different LMDB versions, so they \
-         are not the same library — two copies of LMDB over one environment \
-         is exactly what not vendoring is meant to prevent"
+        "different LMDB versions means two copies of the library, which is \
+         unsound over one environment"
     );
 }
 
@@ -108,12 +110,12 @@ fn rust_writes_and_python_reads() {
     let path = dir.path().join("env");
 
     {
-        let env = Env::open(&path, &options()).unwrap();
-        let state = Db::open(&env, Some("state"), true).unwrap();
-        let main = Db::open(&env, None, false).unwrap();
-        state.put(b"job", b"RUNNING", PutFlags::empty()).unwrap();
-        state.put(b"count", b"42", PutFlags::empty()).unwrap();
-        main.put(b"top", b"level", PutFlags::empty()).unwrap();
+        let env = Env::open_with(&path, &OPTS).unwrap();
+        let state = Db::create(&env, "state").unwrap();
+        let main = Db::main(&env).unwrap();
+        state.put("job", "RUNNING").unwrap();
+        state.put("count", "42").unwrap();
+        main.put("top", "level").unwrap();
     } // closed, so Python is not racing a live writer
 
     let out = py(&format!(
@@ -138,9 +140,8 @@ fn python_writes_and_rust_reads() {
     let Some(()) = python_lmdb() else { return };
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("env");
-    // LMDB requires the directory to exist; let Python create the environment
-    // outright, so this direction proves we can adopt a database we did not
-    // make.
+    // Let Python create the environment outright, so this direction proves a
+    // database made elsewhere can be adopted unchanged.
     std::fs::create_dir_all(&path).unwrap();
 
     py(&format!(
@@ -153,23 +154,19 @@ fn python_writes_and_rust_reads() {
         preamble(&path, false)
     ));
 
-    let env = Env::open(&path, &options()).unwrap();
-    let state = Db::open(&env, Some("state"), false).unwrap();
+    let env = Env::open_with(&path, &OPTS).unwrap();
+    let state = Db::open(&env, "state").unwrap();
     assert_eq!(
-        state.get(b"from-python").unwrap().as_deref(),
+        state.get("from-python").unwrap().as_deref(),
         Some(&b"hello"[..])
     );
-    assert_eq!(state.get(b"n").unwrap().as_deref(), Some(&b"7"[..]));
+    assert_eq!(state.get("n").unwrap().as_deref(), Some(&b"7"[..]));
+    assert_eq!(state.len().unwrap(), 2);
 
-    let mut seen = Vec::new();
-    state
-        .traverse(|k, v| {
-            seen.push((k.to_vec(), v.to_vec()));
-            ControlFlow::<()>::Continue(())
-        })
-        .unwrap();
+    let all: Vec<(Vec<u8>, Vec<u8>)> =
+        state.iter().unwrap().collect::<Result<_, _>>().unwrap();
     assert_eq!(
-        seen,
+        all,
         [
             (b"from-python".to_vec(), b"hello".to_vec()),
             (b"n".to_vec(), b"7".to_vec()),
@@ -183,20 +180,20 @@ fn binary_keys_and_values_cross_unchanged() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("env");
 
-    // Embedded NULs, high bytes, and an invalid UTF-8 sequence — anything that
-    // an envelope, a string conversion, or a C `strlen` would mangle.
+    // Embedded NULs, high bytes, and invalid UTF-8: anything an envelope, a
+    // string conversion, or a C `strlen` would mangle.
     let key: &[u8] = b"k\x00ey\xff";
     let value: &[u8] = b"\x00\xff\x80\xc3\x28bin\x00ary\n\r\x7f";
 
     {
-        let env = Env::open(&path, &options()).unwrap();
-        let db = Db::open(&env, Some("bin"), true).unwrap();
-        db.put(key, value, PutFlags::empty()).unwrap();
-        db.put(b"empty", b"", PutFlags::empty()).unwrap();
+        let env = Env::open_with(&path, &OPTS).unwrap();
+        let db = Db::create(&env, "bin").unwrap();
+        db.put(key, value).unwrap();
+        db.put("empty", "").unwrap();
     }
 
-    // Round-trip through Python: read what Rust wrote, and write it back under
-    // a second key so the Rust side can check the return leg too.
+    // Read what Rust wrote, and write it back under a second key so the return
+    // leg can be checked too.
     let out = py(&format!(
         "{}\
          db = env.open_db(b'bin', create=False)\n\
@@ -214,9 +211,10 @@ fn binary_keys_and_values_cross_unchanged() {
     ));
     assert_eq!(out.trim(), "ok");
 
-    let env = Env::open(&path, &options()).unwrap();
-    let db = Db::open(&env, Some("bin"), false).unwrap();
-    assert_eq!(db.get(b"roundtrip").unwrap().as_deref(), Some(value));
+    let env = Env::open_with(&path, &OPTS).unwrap();
+    let db = Db::open(&env, "bin").unwrap();
+    assert_eq!(db.get("roundtrip").unwrap().as_deref(), Some(value));
+    assert_eq!(db.get(key).unwrap().as_deref(), Some(value));
 }
 
 #[test]
@@ -225,22 +223,21 @@ fn python_reads_a_database_past_its_own_default_map_size() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("env");
 
-    // 12 MiB, comfortably past py-lmdb's 10 MiB default map_size. Opening
-    // still succeeds — LMDB raises an undersized map to at least the committed
-    // data size — which is precisely why the hazard is a *write*-side one and
-    // worth documenting rather than assuming.
+    // 12 MiB, past py-lmdb's 10 MiB default map_size. Opening still succeeds,
+    // because LMDB raises an undersized map to the committed data size — which
+    // is why the map_size hazard is a write-side one.
     {
-        let env = Env::open(&path, &options()).unwrap();
-        let db = Db::open(&env, Some("bulk"), true).unwrap();
+        let env = Env::open_with(&path, &OPTS).unwrap();
+        let db = Db::create(&env, "bulk").unwrap();
         let chunk = vec![0x5au8; 1024 * 1024];
         for i in 0..12u32 {
-            db.put(&i.to_be_bytes(), &chunk, PutFlags::empty()).unwrap();
+            db.put(i.to_be_bytes(), &chunk).unwrap();
         }
     }
 
     let out = py(&format!(
         "import lmdb\n\
-         # No map_size argument at all: py-lmdb's 10 MiB default.\n\
+         # No map_size argument: py-lmdb's 10 MiB default.\n\
          env = lmdb.open({path:?}, subdir=True, max_dbs=8, readonly=True)\n\
          db = env.open_db(b'bulk', create=False)\n\
          with env.begin(db=db) as txn:\n\
@@ -254,17 +251,16 @@ fn python_reads_a_database_past_its_own_default_map_size() {
 }
 
 #[test]
-fn a_live_rust_environment_sees_a_python_write() {
+fn a_live_environment_sees_the_other_processs_write() {
     let Some(()) = python_lmdb() else { return };
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("env");
 
-    // The realistic shape: a long-lived Rust process holding the environment
-    // open while another process writes to it.
-    let env = Env::open(&path, &options()).unwrap();
-    let db = Db::open(&env, Some("state"), true).unwrap();
-    db.put(b"before", b"1", PutFlags::empty()).unwrap();
-    assert_eq!(db.get(b"later").unwrap(), None);
+    // A long-lived process holding the environment open while another writes.
+    let env = Env::open_with(&path, &OPTS).unwrap();
+    let db = Db::create(&env, "state").unwrap();
+    db.put("before", "1").unwrap();
+    assert_eq!(db.get("later").unwrap(), None);
 
     py(&format!(
         "{}\
@@ -275,14 +271,52 @@ fn a_live_rust_environment_sees_a_python_write() {
         preamble(&path, false)
     ));
 
-    // Every read here opens a fresh transaction, so it sees the new commit
-    // rather than a stale snapshot.
-    assert_eq!(db.get(b"later").unwrap().as_deref(), Some(&b"2"[..]));
-    assert_eq!(db.get(b"before").unwrap().as_deref(), Some(&b"1"[..]));
+    // Each read opens a fresh transaction, so it sees the new commit rather
+    // than a stale snapshot.
+    assert_eq!(db.get("later").unwrap().as_deref(), Some(&b"2"[..]));
+    assert_eq!(db.get("before").unwrap().as_deref(), Some(&b"1"[..]));
+    assert_eq!(db.len().unwrap(), 2);
 }
 
-/// Render bytes as a Python `bytes` literal, escaping everything — the only
-/// safe way to get arbitrary bytes into a `python3 -c` script.
+#[test]
+fn an_iterator_holds_its_snapshot_against_another_process() {
+    let Some(()) = python_lmdb() else { return };
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("env");
+
+    let env = Env::open_with(&path, &OPTS).unwrap();
+    let db = Db::create(&env, "state").unwrap();
+    for key in ["a", "b", "c"] {
+        db.put(key, key).unwrap();
+    }
+
+    // The read transaction is opened here and outlives the Python write.
+    let iter = db.iter().unwrap();
+    py(&format!(
+        "{}\
+         state = env.open_db(b'state')\n\
+         with env.begin(db=state, write=True) as txn:\n\
+         \x20   txn.put(b'd', b'd')\n\
+         \x20   txn.delete(b'a')\n",
+        preamble(&path, false)
+    ));
+
+    let keys: Vec<Vec<u8>> = iter
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap()
+        .into_iter()
+        .map(|(k, _)| k)
+        .collect();
+    assert_eq!(keys, [b"a".to_vec(), b"b".to_vec(), b"c".to_vec()]);
+
+    // A new read sees the other process's changes.
+    assert_eq!(db.len().unwrap(), 3);
+    assert!(db.contains_key("d").unwrap());
+    assert!(!db.contains_key("a").unwrap());
+}
+
+/// Render bytes as a fully escaped Python `bytes` literal — the only safe way
+/// to get arbitrary bytes into a `python3 -c` script.
 struct PyBytes<'a>(&'a [u8]);
 
 impl std::fmt::Debug for PyBytes<'_> {
