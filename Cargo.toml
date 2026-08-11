@@ -1,11 +1,9 @@
 # Cargo workspace for the `truenas_ros` satellite crates: pieces that belong
-# with it but cannot live inside it. `truenas_ros` depends only on `libc` and
-# `bitflags` and links no C; each crate here breaks exactly one of those rules
-# for a reason stated in its own manifest.
+# with it but cannot live inside it, because `truenas_ros` depends only on
+# `libc` and `bitflags` and links no C.
 #
-# Virtual workspace on purpose — there is no umbrella crate. A key/value store
-# and a wire codec share tooling, not an API, so consumers depend on the member
-# they actually want.
+# Virtual workspace: no umbrella crate. The members share tooling, not an API,
+# so consumers depend on the one they want.
 [workspace]
 resolver = "2"
 members = [

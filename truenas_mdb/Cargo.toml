@@ -1,10 +1,10 @@
 # `truenas_mdb` — bindings to the system LMDB (`liblmdb`): a pooled environment
 # and a byte-oriented key/value store.
 #
-# The library is linked, not vendored: exactly one copy of LMDB may mediate an
-# environment within a process, and these databases are shared with other
-# processes linking `liblmdb0`. A statically bundled copy alongside it would be
-# a second. Build needs `liblmdb-dev`; runtime needs `liblmdb0`.
+# Links the system library so that databases can be shared with any other
+# process using it. Exactly one copy of LMDB may mediate an environment within
+# a process, so a bundled copy must not be loaded alongside it. Build needs
+# `liblmdb-dev`; runtime needs `liblmdb0`.
 [package]
 name = "truenas_mdb"
 version = "0.1.0"

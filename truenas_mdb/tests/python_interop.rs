@@ -3,9 +3,9 @@
 //!
 //! These check that this crate's on-disk behaviour is plain LMDB and nothing
 //! else: an independent implementation, linking the same `liblmdb`, must read
-//! and write the same databases with byte-identical results. That is the
-//! property that would break first if the wrapper ever added an envelope,
-//! mangled a value, or opened an environment with incompatible flags.
+//! and write the same databases with byte-identical results. Value framing,
+//! key handling, and the environment flags all have to agree for that to
+//! hold.
 //!
 //! Skips when `python3` or its `lmdb` module is missing. Set
 //! `TRUENAS_MDB_REQUIRE_PYTHON=1` to turn that skip into a failure, so the

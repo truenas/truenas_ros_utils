@@ -44,9 +44,9 @@
 //! Two of this crate's APIs hold one open across caller code — the closures
 //! given to [`Db::scan`] and [`Db::with_value`], and a live [`Iter`] — and
 //! while either is in flight, any further operation on that environment from
-//! the same thread returns `EDEADLK` instead of proceeding. Left to LMDB it
-//! would be an unexplained `MDB_BAD_RSLOT` for a read, or a self-deadlock on
-//! the writer mutex for a write.
+//! the same thread returns `EDEADLK` rather than attempting a second
+//! transaction, which LMDB cannot serve: a read needs the thread's reader slot
+//! and a write needs the writer mutex, both already held.
 //!
 //! So this reads and writes back in two steps rather than one:
 //!
@@ -69,28 +69,26 @@
 //!
 //! # One environment per path, per process
 //!
-//! LMDB corrupts its lock table if one process opens the same environment
-//! twice, so [`Env::open`] keeps a process-wide pool keyed by canonical path.
-//! Opening an already-open path returns another handle to the same
-//! environment, ignoring the [`EnvOptions`] the first open fixed. The
-//! environment is synced and closed when the last handle drops.
+//! LMDB requires one open per environment per process, so [`Env::open`] keeps
+//! a process-wide pool keyed by canonical path. Opening an already-open path
+//! returns another handle to the same environment, ignoring the
+//! [`EnvOptions`] the first open fixed. The environment is synced and closed
+//! when the last handle drops.
 //!
 //! # Sharing an environment between processes
 //!
-//! LMDB is multi-process safe, and this crate links the system `liblmdb`
-//! rather than vendoring one, so a database can be shared with any other
-//! process using the same library. Four constraints apply, none of which LMDB
-//! diagnoses:
+//! LMDB is multi-process safe, and this crate links the system `liblmdb`, so a
+//! database can be shared with any other process using that library. Four
+//! constraints apply, and LMDB reports none of them:
 //!
-//! - Environments are directories (`MDB_NOSUBDIR` is not offered), matching
-//!   the default layout elsewhere.
+//! - Environments are directories; `MDB_NOSUBDIR` is not offered.
 //! - `MDB_WRITEMAP` is not offered: `lmdb.h` forbids mixing processes with and
 //!   without it on one environment.
 //! - [`EnvOptions::map_size`] is shared state. Every process sets its own, and
 //!   the smallest one governs in practice — see its documentation.
-//! - Exactly one copy of LMDB may mediate an environment within a process.
-//!   Linking a second, statically bundled copy alongside the system library is
-//!   unsound; [`version`] reports which one this process got.
+//! - Exactly one copy of LMDB may mediate an environment within a process, so
+//!   a statically bundled copy must not be loaded alongside the system
+//!   library. [`version`] reports which one this process linked.
 //!
 //! # Requirements
 //!

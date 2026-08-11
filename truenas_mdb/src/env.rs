@@ -7,9 +7,10 @@
 //!
 //! - A `*mut MDB_env` comes from `mdb_env_create`, is never handed out, and is
 //!   created and closed only while the pool mutex is held.
-//! - LMDB corrupts its lock table if one process opens the same environment
-//!   twice, so every [`Env::open`] of a path shares one handle, reference
-//!   counted, closed exactly once when the last handle drops.
+//! - LMDB requires one open per environment per process — a second open takes
+//!   its own `fcntl` advisory locks and invalidates the first's — so every
+//!   [`Env::open`] of a path shares one handle, reference counted, closed
+//!   exactly once when the last handle drops.
 //! - An `MDB_env` may be used from any thread and LMDB serializes its own
 //!   writers, so the handle is sound to send and share. What is thread-bound is
 //!   a *transaction*, and [`crate::txn`] enforces that one never crosses a
@@ -129,8 +130,9 @@ fn env_pool() -> &'static Mutex<HashMap<PathBuf, EnvSlot>> {
     POOL.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-/// Lock the pool, recovering from poisoning: a panic mid-update leaves the map
-/// consistent, and a poisoned pool would break every later open.
+/// Lock the pool, recovering from poisoning: the map is consistent at every
+/// point a panic could unwind through, so the guard is taken rather than the
+/// poison propagated to every later open.
 fn lock_pool() -> MutexGuard<'static, HashMap<PathBuf, EnvSlot>> {
     env_pool().lock().unwrap_or_else(|e| e.into_inner())
 }
@@ -138,9 +140,9 @@ fn lock_pool() -> MutexGuard<'static, HashMap<PathBuf, EnvSlot>> {
 /// An open environment: a directory holding `data.mdb` and `lock.mdb`, with one
 /// writer and many readers.
 ///
-/// Reference counted per canonical path. Cloning shares the handle; the last
-/// drop syncs and closes it. Opening a path twice therefore shares rather than
-/// corrupting the lock table.
+/// Reference counted per canonical path: opening a path already open in this
+/// process yields another handle to the same environment, which is what LMDB
+/// requires. Cloning shares the handle; the last drop syncs and closes it.
 pub struct Env {
     /// Canonical pool key, and the environment's directory.
     key: PathBuf,

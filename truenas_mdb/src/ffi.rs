@@ -1,13 +1,10 @@
 //! Declarations for the parts of `liblmdb` this crate uses.
 //!
-//! Hand-written rather than generated, so there is no `bindgen`/`libclang`
-//! build dependency. These are plain declarations; the `unsafe` calls and their
-//! `// SAFETY:` notes live in the safe wrappers.
+//! Plain declarations; the `unsafe` calls and their `// SAFETY:` notes live in
+//! the safe wrappers.
 //!
-//! Checked against `lmdb.h` from `liblmdb-dev` 0.9.31. The values are ABI: a
-//! change here must be read off the header, not recalled. `MdbCode::message`'s
-//! table and these constants are both pinned by tests against the linked
-//! library.
+//! These values are ABI, taken from `lmdb.h` in `liblmdb-dev` 0.9.31. Tests
+//! pin them, and `MdbCode`'s message table, against the linked library.
 #![allow(non_camel_case_types)]
 
 use std::os::raw::{c_char, c_int, c_uint, c_void};

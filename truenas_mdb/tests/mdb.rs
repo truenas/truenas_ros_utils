@@ -1,9 +1,9 @@
 //! Behavioral tests for the public API.
 //!
-//! These exercise this crate's design, not LMDB's: they assume the library
-//! stores and returns what it is given, and check the wrapper's own
-//! decisions — copying before a transaction ends, guard drop order, error
-//! classification, scan bounds, iterator state, and handle lifetimes.
+//! These take LMDB's storage as given and cover this crate's own decisions:
+//! copying before a transaction ends, guard drop order, transaction slot
+//! accounting, error classification, scan bounds, iterator state, and handle
+//! lifetimes.
 //!
 //! Needs only a writable temp directory and the linked `liblmdb`.
 
@@ -182,8 +182,8 @@ fn two_handles_on_one_database_see_the_same_data() {
 
 #[test]
 fn the_main_database_indexes_the_named_ones() {
-    // Documented caveat: named databases are entries in the main database, so
-    // a scan of it also yields their names.
+    // Named databases are entries in the main database, so a scan of it also
+    // yields their names.
     let (_dir, env) = scratch_env(SMALL);
     let main = Db::main(&env).unwrap();
     assert!(main.is_empty().unwrap());
@@ -823,9 +823,9 @@ fn exceeding_map_size_reports_map_full() {
 
 #[test]
 fn a_failed_write_leaves_no_transaction_behind() {
-    // Each failure aborts its transaction on the guard's drop. If one leaked,
-    // the environment's single writer lock would be held and the next write
-    // would deadlock rather than fail.
+    // A write transaction holds the environment's single writer lock until its
+    // guard drops, on the failure path as much as the success path. Repeated
+    // failures must therefore leave the next write able to proceed.
     let (_dir, _env, db) = scratch();
     for _ in 0..64 {
         assert!(db.put("", "v").is_err());
@@ -837,8 +837,9 @@ fn a_failed_write_leaves_no_transaction_behind() {
 
 #[test]
 fn a_failed_read_leaves_no_reader_slot_behind() {
-    // Reader slots are finite (126 by default), so a leaked read transaction
-    // would show up as ReadersFull well before this loop ends.
+    // A read claims this thread's transaction slot and a reader lock-table
+    // entry, both released when its guard drops — again on the failure path.
+    // Otherwise the very next call would be refused with EDEADLK.
     let (_dir, _env, db) = scratch();
     for _ in 0..512 {
         assert!(db.get("").is_err());

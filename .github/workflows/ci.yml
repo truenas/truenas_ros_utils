@@ -60,9 +60,10 @@ jobs:
       env:
         TRUENAS_MDB_REQUIRE_PYTHON: "1"
 
-    # An FFI wrapper's bugs show up as memory errors, so the suites run again
-    # under memcheck. Only `definite` leaks are errors: the environment pool is
-    # a process-lifetime static, which memcheck reports as possibly lost.
+    # The crate's correctness at the FFI boundary is a memory-safety property,
+    # so the suites run again under memcheck. Only `definite` leaks count as
+    # errors: the environment pool is a process-lifetime static, which memcheck
+    # reports as possibly lost.
     - name: valgrind
       run: |
         sudo apt-get install -y --no-install-recommends valgrind

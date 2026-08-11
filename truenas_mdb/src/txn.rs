@@ -3,20 +3,20 @@
 //!
 //! # One transaction per thread per environment
 //!
-//! `lmdb.h`: "A thread can only use one transaction at a time". Breaking that
-//! is not diagnosed by LMDB in any useful way:
+//! `lmdb.h`: "A thread can only use one transaction at a time". Attempting a
+//! second one has no safe outcome:
 //!
-//! - A second *read* transaction finds the thread's reader slot already taken
-//!   and fails with `MDB_BAD_RSLOT`, at a call site that looks unrelated.
-//! - A second *write* transaction blocks on the environment's writer mutex,
-//!   which is process-shared and not recursive, so the thread deadlocks
-//!   against itself. It would also reuse `MDB_env`'s single preallocated write
-//!   transaction, which the first one is still using.
+//! - A read transaction needs the thread's reader lock-table slot, which the
+//!   first one holds, and fails with `MDB_BAD_RSLOT`.
+//! - A write transaction blocks on the environment's writer mutex, which is
+//!   process-shared and not recursive, so the thread waits on itself. It also
+//!   needs `MDB_env`'s single preallocated write transaction, which the first
+//!   one is using.
 //!
-//! [`TxnGuard::begin`] therefore refuses up front, returning `EDEADLK`, when
-//! this thread already holds a transaction on this environment. Different
-//! environments have separate reader tables and writer mutexes, so the guard
-//! is per environment, not global.
+//! [`TxnGuard::begin`] therefore refuses up front with `EDEADLK` when this
+//! thread already holds a transaction on this environment. Different
+//! environments have separate reader tables and writer mutexes, so the slot is
+//! per environment, not global.
 //!
 //! Callers reach this through the two APIs that hold a transaction open across
 //! caller code: the closures given to `Db::scan`/`Db::with_value`, and a live
