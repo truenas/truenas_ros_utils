@@ -1,0 +1,8 @@
+# SPDX-FileCopyrightText: 2026 iXsystems, Inc, DBA TrueNAS
+# SPDX-License-Identifier: MIT
+# Says something, then refuses.
+auth      required  pam_echo.so file=@CONFDIR@/deny.txt
+auth      required  pam_deny.so
+account   required  pam_deny.so
+password  required  pam_deny.so
+session   required  pam_deny.so

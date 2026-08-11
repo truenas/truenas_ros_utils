@@ -1,0 +1,61 @@
+# SPDX-FileCopyrightText: 2026 iXsystems, Inc, DBA TrueNAS
+# SPDX-License-Identifier: MIT
+# `truenas_pam` — a PAM client: transactions against the system `libpam`, and a
+# steppable authentication driver over them.
+#
+# Links the system library because a PAM transaction is only meaningful against
+# the modules and configuration the host has installed. Build needs
+# `libpam0g-dev`; runtime needs `libpam0g` and whichever modules the service
+# files name.
+[package]
+name = "truenas_pam"
+version = "0.1.0"
+description = "A PAM client: transactions against the system libpam, and a steppable authentication driver"
+categories = ["authentication", "api-bindings"]
+keywords = ["pam", "authentication", "linux", "truenas"]
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+# The C ABI: the conversation structs' layout, and `malloc`/`free`, which the
+# module stack uses to reclaim the responses this crate hands it. No bindgen —
+# the declarations are hand-written in src/ffi.rs, so no libclang and nothing
+# generated at build time.
+libc = "0.2.155"
+# Typed flag sets for the operation flags.
+bitflags = "2.6"
+
+[dev-dependencies]
+tempfile = "3"
+
+[lints]
+workspace = true
+
+# The Linux-PAM Application Developers' Guide, clause by clause. Needs the
+# modules the service files in tests/pam.d name, all of which ship in
+# `libpam-modules`.
+[[test]]
+name = "adg"
+path = "tests/adg.rs"
+
+# The login sequence: the order it runs in, and what it refuses.
+[[test]]
+name = "authenticator"
+path = "tests/authenticator.rs"
+
+# Authentication driven one round at a time, including what a step timeout
+# bounds and what it does not. Takes a second or so: one case waits out a
+# module configured to be slow to return.
+[[test]]
+name = "stepped"
+path = "tests/stepped.rs"
+
+# This crate's own decisions, driven through a real stack: error
+# classification, items, the environment, the message record, and a
+# conversation that fails or panics.
+[[test]]
+name = "pam"
+path = "tests/pam.rs"

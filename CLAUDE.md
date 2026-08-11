@@ -101,6 +101,44 @@ environment ([`tests/python_interop.rs`](truenas_mdb/tests/python_interop.rs)).
 It must be the distro package, which links `liblmdb0`; `pip install lmdb`
 bundles its own copy and would test nothing.
 
+## `truenas_pam`
+
+Links the system `libpam`. A PAM transaction is only meaningful against the
+modules and configuration the host has installed, so there is nothing to
+vendor.
+
+`pam_start_confdir` is the entry point rather than `pam_start`, so a
+transaction may be pointed at service files of its own.
+[`tests/`](truenas_pam/tests/) run their own stacks out of the source tree that
+way, without privilege and without touching `/etc/pam.d`. It needs libpam 1.4.
+
+`libpam_misc` is not linked, so `pam_misc_setenv`'s read-only variables are not
+offered; `pam_putenv` covers set, replace, and delete.
+
+Items are a partial set. `PAM_AUTHTOK` and `PAM_OLDAUTHTOK` are omitted because
+a password reaches a module through the conversation, and writing one into the
+handle leaves it there for every later module to read; `PAM_CONV` because the
+crate owns it; the `PAM_FAIL_DELAY` function pointer in favour of
+`pam_fail_delay()`; and the X and prompt-text items as having no bearing on a
+network service. Each omission is documented where the accessors are defined.
+
+The conversation is the crate's only C callback, and
+[`src/conv.rs`](truenas_pam/src/conv.rs) is where the conventions for one live:
+responses are allocated with `malloc` because the module stack frees them with
+`free`; every array the stack will not see is scrubbed before release; and the
+body runs under `catch_unwind`, since unwinding into C is undefined and
+aborting would skip `pam_end`. A panic is held until libpam has unwound its own
+frames, then resumed on the thread that drove the call.
+
+One thread at a time per handle, stated in the types: every operation takes
+`&mut self`, and [`src/step.rs`](truenas_pam/src/step.rs) moves the whole
+transaction onto its worker, so the caller cannot reach it mid-exchange.
+Cancellation is cooperative — a module cannot be stopped mid-call — so a step
+timeout bounds the round trip and teardown still waits for the module.
+
+The crate knows PAM and nothing above it. Which service to run, what a prompt
+means, and what to make of a refusal are policy and belong to the consumer.
+
 ## `truenas_xdr`
 
 Conforms to RFC 4506 (STD 67).
@@ -136,13 +174,18 @@ Everything below must pass before a change lands. CI runs all of it.
 ```sh
 cargo fmt --all --check
 cargo clippy --workspace --all-targets -- -D warnings
-TRUENAS_MDB_REQUIRE_PYTHON=1 cargo test --workspace
+TRUENAS_MDB_REQUIRE_PYTHON=1 TRUENAS_PAM_REQUIRE_MODULES=1 \
+    cargo test --workspace
 cargo test -p truenas_xdr --no-default-features
 cargo doc --workspace --no-deps          # must be warning-free
 CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER="valgrind --error-exitcode=99 \
-    --leak-check=full --errors-for-leak-kinds=definite --quiet" \
-    TRUENAS_MDB_REQUIRE_PYTHON=1 cargo test --workspace
+    --leak-check=full --errors-for-leak-kinds=definite \
+    --keep-debuginfo=yes --quiet" \
+    TRUENAS_MDB_REQUIRE_PYTHON=1 TRUENAS_PAM_REQUIRE_MODULES=1 \
+    cargo test --workspace
 ```
 
-Build needs `liblmdb-dev`; the interop suite needs `python3-lmdb`; the memcheck
-run needs `valgrind`.
+Build needs `liblmdb-dev` and `libpam0g-dev`; the interop suite needs
+`python3-lmdb` and the PAM suites need `libpam-modules`; the memcheck run needs
+`valgrind`, and `--keep-debuginfo=yes` because libpam unloads each module
+before the process ends.

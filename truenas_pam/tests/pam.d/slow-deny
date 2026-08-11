@@ -1,0 +1,13 @@
+# SPDX-FileCopyrightText: 2026 iXsystems, Inc, DBA TrueNAS
+# SPDX-License-Identifier: MIT
+# Asks once, then takes a second to fail.
+#
+# pam_faildelay sets the pause libpam applies before a failed authentication
+# returns, in microseconds. Answering the prompt therefore leaves the stack
+# slow to reach its next stopping point.
+auth      required  pam_faildelay.so delay=1000000
+auth      required  pam_stress.so
+auth      required  pam_deny.so
+account   required  pam_deny.so
+password  required  pam_deny.so
+session   required  pam_deny.so

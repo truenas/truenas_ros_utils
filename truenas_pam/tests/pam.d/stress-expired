@@ -1,0 +1,9 @@
+# SPDX-FileCopyrightText: 2026 iXsystems, Inc, DBA TrueNAS
+# SPDX-License-Identifier: MIT
+# As `stress`, but the account needs a new token: pam_sm_acct_mgmt returns
+# PAM_NEW_AUTHTOK_REQD, the one code that means "authenticated, but not usable
+# until the password changes".
+auth      required  pam_stress.so
+account   required  pam_stress.so expired
+password  required  pam_stress.so
+session   required  pam_stress.so

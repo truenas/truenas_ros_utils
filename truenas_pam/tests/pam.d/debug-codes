@@ -1,0 +1,9 @@
+# SPDX-FileCopyrightText: 2026 iXsystems, Inc, DBA TrueNAS
+# SPDX-License-Identifier: MIT
+# pam_debug returns the code its arguments name. Every stack here names a
+# different one, so the expected value of each is written down rather than
+# inferred.
+auth      required  pam_debug.so auth=user_unknown cred=cred_expired
+account   required  pam_debug.so acct=acct_expired
+password  required  pam_debug.so prechauthtok=try_again chauthtok=authtok_err
+session   required  pam_debug.so open_session=session_err close_session=session_err

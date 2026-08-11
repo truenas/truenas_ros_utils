@@ -1,0 +1,8 @@
+# SPDX-FileCopyrightText: 2026 iXsystems, Inc, DBA TrueNAS
+# SPDX-License-Identifier: MIT
+# Every module declines to take part, so nothing in the stack reaches a
+# decision. The dispatcher absorbs PAM_IGNORE and returns PAM_PERM_DENIED.
+auth      optional  pam_debug.so auth=ignore cred=ignore
+account   optional  pam_debug.so acct=ignore
+password  optional  pam_debug.so prechauthtok=ignore chauthtok=ignore
+session   optional  pam_debug.so open_session=ignore close_session=ignore

@@ -10,6 +10,7 @@ other; depend on the one you need.
 | Crate | Contents |
 |---|---|
 | [`truenas_mdb`](truenas_mdb/) | Bindings to the system LMDB (`liblmdb`): a pooled environment and a byte-oriented key/value store |
+| [`truenas_pam`](truenas_pam/) | A PAM client over the system `libpam`: transactions, and a login sequence driven one round at a time |
 | [`truenas_xdr`](truenas_xdr/) | A serde codec for XDR (RFC 4506) |
 | [`truenas_xdr_derive`](truenas_xdr_derive/) | `XdrEnum` and `XdrUnion` derive macros, used through `truenas_xdr`'s `derive` feature |
 
@@ -17,10 +18,12 @@ other; depend on the one you need.
 
 - Rust 1.97.1 or newer, edition 2024
 - `liblmdb-dev` to build `truenas_mdb`, `liblmdb0` to run it
+- `libpam0g-dev` to build `truenas_pam`, `libpam0g` to run it
 
 Optional, for the full test suite:
 
 - `python3-lmdb` for `truenas_mdb`'s interop tests
+- `libpam-modules` for `truenas_pam`'s suites
 - `valgrind` for the memcheck run
 
 ## Building and testing
@@ -35,6 +38,12 @@ environment and checks both implementations agree byte for byte. It skips when
 `python3-lmdb` is absent; `TRUENAS_MDB_REQUIRE_PYTHON=1`, which CI sets, makes
 that a failure instead.
 
+`truenas_pam`'s suites run their own service files out of `truenas_pam/tests`,
+through `pam_start_confdir(3)`, so they need neither privilege nor anything in
+`/etc/pam.d`. They do need the modules those files name, all of which ship in
+`libpam-modules`; they skip when one is missing, and
+`TRUENAS_PAM_REQUIRE_MODULES=1`, which CI sets, makes that a failure instead.
+
 `truenas_xdr`'s `derive` feature is on by default. To check the codec without
 the proc-macro crate:
 
@@ -46,9 +55,14 @@ To run the suites under valgrind, as CI does:
 
 ```sh
 CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER="valgrind --error-exitcode=99 \
-    --leak-check=full --errors-for-leak-kinds=definite --quiet" \
+    --leak-check=full --errors-for-leak-kinds=definite --keep-debuginfo=yes \
+    --quiet" \
     cargo test --workspace
 ```
+
+`--keep-debuginfo=yes` is for `truenas_pam`: libpam loads each module with
+`dlopen(3)` and unloads it at the end of the transaction, and without this a
+report from inside one has no symbols left to name.
 
 ## License
 

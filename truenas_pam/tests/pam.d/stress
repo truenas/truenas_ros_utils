@@ -1,0 +1,13 @@
+# SPDX-FileCopyrightText: 2026 iXsystems, Inc, DBA TrueNAS
+# SPDX-License-Identifier: MIT
+# Linux-PAM's own module for exercising an application.
+#
+# auth      prompts PAM_PROMPT_ECHO_OFF ("STRESS Password: ") and accepts any
+#           answer. With no PAM_USER set, pam_get_user prompts
+#           PAM_PROMPT_ECHO_ON first.
+# password  sends one round carrying informational text and two ECHO_OFF
+#           prompts, and refuses the change unless the two answers match.
+auth      required  pam_stress.so
+account   required  pam_stress.so
+password  required  pam_stress.so
+session   required  pam_stress.so
