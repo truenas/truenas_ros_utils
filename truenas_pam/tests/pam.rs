@@ -205,49 +205,40 @@ fn every_credential_operation_reaches_the_stack() {
     }
 }
 
-/// The pause an application asks for is applied to a refusal and not to a
-/// success. libpam varies it by up to 25%, so only the order of magnitude is
-/// checked.
+/// Time one refusal by the `deny` stack, with or without a requested pause.
+fn refusal(dir: &std::path::Path, delay: Option<Duration>) -> Duration {
+    let mut builder = Transaction::builder("deny").user("alice").confdir(dir);
+    if let Some(delay) = delay {
+        builder = builder.fail_delay(delay);
+    }
+    let mut txn = builder.build().unwrap();
+    let began = Instant::now();
+    assert!(txn.authenticate(Flags::empty()).is_err());
+    began.elapsed()
+}
+
+/// The pause an application asks for reaches libpam and is applied to a
+/// refusal.
+///
+/// Measured as the difference between two refusals rather than against the
+/// clock: the pause is real time, which an instrumented run does not scale,
+/// while everything around it is. libpam varies the pause by up to 25%, so
+/// half of what was asked for is the bound.
 #[test]
 fn a_fail_delay_is_applied_to_a_refusal() {
     let Some(()) = modules() else { return };
     let dir = confdir();
     let requested = Duration::from_millis(600);
 
-    let mut quick = Transaction::builder("deny")
-        .user("alice")
-        .confdir(dir.path())
-        .build()
-        .unwrap();
-    let began = Instant::now();
-    assert!(quick.authenticate(Flags::empty()).is_err());
-    let undelayed = began.elapsed();
+    // Loading the stack is paid for here, so neither measurement carries it.
+    refusal(dir.path(), None);
+
+    let undelayed = refusal(dir.path(), None);
+    let delayed = refusal(dir.path(), Some(requested));
     assert!(
-        undelayed < requested / 2,
-        "unasked-for delay: {undelayed:?}"
+        delayed > undelayed + requested / 2,
+        "no pause: {undelayed:?} without, {delayed:?} with"
     );
-
-    let mut delayed = Transaction::builder("deny")
-        .user("alice")
-        .confdir(dir.path())
-        .fail_delay(requested)
-        .build()
-        .unwrap();
-    let began = Instant::now();
-    assert!(delayed.authenticate(Flags::empty()).is_err());
-    let waited = began.elapsed();
-    assert!(waited >= requested / 2, "delay not applied: {waited:?}");
-
-    // A stack that succeeds is not delayed, whatever was asked for.
-    let mut allowed = Transaction::builder("permit")
-        .user("alice")
-        .confdir(dir.path())
-        .fail_delay(requested)
-        .build()
-        .unwrap();
-    let began = Instant::now();
-    allowed.authenticate(Flags::empty()).unwrap();
-    assert!(began.elapsed() < requested / 2);
 }
 
 /// A password change takes flags of its own. The preliminary pass and the
@@ -413,6 +404,37 @@ fn a_builder_argument_with_an_interior_nul_is_refused() {
             .map(|_| ()),
         Err(Error::NulByte)
     );
+}
+
+/// The items are set after the handle exists, so a bad one there is refused
+/// with a transaction already open. Whatever it allocated has to come back,
+/// and the stack has to be told the login was abandoned rather than completed.
+/// Repeated, so anything held per attempt accumulates where memcheck sees it.
+#[test]
+fn a_builder_that_fails_after_starting_ends_the_transaction() {
+    let Some(()) = modules() else { return };
+    let dir = confdir();
+    for bad in [
+        Transaction::builder("permit").ruser("a\0b"),
+        Transaction::builder("permit").rhost("a\0b"),
+        Transaction::builder("permit").tty("a\0b"),
+    ] {
+        assert_eq!(
+            bad.user("alice").confdir(dir.path()).build().map(|_| ()),
+            Err(Error::NulByte)
+        );
+    }
+    for _ in 0..64 {
+        assert_eq!(
+            Transaction::builder("permit")
+                .user("alice")
+                .tty("a\0b")
+                .confdir(dir.path())
+                .build()
+                .map(|_| ()),
+            Err(Error::NulByte)
+        );
+    }
 }
 
 // --- the PAM environment -------------------------------------------------

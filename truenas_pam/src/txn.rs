@@ -92,15 +92,19 @@ impl CredOp {
 /// The service name fixes which stack of modules runs, so it must be a
 /// constant of the program and never anything the user can influence.
 ///
-/// ```
+/// The stack is read here, so a service the configuration does not name, and
+/// has no `other` to fall back to, fails at this point rather than at the
+/// first operation.
+///
+/// ```no_run
 /// # use truenas_pam::Transaction;
-/// # let confdir = std::env::temp_dir();
-/// let txn = Transaction::builder("truenas")
+/// let transaction = Transaction::builder("truenas")
 ///     .user("alice")
 ///     .rhost("198.51.100.7")
-///     .confdir(&confdir)
-///     .build();
-/// # let _ = txn;
+///     .build()?;
+///
+/// assert_eq!(transaction.service()?, Some("truenas"));
+/// # Ok::<(), truenas_pam::Error>(())
 /// ```
 pub struct Builder {
     service: String,
