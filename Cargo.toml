@@ -8,6 +8,8 @@
 resolver = "2"
 members = [
     "truenas_mdb",
+    "truenas_xdr",
+    "truenas_xdr_derive",
 ]
 
 [workspace.package]

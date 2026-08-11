@@ -60,6 +60,11 @@ jobs:
       env:
         TRUENAS_MDB_REQUIRE_PYTHON: "1"
 
+    # `truenas_xdr`'s `derive` feature is on by default; prove the codec still
+    # builds and passes without the proc-macro crate.
+    - name: test without default features
+      run: cargo test -p truenas_xdr --no-default-features
+
     # The crate's correctness at the FFI boundary is a memory-safety property,
     # so the suites run again under memcheck. Only `definite` leaks count as
     # errors: the environment pool is a process-lifetime static, which memcheck

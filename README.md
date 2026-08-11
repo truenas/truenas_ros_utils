@@ -10,6 +10,8 @@ other. Depend on the one you want.
 | Crate | Contents |
 |---|---|
 | [`truenas_mdb`](truenas_mdb/) | Bindings to the system LMDB (`liblmdb`): a pooled environment and a byte-oriented key/value store |
+| [`truenas_xdr`](truenas_xdr/) | A byte-exact serde codec for XDR (RFC 4506) |
+| [`truenas_xdr_derive`](truenas_xdr_derive/) | `XdrEnum` and `XdrUnion` derive macros, reached through `truenas_xdr`'s `derive` feature |
 
 ## Requirements
 

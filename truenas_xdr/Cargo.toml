@@ -1,0 +1,45 @@
+# `truenas_xdr` — a byte-exact serde codec for XDR (RFC 4506).
+#
+# `serde` is a traits-only dependency: this crate implements `Serializer` and
+# `Deserializer` and hand-writes the wrapper types' impls, so it needs no
+# `serde_derive` of its own.
+[package]
+name = "truenas_xdr"
+version = "0.1.0"
+description = "Byte-exact serde codec for XDR (RFC 4506)"
+categories = ["encoding"]
+keywords = ["xdr", "rfc4506", "serde", "codec"]
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+serde = { version = "1", default-features = false, features = ["std"] }
+truenas_xdr_derive = { path = "../truenas_xdr_derive", version = "0.1.0", optional = true }
+
+[dev-dependencies]
+# `derive` here only, so the codec itself pulls no `serde_derive`; tests still
+# get `#[derive(Serialize, Deserialize)]` for their fixtures.
+serde = { version = "1", features = ["derive"] }
+
+[features]
+default = ["derive"]
+# The `XdrEnum` / `XdrUnion` macros. Opt out with `default-features = false` to
+# drop the proc-macro crate.
+derive = ["dep:truenas_xdr_derive"]
+
+[lints]
+workspace = true
+
+# Round-trips, canonical byte vectors, padding, and the error paths.
+[[test]]
+name = "codec"
+path = "tests/codec.rs"
+
+# The derive macros' wire output and their rejection rules.
+[[test]]
+name = "derive"
+path = "tests/derive.rs"
+required-features = ["derive"]
