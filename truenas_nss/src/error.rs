@@ -20,7 +20,8 @@ pub type Result<T> = std::result::Result<T, Error>;
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 #[repr(i32)]
 pub enum NssStatus {
-    /// The call should be retried; the errno says how.
+    /// The call should be retried. An errno, when the module reported one
+    /// through the out-parameter, says why.
     TryAgain = ffi::NSS_STATUS_TRYAGAIN,
     /// The service is not able to answer at all. The fan-out lookups skip a
     /// module reporting this and try the next.
@@ -122,8 +123,13 @@ pub enum Error {
     },
     /// An argument held an interior NUL, so it has no C string form.
     NulByte,
-    /// A string the module returned is not UTF-8.
+    /// An identity field — an entry's name, or a member — is not UTF-8,
+    /// so it cannot round-trip into a lookup. Descriptive fields decode
+    /// lossily instead of raising this.
     NotUtf8,
+    /// A successful call left an entry's name null. The name is the
+    /// entry's identity; without one there is nothing to return.
+    NullName,
 }
 
 impl Error {
@@ -205,7 +211,10 @@ impl fmt::Display for Error {
                 f.write_str("Argument contains an interior NUL byte")
             }
             Error::NotUtf8 => {
-                f.write_str("NSS module returned a non-UTF-8 string")
+                f.write_str("NSS module returned a non-UTF-8 name")
+            }
+            Error::NullName => {
+                f.write_str("NSS module returned an entry with no name")
             }
         }
     }
@@ -225,7 +234,9 @@ impl From<Error> for io::Error {
                 io::Error::new(io::ErrorKind::WouldBlock, err)
             }
             Error::NulByte => io::Error::new(io::ErrorKind::InvalidInput, err),
-            Error::NotUtf8 => io::Error::new(io::ErrorKind::InvalidData, err),
+            Error::NotUtf8 | Error::NullName => {
+                io::Error::new(io::ErrorKind::InvalidData, err)
+            }
             other => io::Error::other(other),
         }
     }
@@ -375,6 +386,10 @@ mod tests {
             io::ErrorKind::InvalidData
         );
         assert_eq!(
+            io::Error::from(Error::NullName).kind(),
+            io::ErrorKind::InvalidData
+        );
+        assert_eq!(
             io::Error::from(Error::Load {
                 module: "SSS",
                 reason: "gone".into(),
@@ -429,5 +444,6 @@ mod tests {
         );
         assert!(!Error::NulByte.to_string().is_empty());
         assert!(!Error::NotUtf8.to_string().is_empty());
+        assert!(!Error::NullName.to_string().is_empty());
     }
 }

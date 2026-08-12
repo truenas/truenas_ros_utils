@@ -29,11 +29,14 @@ use std::os::raw::c_int;
 #[derive(Clone, Debug, Eq, PartialEq, Hash)]
 #[non_exhaustive]
 pub struct Group {
-    /// Group name.
+    /// Group name. Identity: refused rather than altered when it is
+    /// missing or not UTF-8.
     pub name: String,
     /// Group ID.
     pub gid: u32,
-    /// Member login names.
+    /// Member login names. Identities like [`name`](Group::name): a
+    /// member that is not UTF-8 refuses the entry, because membership is
+    /// authorization input.
     pub members: Vec<String>,
     /// The module that provided this entry.
     pub source: Source,
@@ -67,7 +70,7 @@ unsafe fn extract_group(gr: &libc::group, source: Source) -> Result<Group> {
                 break;
             }
             // SAFETY: non-terminator entries are NUL-terminated strings.
-            members.push(unsafe { service::string_field(member) }?);
+            members.push(unsafe { service::name_field(member) }?);
             // SAFETY: the terminator has not been seen, so one past
             // `cursor` is still within the array.
             cursor = unsafe { cursor.add(1) };
@@ -75,7 +78,7 @@ unsafe fn extract_group(gr: &libc::group, source: Source) -> Result<Group> {
     }
     Ok(Group {
         // SAFETY: the caller's contract covers each field.
-        name: unsafe { service::string_field(gr.gr_name) }?,
+        name: unsafe { service::name_field(gr.gr_name) }?,
         gid: gr.gr_gid,
         members,
         source,
@@ -200,8 +203,10 @@ pub fn getgrgid(gid: u32) -> Result<Option<Group>> {
     service::fan_out(|source| source.getgrgid(gid))
 }
 
-/// An enumeration of one module's group database. Yields `Result<Group>`;
-/// ends the enumeration on drop.
+/// An enumeration of one module's group database. Yields `Result<Group>`.
+/// The enumeration ends when the data runs out, when a service call faults,
+/// or when the iterator is dropped; an entry that cannot be converted is
+/// yielded as an error and the walk goes on.
 ///
 /// The cursor may live in the module's thread-local state, so the iterator
 /// stays on the thread that made it:
@@ -249,9 +254,12 @@ impl Iterator for GroupIter {
             unsafe { f(gr.as_mut_ptr(), b, len, ep) }
         });
         match service::classify_ent(svc.module(), "getgrent_r", status, errno) {
-            // An errno-carrying fault is reported and the enumeration
-            // stays open: whether to go on is the caller's decision.
-            Err(err) => Some(Err(err)),
+            // A fault leaves the cursor where it was, so the next call can
+            // only report it again: surface it once and close.
+            Err(err) => {
+                self.close();
+                Some(Err(err))
+            }
             // A bare non-success status is the end of the data.
             Ok(false) => {
                 self.close();
@@ -342,8 +350,20 @@ mod tests {
         assert!(out.is_local());
     }
 
+    /// A name identifies the entry; a successful call that left it null
+    /// has returned nothing usable.
+    #[test]
+    fn a_null_name_is_refused() {
+        let mut gr = entry(c"x", c"x", ptr::null_mut());
+        gr.gr_name = ptr::null_mut();
+        // SAFETY: pointers are static literals or null.
+        let out = unsafe { extract_group(&gr, Source::Files) };
+        assert_eq!(out, Err(Error::NullName));
+    }
+
     /// A non-UTF-8 member name must error, exactly as a non-UTF-8 group
-    /// name does.
+    /// name does: membership is authorization input, and an altered name
+    /// would change it silently.
     #[test]
     fn a_non_utf8_member_is_refused() {
         const BAD: &[u8] = b"b\xffad\0";

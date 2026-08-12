@@ -13,7 +13,18 @@
  *                                  (sss/winbind-like); default is process
  *                                  storage (files-like)
  *   -DNSS_FIXTURE_NO_GROUPS        omit the four group symbols
+ *   -DNSS_FIXTURE_UNRESOLVED       reference an undefined symbol, so an
+ *                                  RTLD_NOW dlopen of the fixture fails
  *   -DNSS_FIXTURE_DEFAULT_MODE="x" the mode when the environment sets none
+ *   -DNSS_FIXTURE_STALE_ERANGE=n   the first n lookup calls return NOTFOUND
+ *                                  with *errnop set to ERANGE
+ *   -DNSS_FIXTURE_ENT_BARE_TRYAGAIN=n  the nth get*ent_r call returns
+ *                                  TRYAGAIN and leaves *errnop alone,
+ *                                  reporting through the thread's errno
+ *   -DNSS_FIXTURE_ENT_FAULT_AT=n   the nth get*ent_r call, and every one
+ *                                  after it, faults with UNAVAIL and EIO
+ *                                  through the errno out-parameter without
+ *                                  moving the cursor
  *
  * The mode — "ok", "unavail", "tryagain", "notfound" — applies to the four
  * lookups and to set*ent, and is read per call from
@@ -53,6 +64,20 @@
 
 #define ARRAY_SIZE(a) (sizeof(a) / sizeof((a)[0]))
 
+#ifdef NSS_FIXTURE_UNRESOLVED
+
+/* A reference no scope can satisfy, from a function the linker must keep,
+ * so resolving this object's relocations fails and dlopen refuses it. */
+extern long nss_fixture_unresolved_symbol(void);
+
+long
+FN(fixture_unresolved)(void)
+{
+	return nss_fixture_unresolved_symbol();
+}
+
+#endif /* NSS_FIXTURE_UNRESOLVED */
+
 /* Counters the tests read; each raw call increments, retries included. */
 long FN(fixture_lookup_calls) = 0;
 long FN(fixture_getent_calls) = 0;
@@ -73,6 +98,20 @@ static ENT_STORAGE size_t gr_cursor = 0;
 /* Written into every pw_passwd/gr_passwd: invalid UTF-8, so a consumer
  * that reads the field it must never read fails loudly. */
 static const char junk_passwd[] = "\xff\xfe";
+
+/* A cursor call that faults without moving the cursor, so every retry
+ * returns the same thing. */
+#ifdef NSS_FIXTURE_ENT_FAULT_AT
+#define ENT_FAULT(errnop)                                                   \
+	do {                                                                \
+		if (FN(fixture_getent_calls) >= (NSS_FIXTURE_ENT_FAULT_AT)) {\
+			*(errnop) = EIO;                                    \
+			return NSS_STATUS_UNAVAIL;                          \
+		}                                                           \
+	} while (0)
+#else
+#define ENT_FAULT(errnop) do { } while (0)
+#endif
 
 typedef enum {
 	MODE_OK,
@@ -139,6 +178,9 @@ static const struct fixture_user users[] = {
 	{ "gecos-giant", 1002, 1002, A3072, "/home/giant", "/bin/sh" },
 	{ "b\xff" "ad", 1003, 1003, "not utf-8", "/", "/bin/false" },
 	{ "carol", 1004, 1004, "Carol Fixture", "/home/carol", "/bin/zsh" },
+	{ "dave", 1005, 1005, "g\xff" "ecos", "/home/dave", "/bin/sh" },
+	/* The winbind domain separator: opaque bytes to the consumer. */
+	{ "FIXDOM\\eve", 1006, 1006, "Eve Fixture", "/home/eve", "/bin/sh" },
 };
 
 #ifndef NSS_FIXTURE_NO_GROUPS
@@ -153,12 +195,16 @@ struct fixture_group {
 static const char *const alpha_members[] = { "alice", "bob", NULL };
 static const char *const empty_members[] = { NULL };
 static const char *const giant_members[] = { A3072, NULL };
+static const char *const domadmins_members[] = {
+	"alice", "FIXDOM\\eve", NULL
+};
 
 static const struct fixture_group groups[] = {
 	{ "alpha", 2000, alpha_members },
 	{ "empty", 2001, empty_members },
 	{ "nullmem", 2002, NULL },
 	{ "giant", 2003, giant_members },
+	{ "domadmins", 2004, domadmins_members },
 };
 
 #endif /* !NSS_FIXTURE_NO_GROUPS */
@@ -201,6 +247,31 @@ fill_passwd(const struct fixture_user *u, struct passwd *result,
 	return NSS_STATUS_SUCCESS;
 }
 
+/* A module may report a failure through the thread's errno and leave
+ * *errnop alone: glibc's frontends pass &errno as that parameter, so for
+ * them the two are one location. Returns 1 on the nth get*ent_r call. */
+static int
+bare_tryagain(void)
+{
+#if defined(NSS_FIXTURE_ENT_BARE_TRYAGAIN)
+	return FN(fixture_getent_calls) == NSS_FIXTURE_ENT_BARE_TRYAGAIN;
+#else
+	return 0;
+#endif
+}
+
+/* Returns 1 while a lookup should report ERANGE under a status that is not
+ * TRYAGAIN, which is not a request to enlarge the buffer. */
+static int
+stale_erange(void)
+{
+#if defined(NSS_FIXTURE_STALE_ERANGE)
+	return FN(fixture_lookup_calls) <= NSS_FIXTURE_STALE_ERANGE;
+#else
+	return 0;
+#endif
+}
+
 /* --- passwd -------------------------------------------------------------- */
 
 enum nss_status
@@ -211,6 +282,10 @@ FN(getpwnam_r)(const char *name, struct passwd *result, char *buffer,
 	size_t i;
 
 	FN(fixture_lookup_calls)++;
+	if (stale_erange()) {
+		*errnop = ERANGE;
+		return NSS_STATUS_NOTFOUND;
+	}
 	if (m != MODE_OK)
 		return mode_result(m, errnop);
 	for (i = 0; i < ARRAY_SIZE(users); i++) {
@@ -265,6 +340,11 @@ FN(getpwent_r)(struct passwd *result, char *buffer, size_t buflen,
 	enum nss_status s;
 
 	FN(fixture_getent_calls)++;
+	ENT_FAULT(errnop);
+	if (bare_tryagain()) {
+		errno = EAGAIN;
+		return NSS_STATUS_TRYAGAIN;
+	}
 	if (pw_cursor >= ARRAY_SIZE(users))
 		return NSS_STATUS_NOTFOUND;
 	s = fill_passwd(&users[pw_cursor], result, buffer, buflen, errnop);
@@ -387,6 +467,11 @@ FN(getgrent_r)(struct group *result, char *buffer, size_t buflen,
 	enum nss_status s;
 
 	FN(fixture_getent_calls)++;
+	ENT_FAULT(errnop);
+	if (bare_tryagain()) {
+		errno = EAGAIN;
+		return NSS_STATUS_TRYAGAIN;
+	}
 	if (gr_cursor >= ARRAY_SIZE(groups))
 		return NSS_STATUS_NOTFOUND;
 	s = fill_group(&groups[gr_cursor], result, buffer, buflen, errnop);

@@ -74,10 +74,11 @@ fn enumeration_reaches_the_whole_database() {
 /// modules, which this host may not have installed.
 #[test]
 fn the_fan_out_answers_locally() {
-    let Some(svc) = files() else { return };
-    if svc.getpwuid(0).unwrap().is_none() {
+    if files().is_none() {
         return;
     }
-    let root = truenas_nss::getpwuid(0).unwrap().unwrap();
+    let root = truenas_nss::getpwuid(0)
+        .unwrap()
+        .expect("uid 0 missing from the fan-out");
     assert_eq!(root.source, Source::Files);
 }

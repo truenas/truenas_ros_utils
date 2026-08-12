@@ -36,12 +36,24 @@
 //! its enumeration when dropped. Cursors live in the module — per process
 //! for `FILES`, per thread for `SSS` and `WINBIND` — so iterators are
 //! `!Send`, a same-thread iterator that would share a cursor is
-//! [`Error::Busy`], and a `FILES` enumeration on another thread waits.
+//! [`Error::Busy`], and a `FILES` enumeration on another thread waits for
+//! the whole life of the live iterator, not one entry at a time.
+//!
+//! That exclusion reaches this crate's iterators only. glibc holds one
+//! open stream per database for the process, and libc's own `setpwent`,
+//! `getpwent`, and `endpwent` drive that same stream, so an unrelated
+//! caller elsewhere in the process rewinds a live `FILES` walk to the
+//! first entry — silently, since the module reports no error for it. A
+//! concurrent lookup is harmless: those open a stream of their own.
 //!
 //! # What entries carry
 //!
 //! [`Passwd`] and [`Group`] name the module that produced them and hold
-//! owned strings copied out of the module's buffers. Neither has a
+//! owned strings copied out of the module's buffers. Identity fields —
+//! entry names and group members — must be present and UTF-8, because
+//! they round-trip into lookups and stand in authorization decisions;
+//! descriptive fields (GECOS, directory, shell) decode lossily, so a
+//! stray byte in one cannot deny the identity. Neither entry has a
 //! password field: the real hash lives in the shadow database, and the
 //! placeholder the passwd and group databases carry invites misuse.
 //!
