@@ -32,17 +32,19 @@ jobs:
     # its interop suite runs against, and must be the distro package, which
     # links the system liblmdb0 — `pip install lmdb` bundles its own copy and
     # would test something else. libpam0g-dev links truenas_pam, and
-    # libpam-modules supplies the modules its service files name. valgrind
-    # backs the memcheck step below. truenas_nss needs nothing here: its
-    # fixture suites use the runner's C compiler, and the system module its
-    # smoke tests load, libnss_files.so.2, ships in libc6.
+    # libpam-modules supplies the modules its service files name. libssl-dev
+    # links truenas_ktls. valgrind backs the memcheck step below. truenas_nss
+    # needs nothing here: its fixture suites use the runner's C compiler, and
+    # the system module its smoke tests load, libnss_files.so.2, ships in
+    # libc6.
     - name: Install system dependencies
       run: |
         sudo apt-get update
         sudo apt-get install -y --no-install-recommends \
-          liblmdb-dev python3-lmdb libpam0g-dev libpam-modules valgrind
+          liblmdb-dev python3-lmdb libpam0g-dev libpam-modules libssl-dev \
+          pkg-config valgrind
         python3 -c "import lmdb; print('py-lmdb', lmdb.__version__, 'liblmdb', lmdb.version())"
-        dpkg-query -W libpam0g-dev libpam-modules
+        dpkg-query -W libpam0g-dev libpam-modules libssl-dev
         valgrind --version
 
     - name: Install Rust toolchain
@@ -75,6 +77,13 @@ jobs:
     # compiler or the system files module is. We do NOT want any to pass
     # silently as green — the runner guarantees all are present, so require
     # them and let a skip be a failure.
+    #
+    # TRUENAS_KTLS_REQUIRE_SYSTEM is deliberately absent: the runner's kernel
+    # has the tls upper-layer protocol, but its OpenSSL is built without kTLS
+    # support, so an engagement can never happen here. truenas_ktls's
+    # engagement cases skip themselves on that probe; the rest of its suite
+    # still runs. Hosts whose libssl can engage run the full battery with the
+    # gate required.
     - name: test
       run: cargo test --workspace --locked
       env:
@@ -123,7 +132,8 @@ jobs:
       run: |
         sudo apt-get update
         sudo apt-get install -y --no-install-recommends \
-          liblmdb-dev python3-lmdb libpam0g-dev libpam-modules
+          liblmdb-dev python3-lmdb libpam0g-dev libpam-modules libssl-dev \
+          pkg-config
 
     - name: Install Rust toolchain
       run: |
