@@ -198,6 +198,12 @@ truncation and framing errors.
 `Strict` holds input to what the standard permits an encoder to emit; `Lenient`
 accepts what real encoders send.
 
+Decoding bounds its own nesting (`Deserializer::DEFAULT_MAX_DEPTH`, raised
+with `with_max_depth`), so a hostile chain of §4.19 optionals is
+`Error::RecursionLimit`, not a stack overflow.
+[`tests/robustness.rs`](truenas_xdr/tests/robustness.rs) holds every decode
+path to Ok-or-Err over a hostile corpus.
+
 Strings and opaque data decode as borrows of the input. A wire format has to
 round-trip through itself, which `&[u8]` does not — serde encodes it as a
 sequence and decodes it as opaque — so `VarOpaqueRef` exists for that.

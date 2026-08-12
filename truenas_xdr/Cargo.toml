@@ -56,3 +56,13 @@ required-features = ["derive"]
 [[test]]
 name = "zero_copy"
 path = "tests/zero_copy.rs"
+
+# A hostile deeply-nested stream is bounded, not a stack overflow.
+[[test]]
+name = "recursion"
+path = "tests/recursion.rs"
+
+# Every target type returns Ok or Err, never a panic, over a hostile corpus.
+[[test]]
+name = "robustness"
+path = "tests/robustness.rs"
