@@ -1,0 +1,56 @@
+# SPDX-FileCopyrightText: 2026 iXsystems, Inc, DBA TrueNAS
+# SPDX-License-Identifier: MIT
+# `truenas_nss` — direct lookups against the system NSS service modules:
+# passwd and group entries from `libnss_files`, `libnss_sss`, and
+# `libnss_winbind`, per module or fanned out, bypassing `nsswitch.conf`.
+#
+# Nothing is linked at build time: the modules are loaded with `dlopen(3)` on
+# first use, and `dlopen` itself lives in `libc.so.6` on glibc 2.34 and later.
+# Runtime needs the module a lookup names; `libnss_files.so.2` ships in
+# `libc6`.
+[package]
+name = "truenas_nss"
+version = "0.1.0"
+description = "Direct passwd and group lookups against the system NSS service modules"
+categories = ["os::unix-apis", "api-bindings"]
+keywords = ["nss", "passwd", "group", "winbind", "truenas"]
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+# The C ABI: `struct passwd`, `struct group`, the `dl*` family, and errno.
+# No bindgen — the NSS service ABI is ten function signatures, written out by
+# hand in src/ffi.rs.
+libc = "0.2.155"
+
+[dev-dependencies]
+tempfile = "3"
+
+[lints]
+workspace = true
+
+# Behavioral tests over fixture service modules compiled from
+# tests/fixture/nss_fixture.c at test time. Skip when no C compiler is
+# present; set TRUENAS_NSS_REQUIRE_CC=1 (as CI does) to make that a hard
+# failure.
+[[test]]
+name = "nss"
+path = "tests/nss.rs"
+
+# Fan-out over the real soname registry: the test re-executes itself with
+# LD_LIBRARY_PATH pointing at fixture modules named libnss_{files,sss,
+# winbind}.so.2, so the child's bare-soname dlopen resolves to them. Same
+# compiler gate as the fixture suite.
+[[test]]
+name = "fanout"
+path = "tests/fanout.rs"
+
+# Smoke tests against the running system's `files` module. Skip when it cannot
+# be loaded; set TRUENAS_NSS_REQUIRE_SYSTEM=1 (as CI does) to make that a hard
+# failure.
+[[test]]
+name = "system"
+path = "tests/system.rs"
