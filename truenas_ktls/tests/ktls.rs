@@ -90,6 +90,73 @@ fn pre_engagement_failures_classify() {
     let err = acceptor.accept(conn.as_fd()).unwrap_err();
     assert_eq!(err, Error::Stalled);
     drop(holder);
+
+    // A socket the caller left non-blocking is refused before the
+    // handshake, not surfaced as a stall.
+    let parked = TcpStream::connect(addr).unwrap();
+    let (conn, _) = listener.accept().unwrap();
+    conn.set_nonblocking(true).unwrap();
+    let err = acceptor.accept(conn.as_fd()).unwrap_err();
+    assert_eq!(err, Error::NonBlocking);
+    drop(parked);
+}
+
+/// Entries another libssl user left in this thread's error queue must
+/// not leak into classification: a peer reset under a pre-populated
+/// queue still classifies as [`Error::Disconnected`], not as
+/// [`Error::Handshake`] carrying the stale entry's foreign text.
+/// `SSL_get_error` reads the queue and requires it empty at the I/O
+/// call.
+#[test]
+fn a_stale_error_queue_does_not_misclassify() {
+    let dir = tempfile::tempdir().unwrap();
+    let (acceptor, listener) = rig(dir.path(), "stale");
+    let addr = listener.local_addr().unwrap();
+
+    let resetter = std::thread::spawn(move || {
+        use std::os::fd::AsRawFd;
+        let conn = TcpStream::connect(addr).unwrap();
+        // Zero linger turns the close into a reset rather than a clean
+        // shutdown.
+        let linger = libc::linger {
+            l_onoff: 1,
+            l_linger: 0,
+        };
+        #[allow(unsafe_code)]
+        // SAFETY: `setsockopt` reads `size_of::<linger>` bytes from a
+        // live `linger`.
+        let rc = unsafe {
+            libc::setsockopt(
+                conn.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_LINGER,
+                std::ptr::from_ref(&linger).cast(),
+                size_of::<libc::linger>() as libc::socklen_t,
+            )
+        };
+        assert_eq!(rc, 0);
+        drop(conn);
+    });
+    let (conn, _) = listener.accept().unwrap();
+    resetter.join().unwrap();
+
+    // Another user's failed call, its errors left queued on this thread.
+    let garbage = [0xffu8; 8];
+    let mut p = garbage.as_ptr();
+    #[allow(unsafe_code)]
+    // SAFETY: `d2i_X509` reads at most `length` bytes from `*pp`; a null
+    // first argument only means the result is returned, not stored.
+    let parsed = unsafe {
+        openssl_sys::d2i_X509(
+            std::ptr::null_mut(),
+            &mut p,
+            garbage.len() as std::os::raw::c_long,
+        )
+    };
+    assert!(parsed.is_null(), "garbage DER must not parse");
+
+    let err = acceptor.accept(conn.as_fd()).unwrap_err();
+    assert_eq!(err, Error::Disconnected);
 }
 
 /// After an accept, plain writes on the descriptor arrive at a

@@ -31,8 +31,10 @@
 //! [`Acceptor::accept`] borrows the descriptor and closes nothing. It
 //! blocks until the handshake settles, so the caller runs it off any
 //! event loop and bounds it with the socket's own timeouts — an elapsed
-//! `SO_RCVTIMEO` surfaces as [`Error::Stalled`]. One handshake per
-//! connection.
+//! `SO_RCVTIMEO` surfaces as [`Error::Stalled`]. The socket must be
+//! blocking; one with `O_NONBLOCK` set is refused as
+//! [`Error::NonBlocking`] before the handshake starts. One handshake
+//! per connection.
 //!
 //! # Rotation
 //!
