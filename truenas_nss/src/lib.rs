@@ -28,6 +28,13 @@
 //! module that fails any other way, one that cannot be loaded included,
 //! surfaces as the error it raised.
 //!
+//! [`getgrouplist`] answers a different question — every group a user
+//! belongs to — through each module's `initgroups_dyn` service function,
+//! the only path to a directory user's full membership: the backends
+//! compute it server-side and do not enumerate. Membership is additive,
+//! so its fan-out is a union of all three modules rather than a first
+//! hit, under the same skip-and-propagate rule.
+//!
 //! # Enumeration
 //!
 //! [`Source::passwd_entries`] and [`Source::group_entries`] walk one
@@ -71,6 +78,6 @@ mod pwd;
 mod service;
 
 pub use error::{Error, NssStatus, Result};
-pub use grp::{Group, GroupIter, getgrgid, getgrnam};
+pub use grp::{Group, GroupIter, getgrgid, getgrnam, getgrouplist};
 pub use pwd::{Passwd, PasswdIter, getpwnam, getpwuid};
 pub use service::{EntScope, Service, Source};

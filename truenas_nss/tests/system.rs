@@ -70,6 +70,41 @@ fn enumeration_reaches_the_whole_database() {
     assert!(found_root, "uid 0 not seen in the files enumeration");
 }
 
+/// `getgrouplist` over the live files module must agree with the group
+/// database itself: the supplementary set `initgroups_dyn` reports is
+/// exactly the memberships an enumeration of the same module derives.
+/// Enumeration can stand as the oracle here because files enumerates; the
+/// directory modules need `initgroups_dyn` precisely because theirs do
+/// not.
+#[test]
+fn getgrouplist_agrees_with_the_group_database() {
+    let Some(svc) = files() else { return };
+    let root = svc.getpwuid(0).unwrap().expect("uid 0 missing from files");
+
+    let gids = svc.getgrouplist(&root.name, root.gid).unwrap();
+    assert_eq!(gids[0], root.gid, "the primary gid leads");
+
+    let mut expected: Vec<u32> = svc
+        .group_entries()
+        .unwrap()
+        .filter_map(|entry| entry.ok())
+        .filter(|group| {
+            group.gid != root.gid && group.members.contains(&root.name)
+        })
+        .map(|group| group.gid)
+        .collect();
+    expected.sort_unstable();
+    expected.dedup();
+
+    let mut supplementary: Vec<u32> = gids[1..]
+        .iter()
+        .copied()
+        .filter(|gid| *gid != root.gid)
+        .collect();
+    supplementary.sort_unstable();
+    assert_eq!(supplementary, expected);
+}
+
 /// The fan-out must answer uid 0 from FILES without consulting the other
 /// modules, which this host may not have installed.
 #[test]

@@ -141,6 +141,24 @@ impl Service {
         })
     }
 
+    /// The groups `name` belongs to in this module, as `getgrouplist(3)`
+    /// reports them: `gid` — the caller's primary gid, from the passwd
+    /// entry — leads, the module's memberships follow in its order, and
+    /// the list is deduplicated. The list is unbounded; a caller with a
+    /// ceiling checks the length, where exceeding it is visible.
+    ///
+    /// The seed alone means no memberships are known here. The service
+    /// ABI does not distinguish an unknown user from a member of nothing,
+    /// so existence is [`getpwnam`](Service::getpwnam)'s question.
+    pub fn getgrouplist(&self, name: &str, gid: u32) -> Result<Vec<u32>> {
+        let f = self
+            .fns()
+            .initgroups_dyn
+            .ok_or_else(|| self.missing("initgroups_dyn"))?;
+        let name = CString::new(name).map_err(|_| Error::NulByte)?;
+        service::call_initgroups(self.module(), f, &name, gid)
+    }
+
     /// Enumerate the module's group database.
     ///
     /// One enumeration per cursor: a second same-thread iterator that
@@ -182,6 +200,12 @@ impl Source {
         self.service()?.getgrgid(gid)
     }
 
+    /// The groups `name` belongs to in this module. See
+    /// [`Service::getgrouplist`].
+    pub fn getgrouplist(self, name: &str, gid: u32) -> Result<Vec<u32>> {
+        self.service()?.getgrouplist(name, gid)
+    }
+
     /// Enumerate this module's group database. See
     /// [`Service::group_entries`].
     pub fn group_entries(self) -> Result<GroupIter> {
@@ -201,6 +225,18 @@ pub fn getgrnam(name: &str) -> Result<Option<Group>> {
 /// same walk as [`getgrnam`].
 pub fn getgrgid(gid: u32) -> Result<Option<Group>> {
     service::fan_out(|source| source.getgrgid(gid))
+}
+
+/// The groups `name` belongs to across [`Source::LOOKUP_ORDER`]: `gid`
+/// leads and every module's memberships follow, deduplicated in first-seen
+/// order. Membership is additive, so this is a union of all three modules
+/// — not the first-hit walk of the entry lookups — under the same skip
+/// rule: a module reporting unavailable contributes nothing, and any other
+/// failure, a module that cannot be loaded included, propagates. A partial
+/// union must not pass for a whole one: supplementary groups both grant
+/// and, where a group carries a deny, withhold.
+pub fn getgrouplist(name: &str, gid: u32) -> Result<Vec<u32>> {
+    service::fan_out_groups(gid, |source| source.getgrouplist(name, gid))
 }
 
 /// An enumeration of one module's group database. Yields `Result<Group>`.

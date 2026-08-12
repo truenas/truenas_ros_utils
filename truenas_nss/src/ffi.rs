@@ -13,7 +13,7 @@
 //! Modules that declare theirs `(void)` ignore the register the argument
 //! arrives in; passing it is how every caller of this ABI behaves.
 
-use std::os::raw::{c_char, c_int};
+use std::os::raw::{c_char, c_int, c_long};
 
 // --- enum nss_status -------------------------------------------------------
 
@@ -70,6 +70,24 @@ pub type GetgrentRFn = unsafe extern "C" fn(
     *mut libc::group,
     *mut c_char,
     libc::size_t,
+    *mut c_int,
+) -> c_int;
+
+/// `_nss_<module>_initgroups_dyn`: append the gids of the groups `user`
+/// belongs to, skipping `group`, to the caller's array.
+///
+/// The array protocol differs from the `_r` calls: `*groupsp` is a
+/// `malloc`-owned `gid_t` array of `*size` entries with `*start` of them
+/// filled; the module appends at `*start` and advances it, and may
+/// `realloc` the array — growing `*size` — up to `limit` entries when
+/// `limit` is positive. It never frees the array.
+pub type InitgroupsDynFn = unsafe extern "C" fn(
+    *const c_char,
+    libc::gid_t,
+    *mut c_long,
+    *mut c_long,
+    *mut *mut libc::gid_t,
+    c_long,
     *mut c_int,
 ) -> c_int;
 

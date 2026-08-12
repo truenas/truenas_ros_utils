@@ -109,9 +109,11 @@ fn a_step_timeout_bounds_each_round() {
         .confdir(dir.path())
         .build()
         .unwrap();
-    let mut auth = Authenticator::new(txn).timeout(Duration::from_millis(50));
+    let mut auth = Authenticator::new(txn).timeout(Duration::from_secs(10));
 
-    // The first round arrives at once; answering it runs into the slow module.
+    // The first round runs under a bound that does not fire. The tight
+    // bound goes on the round that runs into the slow module, and only
+    // there: anywhere earlier it races the machine, not the module.
     let step = auth.begin().unwrap();
     let Step::Prompt(messages) = step else {
         panic!("expected a prompt")
@@ -120,6 +122,7 @@ fn a_step_timeout_bounds_each_round() {
         .iter()
         .map(|_| Some(Secret::from("token")))
         .collect();
+    let mut auth = auth.timeout(Duration::from_millis(50));
     assert_eq!(auth.respond(answers), Err(Error::Timeout));
     assert_eq!(auth.stage(), Stage::Failed);
 

@@ -128,6 +128,17 @@ cannot be loaded included. The scratch buffer grows only on TRYAGAIN with
 ERANGE — the pairing glibc's frontends require — because ERANGE under any
 other status is not a request for a larger buffer.
 
+`getgrouplist` drives `_nss_<module>_initgroups_dyn`, the only path to a
+directory user's full membership: sssd and winbind compute the closure
+server-side and do not enumerate. Membership is additive, so its fan-out is
+a union of all three modules under the lookup fan-out's skip rule — a
+partial union is a wrong answer, not a smaller one. The gid array is
+`malloc`-owned because the module grows it with `realloc`, and the limit is
+passed unbounded: a module at a positive limit truncates the list and still
+reports success, so a ceiling belongs to the caller, where exceeding it is
+visible. NOTFOUND is "no memberships known here", indistinguishable from an
+unknown user; existence is `getpwnam`'s question.
+
 Enumeration is per module — no all-modules iterator, which would invent an
 ordering NSS does not define. `FILES` keeps one cursor per process, so its
 iterator holds a per-service lock for its whole life and another thread's
