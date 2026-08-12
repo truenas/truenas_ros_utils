@@ -77,6 +77,33 @@ When a crate implements a specification:
   for the error conventions they use. Record what they establish in the crate's
   documentation, not what they are called or where they live.
 
+## `truenas_ktls`
+
+Links the system libssl. Nothing in it implements TLS: the crate drives
+the library's handshake over a caller's connected socket with kernel TLS
+enabled, reads the kernel's crypto state back for both directions, and
+refuses the connection unless it is there. The option is a request and the
+readback is the fact; plaintext must never pass for TLS. The handshake
+runs over a socket BIO on the real descriptor — which is what lets libssl
+install kernel TLS — and the BIO never owns the descriptor. Once `accept`
+returns, nothing of the call remains: plain reads and writes on the
+socket carry the connection.
+
+`accept` blocks; the caller bounds it with the socket's own timeouts, and
+an elapsed timeout is `Error::Stalled`. An `Acceptor` is `Clone` over a
+reference-counted context, so certificate rotation is building a new one
+and swapping which the caller uses — an in-flight handshake keeps its own
+context alive. Session tickets are disabled: nothing retains the state
+resumption would need.
+
+[`tests/ktls.rs`](truenas_ktls/tests/ktls.rs) generates certificate
+material in-process and drives accepts against a userspace TLS client
+over loopback TCP. The engagement cases probe once with a real loopback
+handshake and skip where the kernel or libssl cannot install TLS on a
+socket; `TRUENAS_KTLS_REQUIRE_SYSTEM=1` turns the skip into a failure.
+Only a refused engagement skips — any other probe failure is the crate's
+own and fails loudly.
+
 ## `truenas_mdb`
 
 Links the system `liblmdb`. It is never vendored: exactly one copy of LMDB may
@@ -243,6 +270,7 @@ cargo fmt --all --check
 cargo clippy --workspace --all-targets -- -D warnings
 TRUENAS_MDB_REQUIRE_PYTHON=1 TRUENAS_PAM_REQUIRE_MODULES=1 \
     TRUENAS_NSS_REQUIRE_CC=1 TRUENAS_NSS_REQUIRE_SYSTEM=1 \
+    TRUENAS_KTLS_REQUIRE_SYSTEM=1 \
     cargo test --workspace
 cargo test -p truenas_xdr --no-default-features
 cargo doc --workspace --no-deps          # must be warning-free
@@ -251,11 +279,17 @@ CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER="valgrind --error-exitcode=99 \
     --keep-debuginfo=yes --quiet" \
     TRUENAS_MDB_REQUIRE_PYTHON=1 TRUENAS_PAM_REQUIRE_MODULES=1 \
     TRUENAS_NSS_REQUIRE_CC=1 TRUENAS_NSS_REQUIRE_SYSTEM=1 \
+    TRUENAS_KTLS_REQUIRE_SYSTEM=1 \
     cargo test --workspace
 ```
 
-Build needs `liblmdb-dev` and `libpam0g-dev`; the interop suite needs
-`python3-lmdb`, the PAM suites need `libpam-modules`, and the NSS fixture
-suites need a C compiler (`cc`); the memcheck run needs `valgrind`, and
-`--keep-debuginfo=yes` because libpam unloads each module before the process
-ends.
+Build needs `liblmdb-dev`, `libpam0g-dev`, and `libssl-dev`; the interop
+suite needs `python3-lmdb`, the PAM suites need `libpam-modules`, and the
+NSS fixture suites need a C compiler (`cc`); the memcheck run needs
+`valgrind`, and `--keep-debuginfo=yes` because libpam unloads each module
+before the process ends.
+
+`TRUENAS_KTLS_REQUIRE_SYSTEM` is the one gate CI cannot set: the stock
+runners' OpenSSL is built without kTLS, so engagement cannot happen there
+and those cases skip. The battery above runs on hosts whose kernel and
+libssl can engage, and there the gate is required.

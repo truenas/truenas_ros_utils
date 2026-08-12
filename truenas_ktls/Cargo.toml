@@ -1,0 +1,46 @@
+# SPDX-FileCopyrightText: 2026 iXsystems, Inc, DBA TrueNAS
+# SPDX-License-Identifier: MIT
+# `truenas_ktls` — kernel TLS for accepted connections: the system libssl
+# runs the handshake over the caller's socket, and the connection is refused
+# unless the kernel installed TLS crypto state in both directions.
+#
+# Links the system libssl/libcrypto; nothing is vendored. Build needs
+# `libssl-dev`; engaging a connection at run time needs a kernel with the
+# `tls` upper-layer protocol and a libssl built with kTLS support.
+[package]
+name = "truenas_ktls"
+version = "0.1.0"
+description = "Kernel TLS engagement for accepted sockets, over the system libssl"
+categories = ["network-programming", "api-bindings"]
+keywords = ["ktls", "tls", "openssl", "linux", "truenas"]
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+# `SOL_TLS`/`TLS_TX`/`TLS_RX` and `getsockopt`, for verifying the kernel's
+# crypto state on the socket.
+libc = "0.2.155"
+# Context construction and the handshake, over the system libssl.
+openssl = "0.10"
+# The socket-BIO calls the `openssl` crate does not wrap: the handshake must
+# run over the real descriptor for the library to install kernel TLS on it.
+openssl-sys = "0.9"
+# `ForeignType::as_ptr`, the bridge from the safe wrappers to those calls.
+foreign-types = "0.3"
+
+[dev-dependencies]
+tempfile = "3"
+
+[lints]
+workspace = true
+
+# Certificate material is generated in-process; connections are loopback TCP
+# with a userspace TLS client. The engagement cases skip themselves where the
+# kernel or libssl cannot install TLS on a socket, unless
+# TRUENAS_KTLS_REQUIRE_SYSTEM=1 turns the skip into a failure.
+[[test]]
+name = "ktls"
+path = "tests/ktls.rs"

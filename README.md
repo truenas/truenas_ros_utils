@@ -9,6 +9,7 @@ other; depend on the one you need.
 
 | Crate | Contents |
 |---|---|
+| [`truenas_ktls`](truenas_ktls/) | Kernel TLS for accepted sockets: the system libssl runs the handshake, the kernel carries the connection from then on |
 | [`truenas_mdb`](truenas_mdb/) | Bindings to the system LMDB (`liblmdb`): a pooled environment and a byte-oriented key/value store |
 | [`truenas_nss`](truenas_nss/) | Direct passwd, group, and group-membership lookups against the system NSS service modules (`libnss_files`, `libnss_sss`, `libnss_winbind`), bypassing `nsswitch.conf` |
 | [`truenas_pam`](truenas_pam/) | A PAM client over the system `libpam`: transactions, and a login sequence driven one round at a time |
@@ -20,6 +21,9 @@ other; depend on the one you need.
 - Rust 1.97.1 or newer, edition 2024
 - `liblmdb-dev` to build `truenas_mdb`, `liblmdb0` to run it
 - `libpam0g-dev` to build `truenas_pam`, `libpam0g` to run it
+- `libssl-dev` to build `truenas_ktls`; engaging a connection at run time
+  needs a kernel with the `tls` upper-layer protocol and a libssl (3.0 or
+  newer) built with kTLS support
 - Nothing extra to build `truenas_nss`; it loads the modules a lookup names
   at run time (glibc 2.34 or newer; `libnss_files.so.2` ships in `libc6`)
 
@@ -55,6 +59,14 @@ the host is touched; they skip when no C compiler is present, and
 smoke tests drive the system's own `files` module and skip when it cannot be
 loaded; `TRUENAS_NSS_REQUIRE_SYSTEM=1`, which CI sets, makes that a failure
 instead.
+
+`truenas_ktls`'s suite generates certificate material in-process and drives
+accepts against a userspace TLS client over loopback TCP. The cases that
+prove engagement probe once with a real loopback handshake and skip where
+the kernel or libssl cannot install TLS on a socket;
+`TRUENAS_KTLS_REQUIRE_SYSTEM=1` makes that a failure instead. CI's stock
+runners build OpenSSL without kTLS, so CI cannot set it; the variable is for
+hosts whose stack can engage, where the full battery runs.
 
 `truenas_xdr`'s `derive` feature is on by default. To check the codec without
 the proc-macro crate:
