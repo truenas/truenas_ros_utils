@@ -7,20 +7,14 @@
 //! Every call here goes through a function pointer resolved for the NSS
 //! service ABI. A `_r` call fills a `libc::group` whose string pointers —
 //! and whose member array — alias the scratch buffer passed alongside it;
-//! the entry is copied into owned memory before that buffer is released,
-//! always in the same scope.
+//! the shared drivers copy the entry into owned memory before that
+//! buffer is released.
 #![allow(unsafe_code)]
 
 use crate::error::{Error, Result};
-use crate::ffi;
-use crate::service::{
-    self, Database, EnumSlot, INITIAL_BUFLEN, Service, Source,
-};
+use crate::service::{self, Database, EnumSlot, Service, Source};
 use std::ffi::CString;
 use std::fmt;
-use std::marker::PhantomData;
-use std::mem::MaybeUninit;
-use std::os::raw::c_int;
 
 /// A group entry, stamped with the module that produced it.
 ///
@@ -85,34 +79,6 @@ unsafe fn extract_group(gr: &libc::group, source: Source) -> Result<Group> {
     })
 }
 
-/// Drive one group `_r` call and extract its result.
-fn group_lookup(
-    svc: &Service,
-    op: &'static str,
-    mut raw: impl FnMut(
-        *mut libc::group,
-        *mut std::os::raw::c_char,
-        libc::size_t,
-        *mut c_int,
-    ) -> c_int,
-) -> Result<Option<Group>> {
-    let mut gr = MaybeUninit::<libc::group>::uninit();
-    let mut buf = vec![0u8; INITIAL_BUFLEN];
-    let (status, errno) = service::grow_and_call(&mut buf, |b, len, ep| {
-        raw(gr.as_mut_ptr(), b, len, ep)
-    });
-    if !service::classify_lookup(svc.module(), op, status, errno)? {
-        return Ok(None);
-    }
-    // SAFETY: a success return means the module initialised `gr`; its
-    // pointers alias `buf`, which lives to the end of this function.
-    let gr = unsafe { gr.assume_init_ref() };
-    // SAFETY: the module wrote null or NUL-terminated strings — and a
-    // null-terminated member array — into `buf`.
-    let entry = unsafe { extract_group(gr, svc.source()) }?;
-    Ok(Some(entry))
-}
-
 impl Service {
     /// Look up a group entry by name. `Ok(None)` is not-found.
     pub fn getgrnam(&self, name: &str) -> Result<Option<Group>> {
@@ -121,11 +87,16 @@ impl Service {
             .getgrnam_r
             .ok_or_else(|| self.missing("getgrnam_r"))?;
         let name = CString::new(name).map_err(|_| Error::NulByte)?;
-        group_lookup(self, "getgrnam_r", |gr, buf, len, errnop| {
-            // SAFETY: a resolved `_nss_*_getgrnam_r`; every pointer is
-            // live for the call.
-            unsafe { f(name.as_ptr(), gr, buf, len, errnop) }
-        })
+        service::lookup_entry(
+            self,
+            "getgrnam_r",
+            |gr, buf, len, errnop| {
+                // SAFETY: a resolved `_nss_*_getgrnam_r`; every pointer
+                // is live for the call.
+                unsafe { f(name.as_ptr(), gr, buf, len, errnop) }
+            },
+            extract_group,
+        )
     }
 
     /// Look up a group entry by group ID. `Ok(None)` is not-found.
@@ -134,11 +105,16 @@ impl Service {
             .fns()
             .getgrgid_r
             .ok_or_else(|| self.missing("getgrgid_r"))?;
-        group_lookup(self, "getgrgid_r", |gr, buf, len, errnop| {
-            // SAFETY: a resolved `_nss_*_getgrgid_r`; every pointer is
-            // live for the call.
-            unsafe { f(gid, gr, buf, len, errnop) }
-        })
+        service::lookup_entry(
+            self,
+            "getgrgid_r",
+            |gr, buf, len, errnop| {
+                // SAFETY: a resolved `_nss_*_getgrgid_r`; every pointer
+                // is live for the call.
+                unsafe { f(gid, gr, buf, len, errnop) }
+            },
+            extract_group,
+        )
     }
 
     /// The groups `name` belongs to in this module, as `getgrouplist(3)`
@@ -151,6 +127,17 @@ impl Service {
     /// ABI does not distinguish an unknown user from a member of nothing,
     /// so existence is [`getpwnam`](Service::getpwnam)'s question.
     pub fn getgrouplist(&self, name: &str, gid: u32) -> Result<Vec<u32>> {
+        Ok(service::dedup_gids(self.grouplist_raw(name, gid)?))
+    }
+
+    /// The list as the module reports it, repeats kept: the union walk
+    /// dedups once over the whole, so the per-module pass belongs only
+    /// to the single-module answer above.
+    pub(crate) fn grouplist_raw(
+        &self,
+        name: &str,
+        gid: u32,
+    ) -> Result<Vec<u32>> {
         let f = self
             .fns()
             .initgroups_dyn
@@ -178,12 +165,14 @@ impl Service {
             // glibc dispatcher passes.
             unsafe { setent(0) }
         })?;
-        Ok(GroupIter {
-            slot: Some(slot),
+        Ok(GroupIter(service::EntIter::new(
+            slot,
             getent,
             endent,
-            _thread_bound: PhantomData,
-        })
+            "getgrent_r",
+            "endgrent",
+            extract_group,
+        )))
     }
 }
 
@@ -236,7 +225,9 @@ pub fn getgrgid(gid: u32) -> Result<Option<Group>> {
 /// union must not pass for a whole one: supplementary groups both grant
 /// and, where a group carries a deny, withhold.
 pub fn getgrouplist(name: &str, gid: u32) -> Result<Vec<u32>> {
-    service::fan_out_groups(gid, |source| source.getgrouplist(name, gid))
+    service::fan_out_groups(gid, |source| {
+        source.service()?.grouplist_raw(name, gid)
+    })
 }
 
 /// An enumeration of one module's group database. Yields `Result<Group>`.
@@ -251,80 +242,20 @@ pub fn getgrouplist(name: &str, gid: u32) -> Result<Vec<u32>> {
 /// fn assert_send<T: Send>() {}
 /// assert_send::<truenas_nss::GroupIter>();
 /// ```
-pub struct GroupIter {
-    /// `Some` while the enumeration is open; taken on close.
-    slot: Option<EnumSlot>,
-    getent: ffi::GetgrentRFn,
-    endent: ffi::EndentFn,
-    /// The cursor is thread-affine; `!Send` is what keeps it that way.
-    _thread_bound: PhantomData<*const ()>,
-}
-
-impl GroupIter {
-    /// End the enumeration: the cursor is reset while the slot still
-    /// excludes other enumerations, then the claim is released. The
-    /// `end*ent` result is discarded — nothing can act on it here.
-    fn close(&mut self) {
-        if let Some(slot) = self.slot.take() {
-            let f = self.endent;
-            let _ = service::call_ent(slot.svc.module(), "endgrent", || {
-                // SAFETY: a resolved `_nss_*_endgrent`.
-                unsafe { f() }
-            });
-        }
-    }
-}
+pub struct GroupIter(service::EntIter<libc::group, Group>);
 
 impl Iterator for GroupIter {
     type Item = Result<Group>;
 
     fn next(&mut self) -> Option<Result<Group>> {
-        let slot = self.slot.as_ref()?;
-        let svc = slot.svc;
-        let f = self.getent;
-        let mut gr = MaybeUninit::<libc::group>::uninit();
-        let mut buf = vec![0u8; INITIAL_BUFLEN];
-        let (status, errno) = service::grow_and_call(&mut buf, |b, len, ep| {
-            // SAFETY: a resolved `_nss_*_getgrent_r`; every pointer is
-            // live for the call.
-            unsafe { f(gr.as_mut_ptr(), b, len, ep) }
-        });
-        match service::classify_ent(svc.module(), "getgrent_r", status, errno) {
-            // A fault leaves the cursor where it was, so the next call can
-            // only report it again: surface it once and close.
-            Err(err) => {
-                self.close();
-                Some(Err(err))
-            }
-            // A bare non-success status is the end of the data.
-            Ok(false) => {
-                self.close();
-                None
-            }
-            Ok(true) => {
-                // SAFETY: success initialised `gr`, whose pointers alias
-                // `buf` — still live here.
-                let gr = unsafe { gr.assume_init_ref() };
-                // SAFETY: null or NUL-terminated strings, and a
-                // null-terminated member array, from the module.
-                Some(unsafe { extract_group(gr, svc.source()) })
-            }
-        }
-    }
-}
-
-impl Drop for GroupIter {
-    fn drop(&mut self) {
-        // `close` discards the end-call's result, so dropping cannot
-        // panic.
-        self.close();
+        self.0.next()
     }
 }
 
 impl fmt::Debug for GroupIter {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("GroupIter")
-            .field("open", &self.slot.is_some())
+            .field("open", &self.0.is_open())
             .finish_non_exhaustive()
     }
 }

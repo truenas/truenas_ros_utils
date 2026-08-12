@@ -64,7 +64,10 @@ variable CI sets. A skip must never be able to read as a pass.
 A crate with an FFI boundary runs its whole suite under valgrind memcheck in
 CI, through `CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER`. Only `definite`
 leak kinds count as errors: a process-lifetime static is reported as possibly
-lost and is not one.
+lost and is not one. `--trace-children=yes` follows a suite's re-executed
+children — the NSS fan-out suite drives the module registry only there —
+while `cc` and `python3` are skipped: they are not under test and are not
+memcheck-clean.
 
 ## Implementing a published standard
 
@@ -279,7 +282,8 @@ cargo test -p truenas_xdr --no-default-features
 cargo doc --workspace --no-deps          # must be warning-free
 CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER="valgrind --error-exitcode=99 \
     --leak-check=full --errors-for-leak-kinds=definite \
-    --keep-debuginfo=yes --quiet" \
+    --keep-debuginfo=yes --quiet \
+    --trace-children=yes --trace-children-skip=*/cc,*/python3*" \
     TRUENAS_MDB_REQUIRE_PYTHON=1 TRUENAS_PAM_REQUIRE_MODULES=1 \
     TRUENAS_NSS_REQUIRE_CC=1 TRUENAS_NSS_REQUIRE_SYSTEM=1 \
     TRUENAS_KTLS_REQUIRE_SYSTEM=1 \
