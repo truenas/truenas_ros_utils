@@ -171,6 +171,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "truenas_nss"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "tempfile",
+]
+
+[[package]]
 name = "truenas_pam"
 version = "0.1.0"
 dependencies = [

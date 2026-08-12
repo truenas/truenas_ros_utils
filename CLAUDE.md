@@ -101,6 +101,44 @@ environment ([`tests/python_interop.rs`](truenas_mdb/tests/python_interop.rs)).
 It must be the distro package, which links `liblmdb0`; `pip install lmdb`
 bundles its own copy and would test nothing.
 
+## `truenas_nss`
+
+Consumes the system NSS service modules directly: `libnss_files.so.2`,
+`libnss_sss.so.2`, and `libnss_winbind.so.2` are dlopened by bare soname on
+first use and their `_nss_<module>_*` service functions called, so
+`nsswitch.conf` and the libc frontends never mediate a lookup. Nothing is
+linked at build time. It needs glibc 2.34: from there `dlopen` lives in
+`libc.so.6`, and `libnss_files.so.2` is a stub whose `_nss_files_*` functions
+are reached through the handle's dependency scope — `dlsym` therefore always
+goes through the handle, never `RTLD_DEFAULT`.
+
+A loaded module is never dlclosed: NSS modules keep global and thread-local
+state and are not built to be unloaded, so every handle and `Service` lives
+for the process. Every dlopen/dlsym/dlerror sequence runs under one lock,
+because `dlerror` reports through shared state.
+
+Entries name the module that produced them. The password fields
+(`pw_passwd`, `gr_passwd`) are omitted: the hash lives in the shadow
+database, and the placeholder invites misuse. The fan-out lookups skip a
+module that reports UNAVAIL and propagate every other failure, a module that
+cannot be loaded included.
+
+Enumeration is per module — no all-modules iterator, which would invent an
+ordering NSS does not define. `FILES` keeps one cursor per process, so its
+iterator holds a per-service lock for its whole life and another thread's
+enumeration waits; `SSS` and `WINBIND` cursors are per thread, so iterators
+are `!Send`. A same-thread iterator that would share a cursor (or the lock)
+is refused with `Error::Busy` in [`src/service.rs`](truenas_nss/src/service.rs)
+rather than left to deadlock.
+
+`Service::open` points the crate at a module by explicit path.
+[`tests/`](truenas_nss/tests/) compile deterministic fixture modules from
+[`tests/fixture/nss_fixture.c`](truenas_nss/tests/fixture/nss_fixture.c) and
+load them that way — built without a soname, so a fixture can never satisfy
+the registry's bare-soname lookups. [`tests/fanout.rs`](truenas_nss/tests/fanout.rs)
+re-executes itself with `LD_LIBRARY_PATH` pointing at fixtures named as the
+three modules, so a child process drives the real registry end to end.
+
 ## `truenas_pam`
 
 Links the system `libpam`. A PAM transaction is only meaningful against the
@@ -175,6 +213,7 @@ Everything below must pass before a change lands. CI runs all of it.
 cargo fmt --all --check
 cargo clippy --workspace --all-targets -- -D warnings
 TRUENAS_MDB_REQUIRE_PYTHON=1 TRUENAS_PAM_REQUIRE_MODULES=1 \
+    TRUENAS_NSS_REQUIRE_CC=1 TRUENAS_NSS_REQUIRE_SYSTEM=1 \
     cargo test --workspace
 cargo test -p truenas_xdr --no-default-features
 cargo doc --workspace --no-deps          # must be warning-free
@@ -182,10 +221,12 @@ CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER="valgrind --error-exitcode=99 \
     --leak-check=full --errors-for-leak-kinds=definite \
     --keep-debuginfo=yes --quiet" \
     TRUENAS_MDB_REQUIRE_PYTHON=1 TRUENAS_PAM_REQUIRE_MODULES=1 \
+    TRUENAS_NSS_REQUIRE_CC=1 TRUENAS_NSS_REQUIRE_SYSTEM=1 \
     cargo test --workspace
 ```
 
 Build needs `liblmdb-dev` and `libpam0g-dev`; the interop suite needs
-`python3-lmdb` and the PAM suites need `libpam-modules`; the memcheck run needs
-`valgrind`, and `--keep-debuginfo=yes` because libpam unloads each module
-before the process ends.
+`python3-lmdb`, the PAM suites need `libpam-modules`, and the NSS fixture
+suites need a C compiler (`cc`); the memcheck run needs `valgrind`, and
+`--keep-debuginfo=yes` because libpam unloads each module before the process
+ends.

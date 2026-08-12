@@ -33,7 +33,9 @@ jobs:
     # links the system liblmdb0 — `pip install lmdb` bundles its own copy and
     # would test something else. libpam0g-dev links truenas_pam, and
     # libpam-modules supplies the modules its service files name. valgrind
-    # backs the memcheck step below.
+    # backs the memcheck step below. truenas_nss needs nothing here: its
+    # fixture suites use the runner's C compiler, and the system module its
+    # smoke tests load, libnss_files.so.2, ships in libc6.
     - name: Install system dependencies
       run: |
         sudo apt-get update
@@ -68,15 +70,18 @@ jobs:
     - name: clippy
       run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
-    # The interop suite skips itself when python3-lmdb is missing, and the PAM
-    # suites when a module they name is. We do NOT want either to pass silently
-    # as green — the install step guarantees both are present, so require them
-    # and let a skip be a failure.
+    # The interop suite skips itself when python3-lmdb is missing, the PAM
+    # suites when a module they name is, and the NSS suites when the C
+    # compiler or the system files module is. We do NOT want any to pass
+    # silently as green — the runner guarantees all are present, so require
+    # them and let a skip be a failure.
     - name: test
       run: cargo test --workspace --locked
       env:
         TRUENAS_MDB_REQUIRE_PYTHON: "1"
         TRUENAS_PAM_REQUIRE_MODULES: "1"
+        TRUENAS_NSS_REQUIRE_CC: "1"
+        TRUENAS_NSS_REQUIRE_SYSTEM: "1"
 
     # `truenas_xdr`'s `derive` feature is on by default; prove the codec still
     # builds and passes without the proc-macro crate.
@@ -97,6 +102,8 @@ jobs:
           --errors-for-leak-kinds=definite --keep-debuginfo=yes --quiet
         TRUENAS_MDB_REQUIRE_PYTHON: "1"
         TRUENAS_PAM_REQUIRE_MODULES: "1"
+        TRUENAS_NSS_REQUIRE_CC: "1"
+        TRUENAS_NSS_REQUIRE_SYSTEM: "1"
 
     - name: docs
       run: cargo doc --workspace --no-deps --locked
@@ -143,3 +150,5 @@ jobs:
       env:
         TRUENAS_MDB_REQUIRE_PYTHON: "1"
         TRUENAS_PAM_REQUIRE_MODULES: "1"
+        TRUENAS_NSS_REQUIRE_CC: "1"
+        TRUENAS_NSS_REQUIRE_SYSTEM: "1"
