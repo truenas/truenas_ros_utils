@@ -43,6 +43,15 @@ impl<W: Write> Serializer<W> {
         self.put(&v.to_be_bytes())
     }
 
+    /// A variable-length count as its `u32` prefix. The wire bounds every
+    /// count at `u32::MAX`; a longer value has no encoding, so it is
+    /// refused rather than truncated.
+    fn put_len(&mut self, len: usize) -> Result<()> {
+        let len = u32::try_from(len)
+            .map_err(|_| Error::Unsupported("a length beyond u32::MAX"))?;
+        self.put_u32(len)
+    }
+
     /// Zero padding bringing `len` up to a 4-byte boundary.
     fn put_pad(&mut self, len: usize) -> Result<()> {
         let p = pad4(len);
@@ -126,7 +135,7 @@ impl<W: Write> serde::Serializer for &mut Serializer<W> {
     fn serialize_str(self, v: &str) -> Result<()> {
         // A string is variable-length whatever the sentinel said.
         self.fixed_pending = false;
-        self.put_u32(v.len() as u32)?;
+        self.put_len(v.len())?;
         self.put_body(v.as_bytes())
     }
 
@@ -134,7 +143,7 @@ impl<W: Write> serde::Serializer for &mut Serializer<W> {
         if std::mem::take(&mut self.fixed_pending) {
             self.put_body(v)
         } else {
-            self.put_u32(v.len() as u32)?;
+            self.put_len(v.len())?;
             self.put_body(v)
         }
     }
@@ -191,7 +200,7 @@ impl<W: Write> serde::Serializer for &mut Serializer<W> {
     fn serialize_seq(self, len: Option<usize>) -> Result<Self::SerializeSeq> {
         let len =
             len.ok_or(Error::Unsupported("a sequence of unknown length"))?;
-        self.put_u32(len as u32)?;
+        self.put_len(len)?;
         Ok(self)
     }
     fn serialize_tuple(self, _len: usize) -> Result<Self::SerializeTuple> {
@@ -272,6 +281,31 @@ forward_elements!(SerializeStructVariant, serialize_field, &'static str);
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A length that does not fit the 32-bit prefix must be refused at
+    /// the prefix: `as u32` would write `len mod 2^32` and then every
+    /// byte, corrupting the stream for its decoder.
+    #[cfg(target_pointer_width = "64")]
+    #[test]
+    fn an_oversize_length_is_refused_not_truncated() {
+        struct Overlong;
+        impl serde::Serialize for Overlong {
+            fn serialize<S: serde::Serializer>(
+                &self,
+                s: S,
+            ) -> std::result::Result<S::Ok, S::Error> {
+                use serde::ser::SerializeSeq;
+                s.serialize_seq(Some(u32::MAX as usize + 1))?.end()
+            }
+        }
+        let err = crate::to_bytes(&Overlong).unwrap_err();
+        assert_eq!(err, Error::Unsupported("a length beyond u32::MAX"));
+
+        // The boundary itself encodes.
+        let mut ser = Serializer::new(CountWriter { n: 0 });
+        assert!(ser.put_len(u32::MAX as usize).is_ok());
+        assert!(ser.put_len(u32::MAX as usize + 1).is_err());
+    }
 
     #[test]
     fn the_count_writer_counts_and_flushes() {

@@ -250,7 +250,10 @@ accepts what real encoders send.
 
 Decoding bounds its own nesting (`Deserializer::DEFAULT_MAX_DEPTH`, raised
 with `with_max_depth`), so a hostile chain of §4.19 optionals is
-`Error::RecursionLimit`, not a stack overflow.
+`Error::RecursionLimit`, not a stack overflow. A sequence count is held to
+the remaining input before the element loop — an element is at least one
+4-byte unit — so a count the input cannot meet is `Error::Eof`, not a spin
+over a zero-size element type.
 [`tests/robustness.rs`](truenas_xdr/tests/robustness.rs) holds every decode
 path to Ok-or-Err over a hostile corpus.
 

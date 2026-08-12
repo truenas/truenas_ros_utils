@@ -281,6 +281,18 @@ impl<'de> serde::Deserializer<'de> for &mut Deserializer<'de> {
 
     fn deserialize_seq<V: Visitor<'de>>(self, v: V) -> Result<V::Value> {
         let count = self.read_u32()? as usize;
+        // An array element is at least one 4-byte unit (§3), so a count
+        // beyond a quarter of the remaining input cannot be met. Refusing
+        // it here bounds the element loop by the input even for a target
+        // type that consumes no bytes per element.
+        let rem = self.remaining().len();
+        if count > rem / crate::BYTES_PER_XDR_UNIT {
+            return Err(Error::Eof {
+                need: count
+                    .saturating_mul(crate::BYTES_PER_XDR_UNIT)
+                    .saturating_sub(rem),
+            });
+        }
         self.descend()?;
         let reader = self.seq(count);
         let out = v.visit_seq(reader);
