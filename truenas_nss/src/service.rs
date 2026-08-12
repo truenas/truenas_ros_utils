@@ -22,7 +22,7 @@ use std::cell::RefCell;
 use std::ffi::{CStr, CString};
 use std::fmt;
 use std::mem;
-use std::os::raw::{c_char, c_int, c_void};
+use std::os::raw::{c_char, c_int, c_long, c_void};
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 use std::sync::{Mutex, MutexGuard, OnceLock};
@@ -150,6 +150,7 @@ pub(crate) struct Fns {
     pub(crate) setgrent: Option<ffi::SetentFn>,
     pub(crate) endgrent: Option<ffi::EndentFn>,
     pub(crate) getgrent_r: Option<ffi::GetgrentRFn>,
+    pub(crate) initgroups_dyn: Option<ffi::InitgroupsDynFn>,
 }
 
 impl Fns {
@@ -166,6 +167,7 @@ impl Fns {
             || self.setgrent.is_some()
             || self.endgrent.is_some()
             || self.getgrent_r.is_some()
+            || self.initgroups_dyn.is_some()
     }
 }
 
@@ -357,6 +359,10 @@ fn load_locked(spec: LoadSpec<'_>) -> Result<&'static Service> {
         getgrent_r: sym("getgrent_r")?.map(|p| {
             // SAFETY: the ABI's `getgrent_r` signature.
             unsafe { mem::transmute::<*mut c_void, ffi::GetgrentRFn>(p) }
+        }),
+        initgroups_dyn: sym("initgroups_dyn")?.map(|p| {
+            // SAFETY: the ABI's `initgroups_dyn` signature.
+            unsafe { mem::transmute::<*mut c_void, ffi::InitgroupsDynFn>(p) }
         }),
     };
 
@@ -555,6 +561,101 @@ pub(crate) unsafe fn text_field(p: *const c_char) -> String {
     s.to_string_lossy().into_owned()
 }
 
+/// The gid array every `initgroups_dyn` call starts with, in entries.
+pub(crate) const INITGROUPS_INITIAL: usize = 32;
+
+/// Drive one `initgroups_dyn` call and copy its gid array out.
+///
+/// The array is allocated with `malloc` because the module grows it with
+/// `realloc`; whatever pointer the call leaves behind is copied and freed
+/// here, on every path. It is seeded with `gid` at index 0 — the glibc
+/// frontends seed theirs the same way, and the module skips that gid when
+/// it appends.
+///
+/// `limit` is passed as `-1`, never a positive cap: a module that reaches
+/// a positive limit truncates the list and still reports success, and a
+/// group list that is silently short is an authorization fault. A ceiling
+/// is the caller's to enforce on the returned list, where over-limit is
+/// visible.
+pub(crate) fn call_initgroups(
+    module: &'static str,
+    f: ffi::InitgroupsDynFn,
+    name: &CStr,
+    gid: u32,
+) -> Result<Vec<u32>> {
+    let bytes = INITGROUPS_INITIAL * mem::size_of::<libc::gid_t>();
+    // SAFETY: allocating `INITGROUPS_INITIAL` gid_t entries.
+    let mut groups: *mut libc::gid_t = unsafe { libc::malloc(bytes) }.cast();
+    assert!(!groups.is_null(), "malloc({bytes}) failed");
+    // SAFETY: index 0 is within the fresh allocation.
+    unsafe { *groups = gid };
+    let mut start: c_long = 1;
+    let mut size: c_long = INITGROUPS_INITIAL as c_long;
+    let mut errno: c_int = 0;
+    // SAFETY: a resolved `_nss_*_initgroups_dyn`; every pointer is live
+    // for the call and the array is malloc-owned, as the ABI requires.
+    let status = unsafe {
+        f(
+            name.as_ptr(),
+            gid,
+            &mut start,
+            &mut size,
+            &mut groups,
+            -1,
+            &mut errno,
+        )
+    };
+    // Copy out and free before classifying, so every path releases the
+    // possibly-realloc-moved array exactly once. The filled count is
+    // bounded by the capacity, so a module that mis-advanced `start`
+    // cannot walk the copy past the allocation.
+    let filled = start.max(0).min(size.max(0)) as usize;
+    // SAFETY: `groups` has capacity for `size` entries, of which the
+    // first `filled` were written — the seed above, then the module's
+    // appends.
+    let copied = unsafe { std::slice::from_raw_parts(groups, filled) }.to_vec();
+    // SAFETY: this function's allocation, or the module's realloc of it.
+    unsafe { libc::free(groups.cast()) };
+    // NOTFOUND passes: it is "no memberships known here", and the seed
+    // alone comes back. The system files module reports it for an unknown
+    // user and for a member of nothing alike, so the two are one answer.
+    classify_lookup(module, "initgroups_dyn", status, errno)?;
+    let mut gids = Vec::with_capacity(copied.len());
+    for gid in copied {
+        if !gids.contains(&gid) {
+            gids.push(gid);
+        }
+    }
+    Ok(gids)
+}
+
+/// Union the group lists of every module in [`Source::LOOKUP_ORDER`],
+/// seeded with `gid`. Membership is additive across modules, so every
+/// module is consulted — unlike the first-hit lookups — under the same
+/// skip rule: a module whose failure is [`unavail`](Error::is_unavail)
+/// contributes nothing, and any other error propagates. First appearance
+/// keeps its position.
+pub(crate) fn fan_out_groups(
+    gid: u32,
+    mut lookup: impl FnMut(Source) -> Result<Vec<u32>>,
+) -> Result<Vec<u32>> {
+    let mut out = vec![gid];
+    for source in Source::LOOKUP_ORDER {
+        match lookup(source) {
+            Ok(gids) => {
+                for gid in gids {
+                    if !out.contains(&gid) {
+                        out.push(gid);
+                    }
+                }
+            }
+            Err(err) if err.is_unavail() => {}
+            Err(err) => return Err(err),
+        }
+    }
+    Ok(out)
+}
+
 /// Try each module in [`Source::LOOKUP_ORDER`]; first hit wins. A module
 /// whose failure is [`unavail`](Error::is_unavail) is skipped; any other
 /// error — a load failure included — propagates.
@@ -674,6 +775,7 @@ mod tests {
                 setgrent: None,
                 endgrent: None,
                 getgrent_r: None,
+                initgroups_dyn: None,
             },
             iter_lock: Mutex::new(()),
         }
@@ -893,6 +995,244 @@ mod tests {
         });
         assert_eq!(stopped, Err(hard));
         assert_eq!(tried, [Source::Files], "a hard error must stop the walk");
+    }
+
+    // --- initgroups driver fakes ---------------------------------------
+    // Each stands in for a module's `initgroups_dyn`. They must not
+    // panic: unwinding out of an `extern "C"` function aborts.
+
+    /// Appends within the initial capacity and skips the primary gid, as
+    /// the real modules do.
+    unsafe extern "C" fn ig_appends(
+        _user: *const c_char,
+        group: libc::gid_t,
+        start: *mut c_long,
+        _size: *mut c_long,
+        groups: *mut *mut libc::gid_t,
+        _limit: c_long,
+        _errnop: *mut c_int,
+    ) -> c_int {
+        for gid in [2000, group, 2001, 2000] {
+            if gid == group {
+                continue;
+            }
+            // SAFETY: the driver's contract: `*groups` holds `*size`
+            // entries and `*start` of them are filled; the appends here
+            // stay within the initial capacity.
+            unsafe {
+                *(*groups).add(*start as usize) = gid;
+                *start += 1;
+            }
+        }
+        ffi::NSS_STATUS_SUCCESS
+    }
+
+    /// Touches nothing and reports NOTFOUND: a user this module does not
+    /// know, or one that belongs to nothing.
+    unsafe extern "C" fn ig_notfound(
+        _user: *const c_char,
+        _group: libc::gid_t,
+        _start: *mut c_long,
+        _size: *mut c_long,
+        _groups: *mut *mut libc::gid_t,
+        _limit: c_long,
+        _errnop: *mut c_int,
+    ) -> c_int {
+        ffi::NSS_STATUS_NOTFOUND
+    }
+
+    /// The limit the growth fake last saw, read back by its test.
+    static IG_LIMIT_SEEN: std::sync::atomic::AtomicI64 =
+        std::sync::atomic::AtomicI64::new(0);
+
+    /// Appends past the initial capacity with the doubling `realloc` the
+    /// real winbind module uses, recording the limit it was given.
+    unsafe extern "C" fn ig_grows(
+        _user: *const c_char,
+        _group: libc::gid_t,
+        start: *mut c_long,
+        size: *mut c_long,
+        groups: *mut *mut libc::gid_t,
+        limit: c_long,
+        _errnop: *mut c_int,
+    ) -> c_int {
+        IG_LIMIT_SEEN.store(limit, std::sync::atomic::Ordering::Relaxed);
+        for i in 0..100u32 {
+            // SAFETY: the driver's contract as in `ig_appends`; on a full
+            // array the module grows it with realloc and hands the new
+            // pointer and capacity back.
+            unsafe {
+                if *start == *size {
+                    let bytes =
+                        (*size as usize) * 2 * mem::size_of::<libc::gid_t>();
+                    let grown = libc::realloc((*groups).cast(), bytes);
+                    if grown.is_null() {
+                        return ffi::NSS_STATUS_UNAVAIL;
+                    }
+                    *groups = grown.cast();
+                    *size *= 2;
+                }
+                *(*groups).add(*start as usize) = 5000 + i;
+                *start += 1;
+            }
+        }
+        ffi::NSS_STATUS_SUCCESS
+    }
+
+    /// Appends one gid, then fails the winbind way: NOTFOUND with ENOMEM
+    /// in the errno out-parameter.
+    unsafe extern "C" fn ig_errno_notfound(
+        _user: *const c_char,
+        _group: libc::gid_t,
+        start: *mut c_long,
+        _size: *mut c_long,
+        groups: *mut *mut libc::gid_t,
+        _limit: c_long,
+        errnop: *mut c_int,
+    ) -> c_int {
+        // SAFETY: the driver's contract as in `ig_appends`.
+        unsafe {
+            *(*groups).add(*start as usize) = 2000;
+            *start += 1;
+            *errnop = libc::ENOMEM;
+        }
+        ffi::NSS_STATUS_NOTFOUND
+    }
+
+    /// Fills the whole array, then advances `start` past the capacity.
+    unsafe extern "C" fn ig_overruns(
+        _user: *const c_char,
+        _group: libc::gid_t,
+        start: *mut c_long,
+        size: *mut c_long,
+        groups: *mut *mut libc::gid_t,
+        _limit: c_long,
+        _errnop: *mut c_int,
+    ) -> c_int {
+        // SAFETY: every write is within the `*size`-entry array; only the
+        // final `*start` breaks the contract, which is the point.
+        unsafe {
+            for i in 0..*size {
+                *(*groups).add(i as usize) = 6000 + i as u32;
+            }
+            *start = *size + 3;
+        }
+        ffi::NSS_STATUS_SUCCESS
+    }
+
+    /// The driver seeds the primary gid, keeps the module's appends in
+    /// order, and deduplicates.
+    #[test]
+    fn initgroups_seeds_appends_and_dedups() {
+        let gids = call_initgroups("T", ig_appends, c"alice", 1000).unwrap();
+        assert_eq!(gids, [1000, 2000, 2001]);
+    }
+
+    /// NOTFOUND is not an error: the seed alone comes back, for an
+    /// unknown user and a member of nothing alike.
+    #[test]
+    fn initgroups_notfound_is_the_seed_alone() {
+        let gids = call_initgroups("T", ig_notfound, c"nobody", 4242).unwrap();
+        assert_eq!(gids, [4242]);
+    }
+
+    /// The module may realloc the array; the driver must keep every entry
+    /// across the moves, and must have passed no positive limit — at a
+    /// positive limit a module truncates silently instead of failing.
+    #[test]
+    fn initgroups_survives_realloc_growth_unbounded() {
+        let gids = call_initgroups("T", ig_grows, c"grouprich", 9).unwrap();
+        assert_eq!(gids.len(), 101);
+        assert_eq!(gids[0], 9);
+        assert_eq!(gids[1], 5000);
+        assert_eq!(gids[100], 5099);
+        let limit = IG_LIMIT_SEEN.load(std::sync::atomic::Ordering::Relaxed);
+        assert!(
+            limit < 0,
+            "driver passed limit {limit}; a positive limit truncates \
+             silently"
+        );
+    }
+
+    /// An errno outranks the status here as everywhere: the real winbind
+    /// module reports allocation failure as NOTFOUND with ENOMEM, and a
+    /// partial list must surface as the fault it is, not as a settled
+    /// membership answer.
+    #[test]
+    fn initgroups_errno_outranks_notfound() {
+        let err = call_initgroups("T", ig_errno_notfound, c"alice", 1000)
+            .unwrap_err();
+        assert_eq!(
+            err,
+            Error::Call {
+                module: "T",
+                op: "initgroups_dyn",
+                status: ffi::NSS_STATUS_NOTFOUND,
+                errno: libc::ENOMEM,
+            }
+        );
+    }
+
+    /// A `start` past the capacity is a module bug; the copy is bounded
+    /// by the capacity rather than walking past the allocation.
+    #[test]
+    fn initgroups_bounds_the_copy_to_the_capacity() {
+        let gids = call_initgroups("T", ig_overruns, c"x", 6000).unwrap();
+        assert_eq!(gids.len(), INITGROUPS_INITIAL);
+        assert_eq!(gids[0], 6000);
+        assert_eq!(gids[INITGROUPS_INITIAL - 1], 6031);
+    }
+
+    /// The union walk: every module consulted, the seed first, order
+    /// preserved, duplicates across modules collapsed.
+    #[test]
+    fn fan_out_groups_unions_every_module() {
+        let mut tried = Vec::new();
+        let gids = fan_out_groups(100, |s| {
+            tried.push(s);
+            Ok(match s {
+                Source::Files => vec![100, 2000, 2001],
+                Source::Sss => vec![100, 2001, 3000],
+                Source::Winbind => vec![100],
+            })
+        })
+        .unwrap();
+        assert_eq!(gids, [100, 2000, 2001, 3000]);
+        assert_eq!(tried, Source::LOOKUP_ORDER);
+    }
+
+    /// The union walk keeps the fan-out's skip rule: UNAVAIL contributes
+    /// nothing, and any other failure — a load failure included — stops
+    /// the walk, because a membership list missing a module's answer is
+    /// not a smaller answer but a wrong one.
+    #[test]
+    fn fan_out_groups_skips_unavail_and_propagates_the_rest() {
+        let gids = fan_out_groups(100, |s| match s {
+            Source::Sss => Err(Error::Call {
+                module: "SSS",
+                op: "initgroups_dyn",
+                status: ffi::NSS_STATUS_UNAVAIL,
+                errno: 0,
+            }),
+            _ => Ok(vec![100, s as u32 + 500]),
+        })
+        .unwrap();
+        assert_eq!(gids, [100, 500, 502]);
+
+        let load = Error::Load {
+            module: "WINBIND",
+            reason: "missing".into(),
+        };
+        let mut tried = Vec::new();
+        let propagated = fan_out_groups(100, |s| {
+            tried.push(s);
+            match s {
+                Source::Winbind => Err(load.clone()),
+                _ => Ok(vec![100]),
+            }
+        });
+        assert_eq!(propagated, Err(load));
+        assert_eq!(tried, Source::LOOKUP_ORDER);
     }
 
     /// A second same-thread claim that would share a cursor (or a lock)

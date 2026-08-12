@@ -25,6 +25,16 @@
  *                                  after it, faults with UNAVAIL and EIO
  *                                  through the errno out-parameter without
  *                                  moving the cursor
+ *   -DNSS_FIXTURE_INITGROUPS_FLOOD=n     initgroups_dyn for user
+ *                                  "grouprich" appends n synthetic gids
+ *                                  counting from
+ *                                  NSS_FIXTURE_INITGROUPS_FLOOD_BASE
+ *                                  (default 5000), forcing the array to
+ *                                  grow
+ *   -DNSS_FIXTURE_INITGROUPS_ERRNO=e     initgroups_dyn appends one gid,
+ *                                  then returns NOTFOUND with *errnop set
+ *                                  to e — the shape the real winbind
+ *                                  module fails in
  *
  * The mode — "ok", "unavail", "tryagain", "notfound" — applies to the four
  * lookups and to set*ent, and is read per call from
@@ -51,6 +61,10 @@
 
 #ifndef NSS_FIXTURE_DEFAULT_MODE
 #define NSS_FIXTURE_DEFAULT_MODE "ok"
+#endif
+
+#ifndef NSS_FIXTURE_INITGROUPS_FLOOD_BASE
+#define NSS_FIXTURE_INITGROUPS_FLOOD_BASE 5000
 #endif
 
 #define XCAT(a, b) a##b
@@ -479,6 +493,102 @@ FN(getgrent_r)(struct group *result, char *buffer, size_t buflen,
 	if (s == NSS_STATUS_SUCCESS)
 		gr_cursor++;
 	return s;
+}
+
+/* --- initgroups ---------------------------------------------------------- */
+
+long FN(fixture_initgroups_calls) = 0;
+/* The limit the last initgroups_dyn call received, for readback. */
+long FN(fixture_initgroups_limit) = 0;
+
+/* Append one gid through the initgroups_dyn array protocol: the doubling
+ * realloc the real modules use, honouring a positive limit the way
+ * winbind does — stop appending, keep the status. Returns 1 when the gid
+ * was appended, 0 at the limit, -1 on ENOMEM with *errnop set. */
+static int
+ig_append(gid_t gid, long int *start, long int *size, gid_t **groupsp,
+          long int limit, int *errnop)
+{
+	long int newsize;
+	gid_t *grown;
+
+	if (*start == *size) {
+		newsize = 2 * (*size);
+		if (limit > 0) {
+			if (*size >= limit)
+				return 0;
+			if (newsize > limit)
+				newsize = limit;
+		}
+		grown = realloc(*groupsp, newsize * sizeof(**groupsp));
+		if (grown == NULL) {
+			*errnop = ENOMEM;
+			return -1;
+		}
+		*groupsp = grown;
+		*size = newsize;
+	}
+	(*groupsp)[*start] = gid;
+	(*start)++;
+	return 1;
+}
+
+enum nss_status
+FN(initgroups_dyn)(const char *user, gid_t group, long int *start,
+                   long int *size, gid_t **groupsp, long int limit,
+                   int *errnop)
+{
+	fixture_mode_t m = mode();
+	int appended = 0;
+	size_t i, j;
+
+	FN(fixture_initgroups_calls)++;
+	FN(fixture_initgroups_limit) = limit;
+	if (m != MODE_OK)
+		return mode_result(m, errnop);
+#ifdef NSS_FIXTURE_INITGROUPS_ERRNO
+	if (ig_append(2000, start, size, groupsp, limit, errnop) < 0)
+		return NSS_STATUS_NOTFOUND;
+	*errnop = NSS_FIXTURE_INITGROUPS_ERRNO;
+	return NSS_STATUS_NOTFOUND;
+#endif
+#ifdef NSS_FIXTURE_INITGROUPS_FLOOD
+	if (strcmp(user, "grouprich") == 0) {
+		for (j = 0; j < NSS_FIXTURE_INITGROUPS_FLOOD; j++) {
+			switch (ig_append(
+			    (gid_t)(NSS_FIXTURE_INITGROUPS_FLOOD_BASE + j),
+			    start, size, groupsp, limit, errnop)) {
+			case -1:
+				return NSS_STATUS_NOTFOUND;
+			case 0:
+				goto out;
+			}
+			appended = 1;
+		}
+	}
+#endif
+	for (i = 0; i < ARRAY_SIZE(groups); i++) {
+		if (groups[i].members == NULL)
+			continue;
+		for (j = 0; groups[i].members[j] != NULL; j++) {
+			if (strcmp(groups[i].members[j], user) != 0)
+				continue;
+			/* Skip the primary, as winbind does. */
+			if (groups[i].gid == group)
+				break;
+			switch (ig_append(groups[i].gid, start, size,
+			    groupsp, limit, errnop)) {
+			case -1:
+				return NSS_STATUS_NOTFOUND;
+			case 0:
+				goto out;
+			}
+			appended = 1;
+			break;
+		}
+	}
+out:
+	return appended ? NSS_STATUS_SUCCESS : NSS_STATUS_NOTFOUND;
 }
 
 #endif /* !NSS_FIXTURE_NO_GROUPS */

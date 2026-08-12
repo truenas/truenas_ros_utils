@@ -125,6 +125,7 @@ fn statuses_classify_as_the_contract_says() {
     let err = svc.getgrgid(2000).unwrap_err();
     assert!(err.is_unavail());
     assert_eq!(err.errno(), None);
+    assert!(svc.getgrouplist("alice", 1000).unwrap_err().is_unavail());
 
     let Some((_dir, path)) =
         fixture("notfound", &["NSS_FIXTURE_DEFAULT_MODE=\"notfound\""])
@@ -135,6 +136,8 @@ fn statuses_classify_as_the_contract_says() {
         .unwrap();
     assert_eq!(svc.getpwnam("alice").unwrap(), None);
     assert_eq!(svc.getgrnam("alpha").unwrap(), None);
+    // For a membership list, NOTFOUND is the seed alone, not an error.
+    assert_eq!(svc.getgrouplist("alice", 1000).unwrap(), [1000]);
 }
 
 /// `ERANGE` asks for a larger buffer only under `TRYAGAIN`. Under any other
@@ -255,6 +258,12 @@ fn load_and_symbol_failures_name_what_is_missing() {
         svc.group_entries().unwrap_err(),
         Error::Symbol { .. }
     ));
+    match svc.getgrouplist("alice", 1000).unwrap_err() {
+        Error::Symbol { symbol, .. } => {
+            assert_eq!(&*symbol, "_nss_nogrp_initgroups_dyn");
+        }
+        other => panic!("expected Symbol, got {other:?}"),
+    }
 }
 
 /// Enumeration yields the table in order, grows through an oversized entry
@@ -627,4 +636,75 @@ fn a_domain_separator_name_round_trips() {
     let admins = svc.getgrnam("domadmins").unwrap().unwrap();
     assert_eq!(admins.members, ["alice", "FIXDOM\\eve"]);
     assert_eq!(svc.getpwnam(&admins.members[1]).unwrap().unwrap(), eve);
+}
+
+/// `getgrouplist` reflects the group tables: the primary gid leads, each
+/// membership follows in table order, the module's skip of the primary is
+/// honoured, and a member of nothing gets the seed alone — as does an
+/// unknown user, the one answer the ABI gives both.
+#[test]
+fn getgrouplist_reflects_the_group_tables() {
+    let Some((_dir, path)) = fixture("iggrp", &[]) else {
+        return;
+    };
+    let svc = Service::open(&path, "iggrp", EntScope::Thread, Source::Winbind)
+        .unwrap();
+
+    assert_eq!(svc.getgrouplist("alice", 1000).unwrap(), [1000, 2000, 2004]);
+    assert_eq!(svc.getgrouplist("bob", 1001).unwrap(), [1001, 2000]);
+    // With alpha as her primary gid, the module skips it.
+    assert_eq!(svc.getgrouplist("alice", 2000).unwrap(), [2000, 2004]);
+    assert_eq!(svc.getgrouplist("carol", 1004).unwrap(), [1004]);
+    assert_eq!(svc.getgrouplist("zz-nobody", 4242).unwrap(), [4242]);
+    // The domain separator passes through the membership path unaltered.
+    assert_eq!(svc.getgrouplist("FIXDOM\\eve", 1006).unwrap(), [1006, 2004]);
+    // An interior NUL never reaches the module.
+    assert_eq!(svc.getgrouplist("a\0b", 1).unwrap_err(), Error::NulByte);
+
+    // The array was handed over unbounded: at a positive limit a module
+    // truncates the list and still reports success.
+    let limit = common::counter(&path, "_nss_iggrp_fixture_initgroups_limit");
+    assert_eq!(limit, -1);
+}
+
+/// The gid array grows through the module's own realloc, and every entry
+/// must survive the moves. The valgrind pass holds the ownership hand-off
+/// — this crate mallocs, the module reallocs, this crate frees — to
+/// account here.
+#[test]
+fn getgrouplist_survives_array_growth() {
+    let Some((_dir, path)) =
+        fixture("igbig", &["NSS_FIXTURE_INITGROUPS_FLOOD=100"])
+    else {
+        return;
+    };
+    let svc = Service::open(&path, "igbig", EntScope::Thread, Source::Winbind)
+        .unwrap();
+
+    let gids = svc.getgrouplist("grouprich", 9000).unwrap();
+    assert_eq!(gids.len(), 101);
+    assert_eq!(gids[0], 9000);
+    assert_eq!(gids[1], 5000);
+    assert_eq!(gids[100], 5099);
+    let calls = common::counter(&path, "_nss_igbig_fixture_initgroups_calls");
+    assert_eq!(calls, 1, "the growth is the module's, not a retry loop");
+}
+
+/// The real winbind module reports a failed append as NOTFOUND with ENOMEM
+/// in the errno out-parameter, gids already sitting in the array. The
+/// errno must outrank the status: a partial list surfacing as settled
+/// membership is an authorization fault.
+#[test]
+fn getgrouplist_errno_outranks_the_status() {
+    let Some((_dir, path)) =
+        fixture("igerr", &["NSS_FIXTURE_INITGROUPS_ERRNO=ENOMEM"])
+    else {
+        return;
+    };
+    let svc = Service::open(&path, "igerr", EntScope::Thread, Source::Winbind)
+        .unwrap();
+
+    let err = svc.getgrouplist("alice", 1000).unwrap_err();
+    assert_eq!(err.errno(), Some(libc::ENOMEM));
+    assert_eq!(err.status(), Some(NssStatus::NotFound));
 }
