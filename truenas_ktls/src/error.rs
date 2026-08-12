@@ -26,6 +26,10 @@ pub enum Error {
     /// `SO_RCVTIMEO`/`SO_SNDTIMEO` on the socket, which the caller sets;
     /// a peer that connects and goes silent surfaces here.
     Stalled,
+    /// The socket has `O_NONBLOCK` set. The handshake runs as blocking
+    /// I/O bounded by the socket's timeouts, so it needs a blocking
+    /// descriptor; checked before the handshake starts.
+    NonBlocking,
     /// The handshake completed but the kernel holds no TLS crypto state
     /// for this direction, so the socket cannot carry the connection.
     NotEngaged {
@@ -58,6 +62,10 @@ impl fmt::Display for Error {
             Error::Stalled => f.write_str(
                 "TLS handshake stopped waiting for the peer \
                  (socket timeout elapsed)",
+            ),
+            Error::NonBlocking => f.write_str(
+                "The socket is non-blocking; the TLS handshake needs a \
+                 blocking socket",
             ),
             Error::NotEngaged { direction, errno } => {
                 write!(
@@ -92,6 +100,9 @@ impl From<Error> for io::Error {
             Error::Handshake(_) | Error::NotEngaged { .. } => {
                 io::Error::new(io::ErrorKind::InvalidData, err)
             }
+            Error::NonBlocking => {
+                io::Error::new(io::ErrorKind::InvalidInput, err)
+            }
             other => io::Error::other(other),
         }
     }
@@ -112,6 +123,7 @@ mod tests {
 
         assert!(!Error::Disconnected.to_string().is_empty());
         assert!(Error::Stalled.to_string().contains("timeout"));
+        assert!(Error::NonBlocking.to_string().contains("non-blocking"));
 
         let ne = Error::NotEngaged {
             direction: "RX",
@@ -159,6 +171,12 @@ mod tests {
         assert_eq!(
             io::Error::from(Error::Handshake("x".into())).kind(),
             io::ErrorKind::InvalidData
+        );
+        // Caller misuse, not peer behaviour: it must not read as a
+        // timeout or a protocol fault.
+        assert_eq!(
+            io::Error::from(Error::NonBlocking).kind(),
+            io::ErrorKind::InvalidInput
         );
         assert_eq!(
             io::Error::from(Error::Setup("x".into())).raw_os_error(),

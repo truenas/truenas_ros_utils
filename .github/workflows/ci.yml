@@ -102,13 +102,17 @@ jobs:
     # environment pool is a process-lifetime static, which memcheck reports as
     # possibly lost. `--keep-debuginfo=yes` is for truenas_pam: libpam unloads
     # each module at the end of a transaction, and a report from inside one
-    # would otherwise have no symbols left to name.
+    # would otherwise have no symbols left to name. `--trace-children=yes`
+    # follows the NSS fan-out suite's re-executed children — the multi-module
+    # registry path runs only there — while cc and python3 are skipped: they
+    # are not under test and are not memcheck-clean.
     - name: valgrind
       run: cargo test --workspace --locked
       env:
         CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER: >-
           valgrind --error-exitcode=99 --leak-check=full
           --errors-for-leak-kinds=definite --keep-debuginfo=yes --quiet
+          --trace-children=yes --trace-children-skip=*/cc,*/python3*
         TRUENAS_MDB_REQUIRE_PYTHON: "1"
         TRUENAS_PAM_REQUIRE_MODULES: "1"
         TRUENAS_NSS_REQUIRE_CC: "1"

@@ -6,20 +6,14 @@
 //!
 //! Every call here goes through a function pointer resolved for the NSS
 //! service ABI. A `_r` call fills a `libc::passwd` whose string pointers
-//! alias the scratch buffer passed alongside it; the entry is copied into
-//! owned memory before that buffer is released, always in the same scope.
+//! alias the scratch buffer passed alongside it; the shared drivers copy
+//! the entry into owned memory before that buffer is released.
 #![allow(unsafe_code)]
 
 use crate::error::{Error, Result};
-use crate::ffi;
-use crate::service::{
-    self, Database, EnumSlot, INITIAL_BUFLEN, Service, Source,
-};
+use crate::service::{self, Database, EnumSlot, Service, Source};
 use std::ffi::CString;
 use std::fmt;
-use std::marker::PhantomData;
-use std::mem::MaybeUninit;
-use std::os::raw::c_int;
 
 /// A passwd entry, stamped with the module that produced it.
 ///
@@ -76,33 +70,6 @@ unsafe fn extract_passwd(pw: &libc::passwd, source: Source) -> Result<Passwd> {
     })
 }
 
-/// Drive one passwd `_r` call and extract its result.
-fn passwd_lookup(
-    svc: &Service,
-    op: &'static str,
-    mut raw: impl FnMut(
-        *mut libc::passwd,
-        *mut std::os::raw::c_char,
-        libc::size_t,
-        *mut c_int,
-    ) -> c_int,
-) -> Result<Option<Passwd>> {
-    let mut pw = MaybeUninit::<libc::passwd>::uninit();
-    let mut buf = vec![0u8; INITIAL_BUFLEN];
-    let (status, errno) = service::grow_and_call(&mut buf, |b, len, ep| {
-        raw(pw.as_mut_ptr(), b, len, ep)
-    });
-    if !service::classify_lookup(svc.module(), op, status, errno)? {
-        return Ok(None);
-    }
-    // SAFETY: a success return means the module initialised `pw`; its
-    // pointers alias `buf`, which lives to the end of this function.
-    let pw = unsafe { pw.assume_init_ref() };
-    // SAFETY: the module wrote null or NUL-terminated strings into `buf`.
-    let entry = unsafe { extract_passwd(pw, svc.source()) }?;
-    Ok(Some(entry))
-}
-
 impl Service {
     /// Look up a passwd entry by name. `Ok(None)` is not-found.
     pub fn getpwnam(&self, name: &str) -> Result<Option<Passwd>> {
@@ -111,11 +78,16 @@ impl Service {
             .getpwnam_r
             .ok_or_else(|| self.missing("getpwnam_r"))?;
         let name = CString::new(name).map_err(|_| Error::NulByte)?;
-        passwd_lookup(self, "getpwnam_r", |pw, buf, len, errnop| {
-            // SAFETY: a resolved `_nss_*_getpwnam_r`; every pointer is
-            // live for the call.
-            unsafe { f(name.as_ptr(), pw, buf, len, errnop) }
-        })
+        service::lookup_entry(
+            self,
+            "getpwnam_r",
+            |pw, buf, len, errnop| {
+                // SAFETY: a resolved `_nss_*_getpwnam_r`; every pointer
+                // is live for the call.
+                unsafe { f(name.as_ptr(), pw, buf, len, errnop) }
+            },
+            extract_passwd,
+        )
     }
 
     /// Look up a passwd entry by user ID. `Ok(None)` is not-found.
@@ -124,11 +96,16 @@ impl Service {
             .fns()
             .getpwuid_r
             .ok_or_else(|| self.missing("getpwuid_r"))?;
-        passwd_lookup(self, "getpwuid_r", |pw, buf, len, errnop| {
-            // SAFETY: a resolved `_nss_*_getpwuid_r`; every pointer is
-            // live for the call.
-            unsafe { f(uid, pw, buf, len, errnop) }
-        })
+        service::lookup_entry(
+            self,
+            "getpwuid_r",
+            |pw, buf, len, errnop| {
+                // SAFETY: a resolved `_nss_*_getpwuid_r`; every pointer
+                // is live for the call.
+                unsafe { f(uid, pw, buf, len, errnop) }
+            },
+            extract_passwd,
+        )
     }
 
     /// Enumerate the module's passwd database.
@@ -150,12 +127,14 @@ impl Service {
             // glibc dispatcher passes.
             unsafe { setent(0) }
         })?;
-        Ok(PasswdIter {
-            slot: Some(slot),
+        Ok(PasswdIter(service::EntIter::new(
+            slot,
             getent,
             endent,
-            _thread_bound: PhantomData,
-        })
+            "getpwent_r",
+            "endpwent",
+            extract_passwd,
+        )))
     }
 }
 
@@ -211,79 +190,20 @@ pub fn getpwuid(uid: u32) -> Result<Option<Passwd>> {
 /// fn assert_send<T: Send>() {}
 /// assert_send::<truenas_nss::PasswdIter>();
 /// ```
-pub struct PasswdIter {
-    /// `Some` while the enumeration is open; taken on close.
-    slot: Option<EnumSlot>,
-    getent: ffi::GetpwentRFn,
-    endent: ffi::EndentFn,
-    /// The cursor is thread-affine; `!Send` is what keeps it that way.
-    _thread_bound: PhantomData<*const ()>,
-}
-
-impl PasswdIter {
-    /// End the enumeration: the cursor is reset while the slot still
-    /// excludes other enumerations, then the claim is released. The
-    /// `end*ent` result is discarded — nothing can act on it here.
-    fn close(&mut self) {
-        if let Some(slot) = self.slot.take() {
-            let f = self.endent;
-            let _ = service::call_ent(slot.svc.module(), "endpwent", || {
-                // SAFETY: a resolved `_nss_*_endpwent`.
-                unsafe { f() }
-            });
-        }
-    }
-}
+pub struct PasswdIter(service::EntIter<libc::passwd, Passwd>);
 
 impl Iterator for PasswdIter {
     type Item = Result<Passwd>;
 
     fn next(&mut self) -> Option<Result<Passwd>> {
-        let slot = self.slot.as_ref()?;
-        let svc = slot.svc;
-        let f = self.getent;
-        let mut pw = MaybeUninit::<libc::passwd>::uninit();
-        let mut buf = vec![0u8; INITIAL_BUFLEN];
-        let (status, errno) = service::grow_and_call(&mut buf, |b, len, ep| {
-            // SAFETY: a resolved `_nss_*_getpwent_r`; every pointer is
-            // live for the call.
-            unsafe { f(pw.as_mut_ptr(), b, len, ep) }
-        });
-        match service::classify_ent(svc.module(), "getpwent_r", status, errno) {
-            // A fault leaves the cursor where it was, so the next call can
-            // only report it again: surface it once and close.
-            Err(err) => {
-                self.close();
-                Some(Err(err))
-            }
-            // A bare non-success status is the end of the data.
-            Ok(false) => {
-                self.close();
-                None
-            }
-            Ok(true) => {
-                // SAFETY: success initialised `pw`, whose pointers alias
-                // `buf` — still live here.
-                let pw = unsafe { pw.assume_init_ref() };
-                // SAFETY: null or NUL-terminated strings from the module.
-                Some(unsafe { extract_passwd(pw, svc.source()) })
-            }
-        }
-    }
-}
-
-impl Drop for PasswdIter {
-    fn drop(&mut self) {
-        // `close` discards the end-call's result, so dropping cannot
-        // panic.
-        self.close();
+        self.0.next()
     }
 }
 
 impl fmt::Debug for PasswdIter {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("PasswdIter")
-            .field("open", &self.slot.is_some())
+            .field("open", &self.0.is_open())
             .finish_non_exhaustive()
     }
 }

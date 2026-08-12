@@ -101,6 +101,35 @@ fn corpus() -> Vec<Vec<u8>> {
     c
 }
 
+/// A count that promises more elements than the remaining input could hold
+/// must be refused before the element loop. For a zero-size element type
+/// the loop reads no bytes per element, so without the bound a 4-byte
+/// message would drive it through billions of iterations.
+#[test]
+fn a_hostile_count_cannot_outrun_the_input() {
+    #[derive(Debug, Deserialize)]
+    struct Nothing;
+
+    let wire = u32::MAX.to_be_bytes();
+    for mode in [Strictness::Lenient, Strictness::Strict] {
+        let err = from_bytes_with::<Vec<Nothing>>(&wire, mode).unwrap_err();
+        assert!(matches!(err, truenas_xdr::Error::Eof { .. }), "{err:?}");
+        let err = from_bytes_with::<Vec<()>>(&wire, mode).unwrap_err();
+        assert!(matches!(err, truenas_xdr::Error::Eof { .. }), "{err:?}");
+    }
+
+    // A count the input holds still decodes, empty included.
+    let three: Vec<u32> = from_bytes_with(
+        &[0, 0, 0, 3, 0, 0, 0, 7, 0, 0, 0, 8, 0, 0, 0, 9],
+        Strictness::Strict,
+    )
+    .unwrap();
+    assert_eq!(three, [7, 8, 9]);
+    let none: Vec<u32> =
+        from_bytes_with(&[0, 0, 0, 0], Strictness::Strict).unwrap();
+    assert!(none.is_empty());
+}
+
 #[test]
 fn no_target_type_panics_on_hostile_input() {
     let inputs = corpus();

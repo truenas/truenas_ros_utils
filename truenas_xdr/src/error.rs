@@ -57,7 +57,8 @@ pub enum Error {
         limit: usize,
     },
     /// A construct XDR cannot represent: a map, a sequence of unknown length,
-    /// or a request for self-describing decoding.
+    /// a length beyond the 32-bit prefix, or a request for self-describing
+    /// decoding.
     Unsupported(&'static str),
     /// A write to the output failed, carrying the `io::Error`'s message.
     Io(String),

@@ -43,12 +43,16 @@ pub type GetpwuidRFn = unsafe extern "C" fn(
     *mut c_int,
 ) -> c_int;
 
-pub type GetpwentRFn = unsafe extern "C" fn(
-    *mut libc::passwd,
+/// `_nss_<module>_getpwent_r` and `_nss_<module>_getgrent_r`: one cursor
+/// step, filling the caller's entry struct through the scratch buffer.
+pub type GetentRFn<C> = unsafe extern "C" fn(
+    *mut C,
     *mut c_char,
     libc::size_t,
     *mut c_int,
 ) -> c_int;
+
+pub type GetpwentRFn = GetentRFn<libc::passwd>;
 
 pub type GetgrnamRFn = unsafe extern "C" fn(
     *const c_char,
@@ -66,12 +70,7 @@ pub type GetgrgidRFn = unsafe extern "C" fn(
     *mut c_int,
 ) -> c_int;
 
-pub type GetgrentRFn = unsafe extern "C" fn(
-    *mut libc::group,
-    *mut c_char,
-    libc::size_t,
-    *mut c_int,
-) -> c_int;
+pub type GetgrentRFn = GetentRFn<libc::group>;
 
 /// `_nss_<module>_initgroups_dyn`: append the gids of the groups `user`
 /// belongs to, skipping `group`, to the caller's array.

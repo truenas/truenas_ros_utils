@@ -98,20 +98,23 @@ impl Acceptor {
     ///
     /// Blocks until the handshake settles; the caller bounds the wait
     /// with `SO_RCVTIMEO`/`SO_SNDTIMEO` on the socket, and an elapsed
-    /// timeout surfaces as [`Error::Stalled`]. On success the kernel
-    /// encrypts and decrypts the socket from here on — plain reads and
-    /// writes on the descriptor carry the connection — and nothing of
-    /// this call remains to release. The connection is refused with
-    /// [`Error::NotEngaged`] unless the kernel holds crypto state in
-    /// both directions.
+    /// timeout surfaces as [`Error::Stalled`]. The socket must be
+    /// blocking — a descriptor with `O_NONBLOCK` set is refused as
+    /// [`Error::NonBlocking`] before the handshake starts. On success
+    /// the kernel encrypts and decrypts the socket from here on — plain
+    /// reads and writes on the descriptor carry the connection — and
+    /// nothing of this call remains to release. The connection is
+    /// refused with [`Error::NotEngaged`] unless the kernel holds crypto
+    /// state in both directions.
     ///
     /// One handshake per connection. TLS control records after the
     /// handshake — the close alert included — are the caller's, sent
     /// through the kernel's own record interface.
     pub fn accept(&self, fd: BorrowedFd<'_>) -> Result<Handshake> {
+        let raw = fd.as_raw_fd();
+        confirm_blocking(raw)?;
         let ssl = Ssl::new(self.inner.context())
             .map_err(|err| Error::Handshake(stack_text(&err)))?;
-        let raw = fd.as_raw_fd();
         // SAFETY: `raw` is a live descriptor for the borrow's duration,
         // and BIO_NOCLOSE keeps the BIO from ever closing it. `SSL_set_bio`
         // hands the BIO's one reference to the SSL, which frees it.
@@ -121,6 +124,9 @@ impl Acceptor {
                 return Err(Error::Handshake(drain_stack()));
             }
             openssl_sys::SSL_set_bio(ssl.as_ptr(), bio, bio);
+            // `SSL_get_error` requires this thread's error queue to be
+            // empty when the I/O call is made.
+            openssl_sys::ERR_clear_error();
             openssl_sys::SSL_accept(ssl.as_ptr())
         };
         // errno first: it belongs to the call just made, and the
@@ -129,7 +135,11 @@ impl Acceptor {
         if rc <= 0 {
             // SAFETY: a live SSL and the return value of its own accept.
             let code = unsafe { openssl_sys::SSL_get_error(ssl.as_ptr(), rc) };
-            return Err(classify(code, errno));
+            // Taken after `SSL_get_error`, which peeks the queue, and on
+            // every failure path, so no entry outlives its
+            // classification.
+            let stack = ErrorStack::get();
+            return Err(classify(code, errno, &stack));
         }
         confirm_engaged(raw)?;
         Ok(Handshake {
@@ -163,9 +173,28 @@ fn drain_stack() -> Box<str> {
     stack_text(&ErrorStack::get())
 }
 
-/// Classify a failed `SSL_accept` from its `SSL_get_error` code and the
-/// errno captured at the call.
-fn classify(code: c_int, errno: i32) -> Error {
+/// Refuse a non-blocking socket. The handshake is blocking I/O bounded
+/// by the socket's timeouts; on a non-blocking descriptor every wait
+/// would surface as [`Error::Stalled`] with a healthy peer.
+fn confirm_blocking(fd: RawFd) -> Result<()> {
+    // SAFETY: `F_GETFL` reads the descriptor's flags and takes no
+    // pointer.
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if flags < 0 {
+        return Err(Error::Io {
+            op: "fcntl",
+            errno: io::Error::last_os_error().raw_os_error().unwrap_or(0),
+        });
+    }
+    if flags & libc::O_NONBLOCK != 0 {
+        return Err(Error::NonBlocking);
+    }
+    Ok(())
+}
+
+/// Classify a failed `SSL_accept` from its `SSL_get_error` code, the
+/// errno captured at the call, and the error queue drained after it.
+fn classify(code: c_int, errno: i32, stack: &ErrorStack) -> Error {
     match code {
         // On a blocking socket, want-read/want-write only ever means the
         // socket timeout elapsed mid-wait.
@@ -182,7 +211,6 @@ fn classify(code: c_int, errno: i32) -> Error {
             },
         },
         _ => {
-            let stack = ErrorStack::get();
             // libssl reports a peer that vanished mid-handshake as an
             // SSL-level error, not a syscall EOF; the reason code is its
             // stable name.
@@ -193,7 +221,7 @@ fn classify(code: c_int, errno: i32) -> Error {
             {
                 Error::Disconnected
             } else {
-                Error::Handshake(stack_text(&stack))
+                Error::Handshake(stack_text(stack))
             }
         }
     }
@@ -254,43 +282,63 @@ mod tests {
         }
     }
 
+    /// A socket with `O_NONBLOCK` set must be refused up front. Without
+    /// the guard, every handshake on one would surface as a misleading
+    /// [`Error::Stalled`].
+    #[test]
+    fn a_non_blocking_socket_is_refused() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let _client = TcpStream::connect(listener.local_addr().unwrap());
+        let (server, _) = listener.accept().unwrap();
+
+        assert_eq!(confirm_blocking(server.as_raw_fd()), Ok(()));
+        server.set_nonblocking(true).unwrap();
+        assert_eq!(
+            confirm_blocking(server.as_raw_fd()),
+            Err(Error::NonBlocking)
+        );
+        server.set_nonblocking(false).unwrap();
+        assert_eq!(confirm_blocking(server.as_raw_fd()), Ok(()));
+    }
+
     /// The classification contract, written out: each `SSL_get_error`
     /// code lands on the error a consumer routes on.
     #[test]
     fn classification_matches_the_contract() {
+        let empty = ErrorStack::get();
         assert_eq!(
-            classify(openssl_sys::SSL_ERROR_WANT_READ, 0),
+            classify(openssl_sys::SSL_ERROR_WANT_READ, 0, &empty),
             Error::Stalled
         );
         assert_eq!(
-            classify(openssl_sys::SSL_ERROR_WANT_WRITE, 0),
+            classify(openssl_sys::SSL_ERROR_WANT_WRITE, 0, &empty),
             Error::Stalled
         );
         assert_eq!(
-            classify(openssl_sys::SSL_ERROR_ZERO_RETURN, 0),
+            classify(openssl_sys::SSL_ERROR_ZERO_RETURN, 0, &empty),
             Error::Disconnected
         );
         assert_eq!(
-            classify(openssl_sys::SSL_ERROR_SYSCALL, 0),
+            classify(openssl_sys::SSL_ERROR_SYSCALL, 0, &empty),
             Error::Disconnected
         );
         assert_eq!(
-            classify(openssl_sys::SSL_ERROR_SYSCALL, libc::ECONNRESET),
+            classify(openssl_sys::SSL_ERROR_SYSCALL, libc::ECONNRESET, &empty),
             Error::Disconnected
         );
         assert_eq!(
-            classify(openssl_sys::SSL_ERROR_SYSCALL, libc::EPIPE),
+            classify(openssl_sys::SSL_ERROR_SYSCALL, libc::EPIPE, &empty),
             Error::Disconnected
         );
         assert_eq!(
-            classify(openssl_sys::SSL_ERROR_SYSCALL, libc::ENETDOWN),
+            classify(openssl_sys::SSL_ERROR_SYSCALL, libc::ENETDOWN, &empty),
             Error::Io {
                 op: "SSL_accept",
                 errno: libc::ENETDOWN,
             }
         );
         assert!(matches!(
-            classify(openssl_sys::SSL_ERROR_SSL, 0),
+            classify(openssl_sys::SSL_ERROR_SSL, 0, &empty),
             Error::Handshake(_)
         ));
     }

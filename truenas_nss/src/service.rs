@@ -21,7 +21,8 @@ use crate::ffi;
 use std::cell::RefCell;
 use std::ffi::{CStr, CString};
 use std::fmt;
-use std::mem;
+use std::marker::PhantomData;
+use std::mem::{self, MaybeUninit};
 use std::os::raw::{c_char, c_int, c_long, c_void};
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
@@ -476,6 +477,34 @@ pub(crate) fn classify_lookup(
     }
 }
 
+/// Drive one `_r` entry lookup: the growth protocol, classification, and
+/// the copy out of the scratch buffer, shared by the passwd and group
+/// lookups. `raw` makes the service call with the entry struct, buffer,
+/// and errno slot; `extract` runs only on a module-initialised entry
+/// whose aliased buffer is still live — its safety contract.
+pub(crate) fn lookup_entry<C, T>(
+    svc: &Service,
+    op: &'static str,
+    mut raw: impl FnMut(*mut C, *mut c_char, libc::size_t, *mut c_int) -> c_int,
+    extract: unsafe fn(&C, Source) -> Result<T>,
+) -> Result<Option<T>> {
+    let mut entry = MaybeUninit::<C>::uninit();
+    let mut buf = vec![0u8; INITIAL_BUFLEN];
+    let (status, errno) = grow_and_call(&mut buf, |b, len, ep| {
+        raw(entry.as_mut_ptr(), b, len, ep)
+    });
+    if !classify_lookup(svc.module(), op, status, errno)? {
+        return Ok(None);
+    }
+    // SAFETY: a success return means the module initialised the entry;
+    // its pointers alias `buf`, which lives to the end of this function.
+    let entry = unsafe { entry.assume_init_ref() };
+    // SAFETY: the entry was filled by a successful service call, which
+    // is `extract`'s contract.
+    let out = unsafe { extract(entry, svc.source()) }?;
+    Ok(Some(out))
+}
+
 /// Classify a `get*ent_r` result. `Ok(false)` is the end of the
 /// enumeration: with no errno, a non-success status other than `TRYAGAIN`
 /// means the cursor is done, not that the call faulted.
@@ -564,7 +593,10 @@ pub(crate) unsafe fn text_field(p: *const c_char) -> String {
 /// The gid array every `initgroups_dyn` call starts with, in entries.
 pub(crate) const INITGROUPS_INITIAL: usize = 32;
 
-/// Drive one `initgroups_dyn` call and copy its gid array out.
+/// Drive one `initgroups_dyn` call and copy its gid array out, as the
+/// module left it — the seed leading, appends in the module's order,
+/// repeats included. Deduplication is the caller's, through
+/// [`dedup_gids`].
 ///
 /// The array is allocated with `malloc` because the module grows it with
 /// `realloc`; whatever pointer the call leaves behind is copied and freed
@@ -620,13 +652,20 @@ pub(crate) fn call_initgroups(
     // alone comes back. The system files module reports it for an unknown
     // user and for a member of nothing alike, so the two are one answer.
     classify_lookup(module, "initgroups_dyn", status, errno)?;
-    let mut gids = Vec::with_capacity(copied.len());
-    for gid in copied {
-        if !gids.contains(&gid) {
-            gids.push(gid);
+    Ok(copied)
+}
+
+/// Drop repeated gids, first appearance keeping its position. Paid once
+/// per answer: over the union by the fan-out, over the one module's list
+/// by the single-module lookup.
+pub(crate) fn dedup_gids(gids: Vec<u32>) -> Vec<u32> {
+    let mut out = Vec::with_capacity(gids.len());
+    for gid in gids {
+        if !out.contains(&gid) {
+            out.push(gid);
         }
     }
-    Ok(gids)
+    out
 }
 
 /// Union the group lists of every module in [`Source::LOOKUP_ORDER`],
@@ -639,21 +678,15 @@ pub(crate) fn fan_out_groups(
     gid: u32,
     mut lookup: impl FnMut(Source) -> Result<Vec<u32>>,
 ) -> Result<Vec<u32>> {
-    let mut out = vec![gid];
+    let mut all = vec![gid];
     for source in Source::LOOKUP_ORDER {
         match lookup(source) {
-            Ok(gids) => {
-                for gid in gids {
-                    if !out.contains(&gid) {
-                        out.push(gid);
-                    }
-                }
-            }
+            Ok(gids) => all.extend(gids),
             Err(err) if err.is_unavail() => {}
             Err(err) => return Err(err),
         }
     }
-    Ok(out)
+    Ok(dedup_gids(all))
 }
 
 /// Try each module in [`Source::LOOKUP_ORDER`]; first hit wins. A module
@@ -748,6 +781,107 @@ impl Drop for EnumSlot {
             live.borrow_mut()
                 .retain(|&(k, d)| !(k == key && d == self.db));
         });
+    }
+}
+
+/// The enumeration core the public iterators wrap: cursor stepping,
+/// close-on-fault, and the claim's release, over one scratch buffer
+/// whose ERANGE growth is kept across entries.
+pub(crate) struct EntIter<C, T> {
+    /// `Some` while the enumeration is open; taken on close.
+    slot: Option<EnumSlot>,
+    getent: ffi::GetentRFn<C>,
+    endent: ffi::EndentFn,
+    getent_op: &'static str,
+    endent_op: &'static str,
+    extract: unsafe fn(&C, Source) -> Result<T>,
+    buf: Vec<u8>,
+    /// The cursor is thread-affine; `!Send` is what keeps it that way.
+    _thread_bound: PhantomData<*const ()>,
+}
+
+impl<C, T> EntIter<C, T> {
+    pub(crate) fn new(
+        slot: EnumSlot,
+        getent: ffi::GetentRFn<C>,
+        endent: ffi::EndentFn,
+        getent_op: &'static str,
+        endent_op: &'static str,
+        extract: unsafe fn(&C, Source) -> Result<T>,
+    ) -> Self {
+        EntIter {
+            slot: Some(slot),
+            getent,
+            endent,
+            getent_op,
+            endent_op,
+            extract,
+            buf: vec![0u8; INITIAL_BUFLEN],
+            _thread_bound: PhantomData,
+        }
+    }
+
+    /// Whether the enumeration is still open.
+    pub(crate) fn is_open(&self) -> bool {
+        self.slot.is_some()
+    }
+
+    /// End the enumeration: the cursor is reset while the slot still
+    /// excludes other enumerations, then the claim is released. The
+    /// `end*ent` result is discarded — nothing can act on it here.
+    fn close(&mut self) {
+        if let Some(slot) = self.slot.take() {
+            let f = self.endent;
+            let _ = call_ent(slot.svc.module(), self.endent_op, || {
+                // SAFETY: a resolved `_nss_*_end*ent`.
+                unsafe { f() }
+            });
+        }
+    }
+}
+
+impl<C, T> Iterator for EntIter<C, T> {
+    type Item = Result<T>;
+
+    fn next(&mut self) -> Option<Result<T>> {
+        let slot = self.slot.as_ref()?;
+        let svc = slot.svc;
+        let f = self.getent;
+        let mut entry = MaybeUninit::<C>::uninit();
+        let (status, errno) = grow_and_call(&mut self.buf, |b, len, ep| {
+            // SAFETY: a resolved `_nss_*_get*ent_r`; every pointer is
+            // live for the call.
+            unsafe { f(entry.as_mut_ptr(), b, len, ep) }
+        });
+        match classify_ent(svc.module(), self.getent_op, status, errno) {
+            // A fault leaves the cursor where it was, so the next call
+            // can only report it again: surface it once and close.
+            Err(err) => {
+                self.close();
+                Some(Err(err))
+            }
+            // A bare non-success status is the end of the data.
+            Ok(false) => {
+                self.close();
+                None
+            }
+            Ok(true) => {
+                // SAFETY: success initialised the entry, whose pointers
+                // alias `self.buf` — untouched since the call.
+                let entry = unsafe { entry.assume_init_ref() };
+                // SAFETY: the entry was filled by a successful service
+                // call, which is `extract`'s contract.
+                Some(unsafe { (self.extract)(entry, svc.source()) })
+            }
+        }
+    }
+}
+
+impl<C, T> Drop for EntIter<C, T> {
+    fn drop(&mut self) {
+        // `close` discards the end-call's result, so dropping cannot
+        // panic.
+        self.close();
     }
 }
 
@@ -1120,12 +1254,23 @@ mod tests {
         ffi::NSS_STATUS_SUCCESS
     }
 
-    /// The driver seeds the primary gid, keeps the module's appends in
-    /// order, and deduplicates.
+    /// The driver seeds the primary gid and keeps the module's appends
+    /// in order, repeats included: deduplication belongs to the caller,
+    /// so a repeat dropped here would be dropped twice.
     #[test]
-    fn initgroups_seeds_appends_and_dedups() {
+    fn initgroups_seeds_and_keeps_the_appends() {
         let gids = call_initgroups("T", ig_appends, c"alice", 1000).unwrap();
-        assert_eq!(gids, [1000, 2000, 2001]);
+        assert_eq!(gids, [1000, 2000, 2001, 2000]);
+    }
+
+    /// First appearance keeps its position; repeats drop.
+    #[test]
+    fn dedup_keeps_first_appearance_order() {
+        assert_eq!(
+            dedup_gids(vec![1000, 2000, 2001, 2000, 1000, 3]),
+            [1000, 2000, 2001, 3]
+        );
+        assert!(dedup_gids(Vec::new()).is_empty());
     }
 
     /// NOTFOUND is not an error: the seed alone comes back, for an
@@ -1184,14 +1329,15 @@ mod tests {
     }
 
     /// The union walk: every module consulted, the seed first, order
-    /// preserved, duplicates across modules collapsed.
+    /// preserved, duplicates within one module and across modules
+    /// collapsed alike — the union pass is the only dedup on this path.
     #[test]
     fn fan_out_groups_unions_every_module() {
         let mut tried = Vec::new();
         let gids = fan_out_groups(100, |s| {
             tried.push(s);
             Ok(match s {
-                Source::Files => vec![100, 2000, 2001],
+                Source::Files => vec![100, 2000, 2001, 2000],
                 Source::Sss => vec![100, 2001, 3000],
                 Source::Winbind => vec![100],
             })
