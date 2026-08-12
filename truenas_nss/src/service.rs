@@ -200,6 +200,11 @@ impl Service {
     /// module keeps its enumeration cursor, and `source` is the tag stamped
     /// on the entries it returns. The service and its handle live for the
     /// process; this crate's test fixtures are loaded this way.
+    ///
+    /// One `Service` per module: every call mints a fresh `Service` with
+    /// its own enumeration lock, and the exclusion iterators rely on holds
+    /// only while one lock spans a module's one cursor. Do not open a path
+    /// twice, nor a module [`Source::service`] also reaches.
     pub fn open<P: AsRef<Path>>(
         path: P,
         prefix: &str,
@@ -298,7 +303,15 @@ fn load_locked(spec: LoadSpec<'_>) -> Result<&'static Service> {
         // on glibc 2.34 and later the `files` functions live in
         // `libc.so.6`, which the stub `libnss_files.so.2` depends on.
         let p = unsafe { libc::dlsym(handle, symbol.as_ptr()) };
-        Ok(if p.is_null() { None } else { Some(p) })
+        if p.is_null() {
+            // A symbol this module does not export is a normal result, but
+            // it left an error for the next `dlerror` in this thread to
+            // read. Drain it, still under the load lock.
+            // SAFETY: reading and discarding the pending dl error.
+            unsafe { libc::dlerror() };
+            return Ok(None);
+        }
+        Ok(Some(p))
     };
 
     // Each non-null address is given the type the NSS service ABI fixes
@@ -347,8 +360,7 @@ fn load_locked(spec: LoadSpec<'_>) -> Result<&'static Service> {
         }),
     };
 
-    // Nothing resolving means the wrong prefix or the wrong library, which
-    // per-operation errors would only reveal one call at a time.
+    // Nothing resolving means the wrong prefix or the wrong library.
     if !fns.any() {
         return Err(Error::Symbol {
             module: spec.name,
@@ -409,8 +421,10 @@ fn dlerror_text() -> Box<str> {
 pub(crate) const INITIAL_BUFLEN: usize = 1024;
 
 /// Drives one `_r` call through the buffer-growth protocol: the errno
-/// out-parameter is zeroed for each attempt, and `ERANGE` doubles the buffer
-/// and retries, without bound. Returns the final `(status, errno)`.
+/// out-parameter is zeroed for each attempt, and `TRYAGAIN` with `ERANGE`
+/// — the service ABI's one request for a larger buffer — doubles it and
+/// retries, without bound. Any other `(status, errno)` pair is a settled
+/// answer and is returned as-is.
 pub(crate) fn grow_and_call(
     buf: &mut Vec<u8>,
     mut call: impl FnMut(*mut c_char, libc::size_t, *mut c_int) -> c_int,
@@ -418,7 +432,7 @@ pub(crate) fn grow_and_call(
     loop {
         let mut errno: c_int = 0;
         let status = call(buf.as_mut_ptr().cast(), buf.len(), &mut errno);
-        if errno != libc::ERANGE {
+        if status != ffi::NSS_STATUS_TRYAGAIN || errno != libc::ERANGE {
             return (status, errno);
         }
         // A fresh allocation, not a copy: the module rewrites the whole
@@ -457,15 +471,19 @@ pub(crate) fn classify_lookup(
 }
 
 /// Classify a `get*ent_r` result. `Ok(false)` is the end of the
-/// enumeration: with no errno, any non-success status means the cursor is
-/// done, not that the call faulted.
+/// enumeration: with no errno, a non-success status other than `TRYAGAIN`
+/// means the cursor is done, not that the call faulted.
+///
+/// `TRYAGAIN` is a fault whether or not an errno came with it: a module
+/// may report its reason through the thread's errno rather than the
+/// out-parameter.
 pub(crate) fn classify_ent(
     module: &'static str,
     op: &'static str,
     status: c_int,
     errno: c_int,
 ) -> Result<bool> {
-    if errno != 0 {
+    if errno != 0 || status == ffi::NSS_STATUS_TRYAGAIN {
         return Err(Error::Call {
             module,
             op,
@@ -501,21 +519,40 @@ pub(crate) fn call_ent(
     }
 }
 
-/// Copy one string field out of an entry a module filled in. A null
-/// pointer reads as the empty string; the bytes are required to be UTF-8,
-/// because a name that is not could never be passed back into a lookup.
+/// Copy an identity field out of an entry a module filled in: a login or
+/// group name, or a member. Null and non-UTF-8 are refused — an identity
+/// that cannot round-trip into a lookup is no identity.
 ///
 /// # Safety
 ///
 /// `p` is null or a NUL-terminated string live for the call.
-pub(crate) unsafe fn string_field(p: *const c_char) -> Result<String> {
+pub(crate) unsafe fn name_field(p: *const c_char) -> Result<String> {
     if p.is_null() {
-        return Ok(String::new());
+        return Err(Error::NullName);
     }
     // SAFETY: the caller's contract: non-null means NUL-terminated and
     // live.
     let s = unsafe { CStr::from_ptr(p) };
     s.to_str().map(str::to_owned).map_err(|_| Error::NotUtf8)
+}
+
+/// Copy a descriptive field out of an entry a module filled in: the GECOS,
+/// home directory, or shell. A null pointer reads as the empty string and
+/// bytes that are not UTF-8 are replaced — these fields describe the entry
+/// rather than identify it, and a stray byte in one must not deny the
+/// identity.
+///
+/// # Safety
+///
+/// `p` is null or a NUL-terminated string live for the call.
+pub(crate) unsafe fn text_field(p: *const c_char) -> String {
+    if p.is_null() {
+        return String::new();
+    }
+    // SAFETY: the caller's contract: non-null means NUL-terminated and
+    // live.
+    let s = unsafe { CStr::from_ptr(p) };
+    s.to_string_lossy().into_owned()
 }
 
 /// Try each module in [`Source::LOOKUP_ORDER`]; first hit wins. A module
@@ -602,7 +639,11 @@ impl EnumSlot {
 impl Drop for EnumSlot {
     fn drop(&mut self) {
         let key = std::ptr::from_ref(self.svc) as usize;
-        LIVE.with(|live| {
+        // `try_with`, because an iterator held in thread-local storage is
+        // dropped during this thread's teardown, when the table may already
+        // be gone. Nothing can claim a slot on a dying thread, so having no
+        // table to update is the same as an empty one.
+        let _ = LIVE.try_with(|live| {
             live.borrow_mut()
                 .retain(|&(k, d)| !(k == key && d == self.db));
         });
@@ -707,7 +748,10 @@ mod tests {
     }
 
     /// For a cursor, a bare non-success status is the end of the data, not
-    /// a fault; an errno is still a fault.
+    /// a fault; an errno is still a fault. TRYAGAIN is the exception: it is
+    /// a fault with or without one, because a module may have reported its
+    /// reason through the thread's errno, and an enumeration that stopped
+    /// short must not read as one that finished.
     #[test]
     fn ent_classification_ends_cleanly() {
         assert_eq!(
@@ -722,9 +766,22 @@ mod tests {
             classify_ent("T", "op", ffi::NSS_STATUS_UNAVAIL, 0),
             Ok(false)
         );
+        assert_eq!(
+            classify_ent("T", "op", ffi::NSS_STATUS_RETURN, 0),
+            Ok(false)
+        );
         assert!(
             classify_ent("T", "op", ffi::NSS_STATUS_TRYAGAIN, libc::EIO)
                 .is_err()
+        );
+        assert_eq!(
+            classify_ent("T", "op", ffi::NSS_STATUS_TRYAGAIN, 0),
+            Err(Error::Call {
+                module: "T",
+                op: "op",
+                status: ffi::NSS_STATUS_TRYAGAIN,
+                errno: 0,
+            })
         );
     }
 
@@ -750,6 +807,31 @@ mod tests {
         assert_eq!((status, errno), (ffi::NSS_STATUS_SUCCESS, 0));
         assert_eq!(calls, 3);
         assert_eq!(buf.len(), 4096);
+    }
+
+    /// `ERANGE` under a status other than `TRYAGAIN` is not a request for a
+    /// larger buffer. Retrying on it would throw away the status the module
+    /// returned — a settled not-found could come back a hit.
+    #[test]
+    fn only_tryagain_with_erange_grows() {
+        for status in [
+            ffi::NSS_STATUS_NOTFOUND,
+            ffi::NSS_STATUS_SUCCESS,
+            ffi::NSS_STATUS_UNAVAIL,
+            ffi::NSS_STATUS_RETURN,
+        ] {
+            let mut buf = vec![0u8; INITIAL_BUFLEN];
+            let mut calls = 0;
+            let got = grow_and_call(&mut buf, |_, _, errnop| {
+                calls += 1;
+                // SAFETY: the driver passes a live out-parameter.
+                unsafe { *errnop = libc::ERANGE };
+                status
+            });
+            assert_eq!(got, (status, libc::ERANGE), "status {status}");
+            assert_eq!(calls, 1, "status {status} must not be retried");
+            assert_eq!(buf.len(), INITIAL_BUFLEN);
+        }
     }
 
     /// First hit wins and a miss moves on; the whole order exhausted is a

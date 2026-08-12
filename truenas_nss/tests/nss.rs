@@ -137,6 +137,60 @@ fn statuses_classify_as_the_contract_says() {
     assert_eq!(svc.getgrnam("alpha").unwrap(), None);
 }
 
+/// `ERANGE` asks for a larger buffer only under `TRYAGAIN`. Under any other
+/// status it is a failure like any other, and the call is over: a driver that
+/// grew on the errno alone would reissue a settled lookup and can hand back
+/// an entry where the module reported none.
+#[test]
+fn erange_under_another_status_is_not_a_grow_request() {
+    let Some((_dir, path)) =
+        fixture("stalerange", &["NSS_FIXTURE_STALE_ERANGE=4"])
+    else {
+        return;
+    };
+    let svc =
+        Service::open(&path, "stalerange", EntScope::Process, Source::Sss)
+            .unwrap();
+    let calls =
+        || common::counter(&path, "_nss_stalerange_fixture_lookup_calls");
+
+    let before = calls();
+    let err = svc.getpwnam("alice").unwrap_err();
+    assert_eq!(calls() - before, 1, "one call: the result was not a retry");
+    assert_eq!(err.status(), Some(NssStatus::NotFound));
+    assert_eq!(err.errno(), Some(libc::ERANGE));
+}
+
+/// A module may report a `get*ent_r` fault through the thread's errno and
+/// leave the out-parameter alone. `TRYAGAIN` is a fault whichever channel
+/// carried the reason: an enumeration that stopped short must not be
+/// indistinguishable from one that reached the end of the data.
+#[test]
+fn a_tryagain_without_an_errno_is_a_fault_not_a_clean_end() {
+    let Some((_dir, path)) =
+        fixture("bareagain", &["NSS_FIXTURE_ENT_BARE_TRYAGAIN=2"])
+    else {
+        return;
+    };
+    let svc =
+        Service::open(&path, "bareagain", EntScope::Process, Source::Files)
+            .unwrap();
+    let endent =
+        || common::counter(&path, "_nss_bareagain_fixture_endent_calls");
+
+    let before = endent();
+    let mut iter = svc.passwd_entries().unwrap();
+    assert_eq!(iter.next().unwrap().unwrap().name, "alice");
+    let err = iter
+        .next()
+        .expect("a fault, not the end of the data")
+        .unwrap_err();
+    assert_eq!(err.status(), Some(NssStatus::TryAgain));
+    assert_eq!(err.errno(), None);
+    assert_eq!(endent() - before, 1, "the fault ends the enumeration");
+    assert!(iter.next().is_none(), "fused after the fault");
+}
+
 /// An interior NUL never reaches the module; a non-UTF-8 entry is refused
 /// on the way out rather than mangled.
 #[test]
@@ -151,6 +205,11 @@ fn nul_in_and_bad_utf8_out_are_refused() {
     assert_eq!(svc.getgrnam("a\0b").unwrap_err(), Error::NulByte);
     // uid 1003's name is not UTF-8.
     assert_eq!(svc.getpwuid(1003).unwrap_err(), Error::NotUtf8);
+    // uid 1005's GECOS is not UTF-8: descriptive, so decoded lossily
+    // rather than denying the identity.
+    let dave = svc.getpwuid(1005).unwrap().unwrap();
+    assert_eq!(dave.name, "dave");
+    assert_eq!(dave.gecos, "g\u{fffd}ecos");
 }
 
 /// A path that does not load is `Load` with the dlerror text; a module
@@ -216,9 +275,14 @@ fn enumeration_walks_the_table_in_order() {
     assert_eq!(iter.next().unwrap().unwrap().name, "bob");
     // The giant entry forces ERANGE growth mid-enumeration.
     assert_eq!(iter.next().unwrap().unwrap().gecos.len(), 3072);
-    // The non-UTF-8 entry is an error, and the walk goes on.
+    // The non-UTF-8 name is an error, and the walk goes on.
     assert_eq!(iter.next().unwrap().unwrap_err(), Error::NotUtf8);
     assert_eq!(iter.next().unwrap().unwrap().name, "carol");
+    // A non-UTF-8 GECOS is descriptive: decoded lossily, not an error.
+    let dave = iter.next().unwrap().unwrap();
+    assert_eq!(dave.name, "dave");
+    assert_eq!(dave.gecos, "g\u{fffd}ecos");
+    assert_eq!(iter.next().unwrap().unwrap().name, "FIXDOM\\eve");
     assert!(iter.next().is_none());
     assert_eq!(endent() - before, 1, "end of data ends the enumeration");
     // Fused: the closed iterator stays closed.
@@ -235,7 +299,7 @@ fn enumeration_walks_the_table_in_order() {
         .filter_map(|entry| entry.ok())
         .map(|group| group.name)
         .collect();
-    assert_eq!(names, ["alpha", "empty", "nullmem", "giant"]);
+    assert_eq!(names, ["alpha", "empty", "nullmem", "giant", "domadmins"]);
     assert_eq!(endent() - before, 1);
 
     // A fresh enumeration starts from the top.
@@ -354,13 +418,25 @@ fn thread_scoped_cursors_are_independent() {
                 .filter_map(|entry| entry.ok())
                 .map(|user| user.name)
                 .collect();
-            assert_eq!(names, ["alice", "bob", "gecos-giant", "carol"]);
+            assert_eq!(
+                names,
+                [
+                    "alice",
+                    "bob",
+                    "gecos-giant",
+                    "carol",
+                    "dave",
+                    "FIXDOM\\eve"
+                ]
+            );
         });
     });
 
     assert_eq!(mine.next().unwrap().unwrap().name, "gecos-giant");
     assert_eq!(mine.next().unwrap().unwrap_err(), Error::NotUtf8);
     assert_eq!(mine.next().unwrap().unwrap().name, "carol");
+    assert_eq!(mine.next().unwrap().unwrap().name, "dave");
+    assert_eq!(mine.next().unwrap().unwrap().name, "FIXDOM\\eve");
     assert!(mine.next().is_none());
 }
 
@@ -396,7 +472,159 @@ fn process_scoped_enumeration_serializes_across_threads() {
             rx.try_recv().is_err(),
             "the other thread acquired while an iterator was live"
         );
+        // Draining further items must not hand the lock over between
+        // them: one cursor per process means the claim spans the whole
+        // iterator, not one `next` at a time. The giant entry in the
+        // middle also covers the buffer-growth retries.
+        assert_eq!(held.next().unwrap().unwrap().name, "bob");
+        assert_eq!(held.next().unwrap().unwrap().gecos.len(), 3072);
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(
+            rx.try_recv().is_err(),
+            "the other thread acquired between two items"
+        );
         drop(held);
         assert_eq!(rx.recv().unwrap(), "acquired");
     });
+}
+
+/// An iterator is `!Send`, so thread-local storage is where a caller keeps
+/// one; the slot it holds must still release when that storage is torn
+/// down, on a thread whose own tables are already going away.
+#[test]
+fn an_iterator_in_thread_local_storage_releases_on_thread_exit() {
+    use std::cell::RefCell;
+    use truenas_nss::PasswdIter;
+
+    thread_local! {
+        /// Registered for destruction before any enumeration runs, so it is
+        /// torn down after the crate's own thread-local bookkeeping.
+        static PARKED: RefCell<Option<PasswdIter>> =
+            const { RefCell::new(None) };
+    }
+
+    let Some((_dir, path)) = fixture("tlspark", &[]) else {
+        return;
+    };
+    let svc = Service::open(&path, "tlspark", EntScope::Process, Source::Files)
+        .unwrap();
+
+    let parker = std::thread::spawn(move || {
+        PARKED.with(|parked| assert!(parked.borrow().is_none()));
+        let mut iter = svc.passwd_entries().unwrap();
+        assert_eq!(iter.next().unwrap().unwrap().name, "alice");
+        PARKED.with(|parked| *parked.borrow_mut() = Some(iter));
+    });
+    assert!(parker.join().is_ok());
+
+    // The claim and the process-scoped lock both came back, so this thread
+    // can enumerate.
+    let mut next = svc.passwd_entries().unwrap();
+    assert_eq!(next.next().unwrap().unwrap().name, "alice");
+}
+
+/// A symbol a module does not export is a normal result, but the failed
+/// `dlsym` behind it leaves an error pending for the next `dlerror` in the
+/// thread. Loading must not hand that to unrelated code.
+#[test]
+#[allow(unsafe_code)]
+fn a_load_leaves_no_pending_dl_error() {
+    let Some((_dir, path)) = fixture("dlerr", &["NSS_FIXTURE_NO_GROUPS"])
+    else {
+        return;
+    };
+
+    // Start from a clean slate: the pending error is per-thread, and this
+    // test makes every dl call on its own thread.
+    // SAFETY: reading and discarding any pending dl error.
+    unsafe { libc::dlerror() };
+
+    let svc = Service::open(&path, "dlerr", EntScope::Process, Source::Files)
+        .unwrap();
+    assert!(matches!(svc.getgrgid(2000), Err(Error::Symbol { .. })));
+
+    // SAFETY: a null return means no error is pending; a non-null one is a
+    // NUL-terminated string owned by the loader.
+    let pending = unsafe { libc::dlerror() };
+    let text = if pending.is_null() {
+        None
+    } else {
+        // SAFETY: as above.
+        Some(unsafe { std::ffi::CStr::from_ptr(pending) }.to_string_lossy())
+    };
+    assert_eq!(text, None, "load left a pending dlerror");
+}
+
+/// A cursor call that faults leaves the cursor where it was, so the next
+/// call can only report the same fault. The iterator must surface it once
+/// and close, or a `for` over it never ends.
+#[test]
+fn a_module_fault_ends_the_enumeration() {
+    let Some((_dir, path)) = fixture("entflt", &["NSS_FIXTURE_ENT_FAULT_AT=3"])
+    else {
+        return;
+    };
+    let svc = Service::open(&path, "entflt", EntScope::Process, Source::Files)
+        .unwrap();
+    let endent = || common::counter(&path, "_nss_entflt_fixture_endent_calls");
+    let before = endent();
+
+    let mut iter = svc.passwd_entries().unwrap();
+    assert_eq!(iter.next().unwrap().unwrap().name, "alice");
+    assert_eq!(iter.next().unwrap().unwrap().name, "bob");
+
+    let err = iter.next().unwrap().unwrap_err();
+    assert_eq!(err.status(), Some(NssStatus::Unavail));
+    assert_eq!(err.errno(), Some(libc::EIO));
+
+    assert!(iter.next().is_none(), "the fault repeated");
+    assert_eq!(endent() - before, 1, "the fault ended the enumeration");
+
+    // The claim came back with it, though the iterator is still in scope.
+    assert!(svc.passwd_entries().is_ok());
+}
+
+/// The idiom the close-on-fault contract exists for: a `collect` over a
+/// persistent fault must terminate, not spin. `.take(4)` bounds it so a
+/// regression to stays-open fails on the count rather than hanging.
+#[test]
+fn a_persistent_fault_does_not_spin_a_collect() {
+    let Some((_dir, path)) =
+        fixture("entspin", &["NSS_FIXTURE_ENT_FAULT_AT=2"])
+    else {
+        return;
+    };
+    let svc = Service::open(&path, "entspin", EntScope::Process, Source::Files)
+        .unwrap();
+    // alice, then one Err, then a fused None -- two items, never a spin.
+    let iter = svc.passwd_entries().unwrap();
+    assert_eq!(iter.take(4).count(), 2, "close-on-fault did not terminate");
+}
+
+/// A name carrying the winbind domain separator is opaque bytes to this
+/// crate. Lookup, enumeration, and membership must hand it back unaltered,
+/// and the name as returned must resolve the same entry — an escape or a
+/// normalization added anywhere in the name path breaks here.
+#[test]
+fn a_domain_separator_name_round_trips() {
+    let Some((_dir, path)) = fixture("domsep", &[]) else {
+        return;
+    };
+    let svc = Service::open(&path, "domsep", EntScope::Thread, Source::Winbind)
+        .unwrap();
+
+    let eve = svc.getpwnam("FIXDOM\\eve").unwrap().unwrap();
+    assert_eq!(eve.name, "FIXDOM\\eve");
+    assert_eq!(eve.uid, 1006);
+    assert!(!eve.is_local());
+
+    // Round-trip: the name as returned resolves the same entry.
+    assert_eq!(svc.getpwnam(&eve.name).unwrap().unwrap(), eve);
+    assert_eq!(svc.getpwuid(1006).unwrap().unwrap(), eve);
+
+    // Membership preserves the separator, and the member as returned
+    // resolves.
+    let admins = svc.getgrnam("domadmins").unwrap().unwrap();
+    assert_eq!(admins.members, ["alice", "FIXDOM\\eve"]);
+    assert_eq!(svc.getpwnam(&admins.members[1]).unwrap().unwrap(), eve);
 }

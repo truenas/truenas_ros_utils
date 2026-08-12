@@ -117,11 +117,16 @@ state and are not built to be unloaded, so every handle and `Service` lives
 for the process. Every dlopen/dlsym/dlerror sequence runs under one lock,
 because `dlerror` reports through shared state.
 
-Entries name the module that produced them. The password fields
-(`pw_passwd`, `gr_passwd`) are omitted: the hash lives in the shadow
-database, and the placeholder invites misuse. The fan-out lookups skip a
+Entries name the module that produced them. Identity fields — names and
+members — must be present and UTF-8: they round-trip into lookups and
+stand in authorization decisions. Descriptive fields (GECOS, directory,
+shell) decode lossily, so a stray byte in one cannot deny the identity.
+The password fields (`pw_passwd`, `gr_passwd`) are omitted: the hash lives
+in the shadow database, and the placeholder invites misuse. The fan-out lookups skip a
 module that reports UNAVAIL and propagate every other failure, a module that
-cannot be loaded included.
+cannot be loaded included. The scratch buffer grows only on TRYAGAIN with
+ERANGE — the pairing glibc's frontends require — because ERANGE under any
+other status is not a request for a larger buffer.
 
 Enumeration is per module — no all-modules iterator, which would invent an
 ordering NSS does not define. `FILES` keeps one cursor per process, so its
@@ -129,9 +134,16 @@ iterator holds a per-service lock for its whole life and another thread's
 enumeration waits; `SSS` and `WINBIND` cursors are per thread, so iterators
 are `!Send`. A same-thread iterator that would share a cursor (or the lock)
 is refused with `Error::Busy` in [`src/service.rs`](truenas_nss/src/service.rs)
-rather than left to deadlock.
+rather than left to deadlock. A cursor fault ends the enumeration — the
+cursor did not move, so a retry could only repeat it — while an entry that
+will not convert is yielded as an error and the walk goes on. The exclusion
+reaches this crate's iterators only: libc's own `set`/`get`/`endpwent`
+drive the same process-global `FILES` stream, so a consumer must not mix
+them with a live enumeration.
 
-`Service::open` points the crate at a module by explicit path.
+`Service::open` points the crate at a module by explicit path, one
+`Service` per module: a second over the same module would put a second
+lock over its one cursor.
 [`tests/`](truenas_nss/tests/) compile deterministic fixture modules from
 [`tests/fixture/nss_fixture.c`](truenas_nss/tests/fixture/nss_fixture.c) and
 load them that way — built without a soname, so a fixture can never satisfy

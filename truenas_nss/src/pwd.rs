@@ -28,17 +28,18 @@ use std::os::raw::c_int;
 #[derive(Clone, Debug, Eq, PartialEq, Hash)]
 #[non_exhaustive]
 pub struct Passwd {
-    /// Login name.
+    /// Login name. Identity: refused rather than altered when it is
+    /// missing or not UTF-8.
     pub name: String,
     /// User ID.
     pub uid: u32,
     /// Primary group ID.
     pub gid: u32,
-    /// Real name / GECOS field.
+    /// Real name / GECOS field. Descriptive: decoded lossily.
     pub gecos: String,
-    /// Home directory.
+    /// Home directory. Descriptive: decoded lossily.
     pub dir: String,
-    /// Login shell.
+    /// Login shell. Descriptive: decoded lossily.
     pub shell: String,
     /// The module that provided this entry.
     pub source: Source,
@@ -62,15 +63,15 @@ unsafe fn extract_passwd(pw: &libc::passwd, source: Source) -> Result<Passwd> {
     // `pw_passwd` is deliberately never read; see [`Passwd`].
     Ok(Passwd {
         // SAFETY: the caller's contract covers each field.
-        name: unsafe { service::string_field(pw.pw_name) }?,
+        name: unsafe { service::name_field(pw.pw_name) }?,
         uid: pw.pw_uid,
         gid: pw.pw_gid,
         // SAFETY: as above.
-        gecos: unsafe { service::string_field(pw.pw_gecos) }?,
+        gecos: unsafe { service::text_field(pw.pw_gecos) },
         // SAFETY: as above.
-        dir: unsafe { service::string_field(pw.pw_dir) }?,
+        dir: unsafe { service::text_field(pw.pw_dir) },
         // SAFETY: as above.
-        shell: unsafe { service::string_field(pw.pw_shell) }?,
+        shell: unsafe { service::text_field(pw.pw_shell) },
         source,
     })
 }
@@ -199,7 +200,9 @@ pub fn getpwuid(uid: u32) -> Result<Option<Passwd>> {
 }
 
 /// An enumeration of one module's passwd database. Yields
-/// `Result<Passwd>`; ends the enumeration on drop.
+/// `Result<Passwd>`. The enumeration ends when the data runs out, when a
+/// service call faults, or when the iterator is dropped; an entry that
+/// cannot be converted is yielded as an error and the walk goes on.
 ///
 /// The cursor may live in the module's thread-local state, so the iterator
 /// stays on the thread that made it:
@@ -247,9 +250,12 @@ impl Iterator for PasswdIter {
             unsafe { f(pw.as_mut_ptr(), b, len, ep) }
         });
         match service::classify_ent(svc.module(), "getpwent_r", status, errno) {
-            // An errno-carrying fault is reported and the enumeration
-            // stays open: whether to go on is the caller's decision.
-            Err(err) => Some(Err(err)),
+            // A fault leaves the cursor where it was, so the next call can
+            // only report it again: surface it once and close.
+            Err(err) => {
+                self.close();
+                Some(Err(err))
+            }
             // A bare non-success status is the end of the data.
             Ok(false) => {
                 self.close();
@@ -338,13 +344,37 @@ mod tests {
     /// A non-UTF-8 name cannot round-trip into a lookup, so it must error
     /// rather than be silently mangled.
     #[test]
-    fn a_non_utf8_field_is_refused() {
+    fn a_non_utf8_name_is_refused() {
         const BAD: &[u8] = b"b\xffad\0";
         let bad = CStr::from_bytes_with_nul(BAD).unwrap();
         let pw = entry(bad, c"x", None);
         // SAFETY: pointers are static literals or null.
         let out = unsafe { extract_passwd(&pw, Source::Files) };
         assert_eq!(out, Err(Error::NotUtf8));
+    }
+
+    /// A name identifies the entry; a successful call that left it null
+    /// has returned nothing usable.
+    #[test]
+    fn a_null_name_is_refused() {
+        let mut pw = entry(c"x", c"x", None);
+        pw.pw_name = std::ptr::null_mut();
+        // SAFETY: pointers are static literals or null.
+        let out = unsafe { extract_passwd(&pw, Source::Files) };
+        assert_eq!(out, Err(Error::NullName));
+    }
+
+    /// A descriptive field only describes; a stray byte in one must not
+    /// deny the identity, so it decodes lossily rather than erroring.
+    #[test]
+    fn a_non_utf8_gecos_decodes_lossily() {
+        const BAD: &[u8] = b"g\xffecos\0";
+        let bad = CStr::from_bytes_with_nul(BAD).unwrap();
+        let pw = entry(c"alice", c"x", Some(bad));
+        // SAFETY: pointers are static literals or null.
+        let out = unsafe { extract_passwd(&pw, Source::Files) }.unwrap();
+        assert_eq!(out.name, "alice");
+        assert_eq!(out.gecos, "g\u{fffd}ecos");
     }
 
     /// The password field must never be read: a pointer to non-UTF-8
