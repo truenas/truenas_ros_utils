@@ -23,9 +23,21 @@ pub struct Deserializer<'de> {
     /// Set by `deserialize_newtype_struct(SENTINEL_FIXED, ..)`, so the next
     /// `deserialize_tuple(N, ..)` reads `N` raw bytes rather than a tuple.
     fixed_pending: bool,
+    /// Nesting reached so far; compared against `max_depth` at each compound.
+    depth: usize,
+    max_depth: usize,
 }
 
 impl<'de> Deserializer<'de> {
+    /// Compound-nesting depth a decoder follows before returning
+    /// [`Error::RecursionLimit`]. Every struct, array, optional, union, and
+    /// newtype is one level, so a recursive value (RFC 4506 §4.19
+    /// optional-data encodes a linked list this way) adds one or more per
+    /// element. Bounding it is what keeps a hostile stream from driving the
+    /// decoder to a stack overflow; data known to nest deeper raises the bound
+    /// with [`with_max_depth`](Self::with_max_depth).
+    pub const DEFAULT_MAX_DEPTH: usize = 128;
+
     /// A deserializer over `input` with the given strictness.
     pub fn new(input: &'de [u8], mode: Strictness) -> Self {
         Deserializer {
@@ -33,12 +45,39 @@ impl<'de> Deserializer<'de> {
             pos: 0,
             mode,
             fixed_pending: false,
+            depth: 0,
+            max_depth: Self::DEFAULT_MAX_DEPTH,
         }
+    }
+
+    /// Set the maximum nesting depth, overriding [`DEFAULT_MAX_DEPTH`].
+    ///
+    /// [`DEFAULT_MAX_DEPTH`]: Self::DEFAULT_MAX_DEPTH
+    pub fn with_max_depth(mut self, max_depth: usize) -> Self {
+        self.max_depth = max_depth;
+        self
     }
 
     /// The bytes not yet consumed.
     pub fn remaining(&self) -> &'de [u8] {
         &self.input[self.pos..]
+    }
+
+    /// Enter one nesting level, refusing to descend past `max_depth`. Paired
+    /// with [`ascend`](Self::ascend) once the compound has been read.
+    fn descend(&mut self) -> Result<()> {
+        self.depth += 1;
+        if self.depth > self.max_depth {
+            return Err(Error::RecursionLimit {
+                limit: self.max_depth,
+            });
+        }
+        Ok(())
+    }
+
+    /// Leave the level entered by [`descend`](Self::descend).
+    fn ascend(&mut self) {
+        self.depth -= 1;
     }
 
     fn take(&mut self, n: usize) -> Result<&'de [u8]> {
@@ -204,9 +243,13 @@ impl<'de> serde::Deserializer<'de> for &mut Deserializer<'de> {
 
     fn deserialize_option<V: Visitor<'de>>(self, v: V) -> Result<V::Value> {
         // RFC 4506 §4.19: optional-data is a union switching on a bool, so
-        // the discriminant is validated exactly as one.
+        // the discriminant is validated exactly as one. A present arm holds
+        // the element, so following it is a descent.
         if self.read_bool()? {
-            v.visit_some(self)
+            self.descend()?;
+            let out = v.visit_some(&mut *self);
+            self.ascend();
+            out
         } else {
             v.visit_none()
         }
@@ -230,13 +273,19 @@ impl<'de> serde::Deserializer<'de> for &mut Deserializer<'de> {
         if name == crate::SENTINEL_FIXED {
             self.fixed_pending = true;
         }
-        v.visit_newtype_struct(self)
+        self.descend()?;
+        let out = v.visit_newtype_struct(&mut *self);
+        self.ascend();
+        out
     }
 
     fn deserialize_seq<V: Visitor<'de>>(self, v: V) -> Result<V::Value> {
         let count = self.read_u32()? as usize;
+        self.descend()?;
         let reader = self.seq(count);
-        v.visit_seq(reader)
+        let out = v.visit_seq(reader);
+        self.ascend();
+        out
     }
 
     fn deserialize_tuple<V: Visitor<'de>>(
@@ -245,11 +294,15 @@ impl<'de> serde::Deserializer<'de> for &mut Deserializer<'de> {
         v: V,
     ) -> Result<V::Value> {
         if std::mem::take(&mut self.fixed_pending) {
+            // Fixed opaque reads raw bytes into a leaf, so it does not descend.
             let bytes = self.read_fixed(len)?;
             return v.visit_borrowed_bytes(bytes);
         }
+        self.descend()?;
         let reader = self.seq(len);
-        v.visit_seq(reader)
+        let out = v.visit_seq(reader);
+        self.ascend();
+        out
     }
 
     fn deserialize_tuple_struct<V: Visitor<'de>>(
@@ -258,8 +311,11 @@ impl<'de> serde::Deserializer<'de> for &mut Deserializer<'de> {
         len: usize,
         v: V,
     ) -> Result<V::Value> {
+        self.descend()?;
         let reader = self.seq(len);
-        v.visit_seq(reader)
+        let out = v.visit_seq(reader);
+        self.ascend();
+        out
     }
 
     fn deserialize_map<V: Visitor<'de>>(self, _v: V) -> Result<V::Value> {
@@ -272,8 +328,11 @@ impl<'de> serde::Deserializer<'de> for &mut Deserializer<'de> {
         fields: &'static [&'static str],
         v: V,
     ) -> Result<V::Value> {
+        self.descend()?;
         let reader = self.seq(fields.len());
-        v.visit_seq(reader)
+        let out = v.visit_seq(reader);
+        self.ascend();
+        out
     }
 
     fn deserialize_enum<V: Visitor<'de>>(
@@ -283,10 +342,13 @@ impl<'de> serde::Deserializer<'de> for &mut Deserializer<'de> {
         v: V,
     ) -> Result<V::Value> {
         let tag = self.read_u32()?;
-        v.visit_enum(EnumReader {
-            de: self,
+        self.descend()?;
+        let out = v.visit_enum(EnumReader {
+            de: &mut *self,
             variant_index: tag,
-        })
+        });
+        self.ascend();
+        out
     }
 
     fn is_human_readable(&self) -> bool {

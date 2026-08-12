@@ -125,6 +125,11 @@ pub enum MdbCode {
     /// A page has no more space.
     PageFull = ffi::MDB_PAGE_FULL,
     /// Another process grew the database past this process's `map_size`.
+    ///
+    /// A handle that hits this keeps returning it: resizing an open
+    /// environment (`mdb_env_set_mapsize`) is not offered. Recovery is to
+    /// drop every [`Env`](crate::Env) handle to the path, closing it, then
+    /// reopen — which adopts the larger size.
     MapResized = ffi::MDB_MAP_RESIZED,
     /// Operation and database incompatible, or database flags changed.
     Incompatible = ffi::MDB_INCOMPATIBLE,

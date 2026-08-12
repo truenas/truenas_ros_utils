@@ -45,6 +45,17 @@ pub enum Error {
         /// Bytes left unread.
         rest: usize,
     },
+    /// Decoding nested past the configured maximum depth: a recursive or
+    /// deeply nested value long enough to threaten a stack overflow. The bound
+    /// is [`Deserializer::DEFAULT_MAX_DEPTH`] unless raised with
+    /// [`Deserializer::with_max_depth`].
+    ///
+    /// [`Deserializer::DEFAULT_MAX_DEPTH`]: crate::Deserializer::DEFAULT_MAX_DEPTH
+    /// [`Deserializer::with_max_depth`]: crate::Deserializer::with_max_depth
+    RecursionLimit {
+        /// The depth bound that was exceeded.
+        limit: usize,
+    },
     /// A construct XDR cannot represent: a map, a sequence of unknown length,
     /// or a request for self-describing decoding.
     Unsupported(&'static str),
@@ -69,6 +80,9 @@ impl fmt::Display for Error {
             Error::Utf8 => f.write_str("invalid UTF-8 in string"),
             Error::TrailingBytes { rest } => {
                 write!(f, "{rest} trailing byte(s) after value")
+            }
+            Error::RecursionLimit { limit } => {
+                write!(f, "input nests deeper than the limit of {limit}")
             }
             Error::Unsupported(what) => {
                 write!(f, "XDR does not support {what}")
@@ -118,6 +132,10 @@ mod tests {
             (Error::InvalidBool { value: 2 }, "2 is neither 0 nor 1"),
             (Error::Utf8, "invalid UTF-8"),
             (Error::TrailingBytes { rest: 7 }, "7 trailing"),
+            (
+                Error::RecursionLimit { limit: 128 },
+                "deeper than the limit of 128",
+            ),
             (Error::Unsupported("map"), "does not support map"),
             (Error::Io("disk gone".into()), "disk gone"),
             (Error::Message("boom".into()), "boom"),
