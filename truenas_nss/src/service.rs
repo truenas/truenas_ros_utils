@@ -427,11 +427,19 @@ fn dlerror_text() -> Box<str> {
 /// The scratch buffer every `_r` call starts with.
 pub(crate) const INITIAL_BUFLEN: usize = 1024;
 
+/// The scratch buffer's ceiling. A passwd or group entry — a very large
+/// member list included — fits orders of magnitude inside this; the
+/// backends behind `sss` and `winbind` answer over IPC and are not
+/// trusted to stop asking, so a request past the ceiling is refused.
+pub(crate) const MAX_BUFLEN: usize = 1 << 24;
+
 /// Drives one `_r` call through the buffer-growth protocol: the errno
 /// out-parameter is zeroed for each attempt, and `TRYAGAIN` with `ERANGE`
 /// — the service ABI's one request for a larger buffer — doubles it and
-/// retries, without bound. Any other `(status, errno)` pair is a settled
-/// answer and is returned as-is.
+/// retries, up to [`MAX_BUFLEN`]. Any other `(status, errno)` pair is a
+/// settled answer and is returned as-is — as is the request itself once
+/// the buffer is at the ceiling, where it classifies as the module's own
+/// failure.
 pub(crate) fn grow_and_call(
     buf: &mut Vec<u8>,
     mut call: impl FnMut(*mut c_char, libc::size_t, *mut c_int) -> c_int,
@@ -440,6 +448,9 @@ pub(crate) fn grow_and_call(
         let mut errno: c_int = 0;
         let status = call(buf.as_mut_ptr().cast(), buf.len(), &mut errno);
         if status != ffi::NSS_STATUS_TRYAGAIN || errno != libc::ERANGE {
+            return (status, errno);
+        }
+        if buf.len() >= MAX_BUFLEN {
             return (status, errno);
         }
         // A fresh allocation, not a copy: the module rewrites the whole
@@ -657,11 +668,14 @@ pub(crate) fn call_initgroups(
 
 /// Drop repeated gids, first appearance keeping its position. Paid once
 /// per answer: over the union by the fan-out, over the one module's list
-/// by the single-module lookup.
+/// by the single-module lookup. The seen-set keeps it linear — a
+/// directory user's list can run to thousands, and this sits on the
+/// authorization path.
 pub(crate) fn dedup_gids(gids: Vec<u32>) -> Vec<u32> {
+    let mut seen = std::collections::HashSet::with_capacity(gids.len());
     let mut out = Vec::with_capacity(gids.len());
     for gid in gids {
-        if !out.contains(&gid) {
+        if seen.insert(gid) {
             out.push(gid);
         }
     }

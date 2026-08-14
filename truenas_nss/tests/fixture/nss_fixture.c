@@ -18,6 +18,10 @@
  *   -DNSS_FIXTURE_DEFAULT_MODE="x" the mode when the environment sets none
  *   -DNSS_FIXTURE_STALE_ERANGE=n   the first n lookup calls return NOTFOUND
  *                                  with *errnop set to ERANGE
+ *   -DNSS_FIXTURE_INSATIABLE=1     getpwnam_r always returns TRYAGAIN with
+ *                                  *errnop ERANGE, however large the
+ *                                  buffer — a backend that never stops
+ *                                  asking for more
  *   -DNSS_FIXTURE_ENT_BARE_TRYAGAIN=n  the nth get*ent_r call returns
  *                                  TRYAGAIN and leaves *errnop alone,
  *                                  reporting through the thread's errno
@@ -286,6 +290,18 @@ stale_erange(void)
 #endif
 }
 
+/* Returns 1 when every lookup should ask for a larger buffer and never be
+ * satisfied, whatever size arrives. */
+static int
+insatiable(void)
+{
+#if defined(NSS_FIXTURE_INSATIABLE)
+	return 1;
+#else
+	return 0;
+#endif
+}
+
 /* --- passwd -------------------------------------------------------------- */
 
 enum nss_status
@@ -296,6 +312,10 @@ FN(getpwnam_r)(const char *name, struct passwd *result, char *buffer,
 	size_t i;
 
 	FN(fixture_lookup_calls)++;
+	if (insatiable()) {
+		*errnop = ERANGE;
+		return NSS_STATUS_TRYAGAIN;
+	}
 	if (stale_erange()) {
 		*errnop = ERANGE;
 		return NSS_STATUS_NOTFOUND;
