@@ -14,7 +14,7 @@
 
 use crate::db::Db;
 use crate::error::Result;
-use crate::ffi::{MDB_FIRST, MDB_NEXT, MDB_SET_RANGE, MDB_dbi};
+use crate::ffi::MDB_dbi;
 use crate::txn::{CursorGuard, TxnGuard};
 
 /// An iterator over a database's entries in key order, yielding owned
@@ -73,28 +73,17 @@ impl Iter {
     }
 
     fn step(&mut self) -> Result<Option<(Vec<u8>, Vec<u8>)>> {
-        let (op, from) = if self.started {
-            (MDB_NEXT, None)
-        } else {
-            self.started = true;
-            // An empty start key is a full scan: LMDB rejects a zero-length
-            // key, and "greater than or equal to nothing" is the beginning.
-            match &self.start {
-                Some(key) if !key.is_empty() => (MDB_SET_RANGE, Some(&**key)),
-                _ => (MDB_FIRST, None),
-            }
-        };
         // SAFETY: `self.txn` is live for as long as `self`, and the slices are
         // copied below rather than escaping.
-        let Some((key, value)) = (unsafe { self.cursor.step(op, from) })?
-        else {
-            return Ok(None);
-        };
+        let stepped = unsafe {
+            self.cursor.walk(
+                &mut self.started,
+                self.start.as_deref(),
+                self.prefix.as_deref(),
+            )
+        }?;
         let _ = &self.txn; // the borrow above is bounded by this transaction
-        if self.prefix.as_deref().is_some_and(|p| !key.starts_with(p)) {
-            return Ok(None); // sorted order: past the prefix means done
-        }
-        Ok(Some((key.to_vec(), value.to_vec())))
+        Ok(stepped.map(|(key, value)| (key.to_vec(), value.to_vec())))
     }
 }
 

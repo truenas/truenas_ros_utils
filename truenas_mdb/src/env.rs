@@ -8,11 +8,18 @@
 //! `deny(unsafe_code)`; every block carries a `// SAFETY:` note. Invariants:
 //!
 //! - A `*mut MDB_env` comes from `mdb_env_create`, is never handed out, and is
-//!   created and closed only while the pool mutex is held.
+//!   created and closed only while its path's slot mutex is held.
 //! - LMDB requires one open per environment per process — a second open takes
 //!   its own `fcntl` advisory locks and invalidates the first's — so every
 //!   [`Env::open`] of a path shares one handle, reference counted, closed
-//!   exactly once when the last handle drops.
+//!   exactly once when the last handle drops. The per-path lock is what
+//!   holds it: a concurrent open of the same path waits out an open or a
+//!   close in flight, and never runs beside one.
+//! - The pool map itself is locked only for map operations, so a slow
+//!   open or final close on one path — a stalled backing store — never
+//!   blocks another path's. A path's slot persists for the process once
+//!   created (an empty shell after the last close): removing it would
+//!   race a waiter that already holds it.
 //! - An `MDB_env` may be used from any thread and LMDB serializes its own
 //!   writers, so the handle is sound to send and share. What is thread-bound is
 //!   a *transaction*, and [`crate::txn`] enforces that one never crosses a
@@ -114,29 +121,65 @@ impl Default for EnvOptions {
     }
 }
 
-/// A pooled environment: the handle, the count of live [`Env`]s sharing it, and
-/// the mutex serializing `mdb_dbi_open` on it.
-struct EnvSlot {
+/// One path's slot: its environment handle and share count, under a lock
+/// of the slot's own, so the work done on one path — an open against a
+/// slow store, the final sync-and-close — stalls only that path.
+struct PathSlot {
+    state: Mutex<SlotState>,
+}
+
+/// What the slot holds between locks.
+struct SlotState {
+    /// The one open environment for the path, null between a last close
+    /// and the next open.
     env: *mut MDB_env,
+    /// Live [`Env`]s sharing it.
     refcnt: usize,
+    /// Serializes `mdb_dbi_open` on this environment; fresh per open,
+    /// since it belongs to the handle's generation.
     dbi_lock: Arc<Mutex<()>>,
 }
 
-// SAFETY: the handle is created and closed only under the pool mutex, is never
+// SAFETY: the handle is created and closed only under the slot mutex, is never
 // exposed, and is used exactly as in `Env`.
-unsafe impl Send for EnvSlot {}
+unsafe impl Send for SlotState {}
 
-/// Canonical directory -> its one open environment.
-fn env_pool() -> &'static Mutex<HashMap<PathBuf, EnvSlot>> {
-    static POOL: OnceLock<Mutex<HashMap<PathBuf, EnvSlot>>> = OnceLock::new();
+/// Canonical directory -> its slot. An entry, once made, lives for the
+/// process: a waiter may hold the `Arc` while the map is unlocked, so
+/// removal could put two slots — and two LMDB opens — on one path.
+fn env_pool() -> &'static Mutex<HashMap<PathBuf, Arc<PathSlot>>> {
+    static POOL: OnceLock<Mutex<HashMap<PathBuf, Arc<PathSlot>>>> =
+        OnceLock::new();
     POOL.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-/// Lock the pool, recovering from poisoning: the map is consistent at every
-/// point a panic could unwind through, so the guard is taken rather than the
-/// poison propagated to every later open.
-fn lock_pool() -> MutexGuard<'static, HashMap<PathBuf, EnvSlot>> {
-    env_pool().lock().unwrap_or_else(|e| e.into_inner())
+/// The slot for `key`, created empty if the path has none yet. The map
+/// lock is held only for the lookup.
+fn path_slot(key: &Path) -> Arc<PathSlot> {
+    let mut pool = env_pool().lock().unwrap_or_else(|e| e.into_inner());
+    match pool.get(key) {
+        Some(slot) => Arc::clone(slot),
+        None => {
+            let slot = Arc::new(PathSlot {
+                state: Mutex::new(SlotState {
+                    env: ptr::null_mut(),
+                    refcnt: 0,
+                    dbi_lock: Arc::new(Mutex::new(())),
+                }),
+            });
+            pool.insert(key.to_path_buf(), Arc::clone(&slot));
+            slot
+        }
+    }
+}
+
+impl PathSlot {
+    /// Lock the slot, recovering from poisoning: the state is consistent
+    /// at every point a panic could unwind through, so the guard is taken
+    /// rather than the poison propagated to every later open.
+    fn lock(&self) -> MutexGuard<'_, SlotState> {
+        self.state.lock().unwrap_or_else(|e| e.into_inner())
+    }
 }
 
 /// An open environment: a directory holding `data.mdb` and `lock.mdb`, with one
@@ -148,7 +191,10 @@ fn lock_pool() -> MutexGuard<'static, HashMap<PathBuf, EnvSlot>> {
 pub struct Env {
     /// Canonical pool key, and the environment's directory.
     key: PathBuf,
-    /// The pooled handle, valid while this `Env` lives.
+    /// The path's slot; holding it is what keeps the refcount honest.
+    slot: Arc<PathSlot>,
+    /// The pooled handle, valid while this `Env` lives: the refcount it
+    /// carries keeps the slot's environment open.
     env: *mut MDB_env,
     /// Serializes `mdb_dbi_open`, which `lmdb.h` forbids running in concurrent
     /// transactions in one process.
@@ -184,13 +230,21 @@ impl Env {
         // Canonicalize so two spellings of one directory share a pool slot.
         let key = std::fs::canonicalize(path).map_err(io_to_error)?;
 
-        let mut pool = lock_pool();
-        if let Some(slot) = pool.get_mut(&key) {
-            slot.refcnt += 1;
+        let slot = path_slot(&key);
+        // The slot lock is held across the open: LMDB permits one open per
+        // path per process, so a second open of the same path must wait,
+        // and only the slot's own path does.
+        let mut state = slot.lock();
+        if !state.env.is_null() {
+            state.refcnt += 1;
+            let env = state.env;
+            let dbi_lock = Arc::clone(&state.dbi_lock);
+            drop(state);
             return Ok(Env {
                 key,
-                env: slot.env,
-                dbi_lock: Arc::clone(&slot.dbi_lock),
+                slot,
+                env,
+                dbi_lock,
             });
         }
 
@@ -222,22 +276,23 @@ impl Env {
                     })
                 });
         if let Err(e) = configured {
-            // Nothing was pooled, so this handle is ours alone to close.
+            // Nothing was recorded, so this handle is ours alone to close.
             // SAFETY: from `mdb_env_create`, non-null, closed exactly once.
             unsafe { mdb_env_close(env) };
             return Err(e);
         }
 
         let dbi_lock = Arc::new(Mutex::new(()));
-        pool.insert(
-            key.clone(),
-            EnvSlot {
-                env,
-                refcnt: 1,
-                dbi_lock: Arc::clone(&dbi_lock),
-            },
-        );
-        Ok(Env { key, env, dbi_lock })
+        state.env = env;
+        state.refcnt = 1;
+        state.dbi_lock = Arc::clone(&dbi_lock);
+        drop(state);
+        Ok(Env {
+            key,
+            slot,
+            env,
+            dbi_lock,
+        })
     }
 
     /// Flush to disk. Only meaningful with [`EnvFlags::NOSYNC`] or
@@ -264,13 +319,12 @@ impl Env {
 
 impl Clone for Env {
     fn clone(&self) -> Env {
-        let mut pool = lock_pool();
-        // A live `self` guarantees the slot exists; its refcount counts us.
-        if let Some(slot) = pool.get_mut(&self.key) {
-            slot.refcnt += 1;
-        }
+        // A live `self` keeps the slot's environment open; the new handle
+        // adds its own count.
+        self.slot.lock().refcnt += 1;
         Env {
             key: self.key.clone(),
+            slot: Arc::clone(&self.slot),
             env: self.env,
             dbi_lock: Arc::clone(&self.dbi_lock),
         }
@@ -279,24 +333,21 @@ impl Clone for Env {
 
 impl Drop for Env {
     fn drop(&mut self) {
-        let mut pool = lock_pool();
-        let Some(slot) = pool.get_mut(&self.key) else {
-            return;
-        };
-        slot.refcnt -= 1;
-        if slot.refcnt != 0 {
+        let mut state = self.slot.lock();
+        state.refcnt -= 1;
+        if state.refcnt != 0 {
             return;
         }
         // Last handle: sync (which matters under NOSYNC) and close, both under
-        // the pool lock, so a concurrent open of this path blocks, finds the
-        // slot gone, and opens a fresh environment instead of observing a
-        // half-closed one.
-        // SAFETY: `slot.env == self.env`, valid and open, closed exactly once.
+        // the slot lock, so a concurrent open of this path blocks, finds the
+        // slot empty, and opens a fresh environment instead of observing a
+        // half-closed one. Other paths' slots are untouched.
+        // SAFETY: `state.env == self.env`, valid and open, closed exactly once.
         unsafe {
             mdb_env_sync(self.env, 1);
             mdb_env_close(self.env);
         }
-        pool.remove(&self.key);
+        state.env = ptr::null_mut();
     }
 }
 
@@ -318,10 +369,15 @@ fn io_to_error(e: std::io::Error) -> crate::Error {
 mod tests {
     use super::*;
 
-    /// This path's refcount, or `None` if nothing is pooled for it.
+    /// This path's live share count, or `None` if nothing is open for it —
+    /// the slot itself persists, empty, after the last close.
     fn refcnt(path: &Path) -> Option<usize> {
         let key = std::fs::canonicalize(path).unwrap_or_else(|_| path.into());
-        lock_pool().get(&key).map(|s| s.refcnt)
+        let pool = env_pool().lock().unwrap_or_else(|e| e.into_inner());
+        let slot = Arc::clone(pool.get(&key)?);
+        drop(pool);
+        let state = slot.lock();
+        (!state.env.is_null()).then_some(state.refcnt)
     }
 
     fn opts() -> EnvOptions {

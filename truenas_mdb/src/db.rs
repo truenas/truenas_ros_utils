@@ -196,6 +196,11 @@ impl Db {
     }
 
     /// The number of entries.
+    ///
+    /// On the [main](Db::main) database this counts everything the shared
+    /// key space holds, the named-database index entries included: a
+    /// store whose user data lives in named databases reports their count
+    /// here, not zero.
     pub fn len(&self) -> Result<u64> {
         let txn = TxnGuard::begin(&self.env, true)?;
         let mut stat = MDB_stat::default();
@@ -204,7 +209,9 @@ impl Db {
         Ok(stat.ms_entries as u64)
     }
 
-    /// Whether the database has no entries.
+    /// Whether the database has no entries. Counts as [`len`](Db::len)
+    /// does, so the main database is non-empty once any named database
+    /// exists.
     pub fn is_empty(&self) -> Result<bool> {
         Ok(self.len()? == 0)
     }
@@ -376,19 +383,12 @@ impl Db {
     ) -> Result<Option<B>> {
         let txn = TxnGuard::begin(&self.env, true)?;
         let cursor = CursorGuard::open(&txn, self.dbi)?;
-        // An empty start key is a full scan: LMDB rejects a zero-length key,
-        // and "greater than or equal to nothing" is the beginning anyway.
-        let (mut op, mut from) = match start {
-            Some(key) if !key.is_empty() => (MDB_SET_RANGE, Some(key)),
-            _ => (MDB_FIRST, None),
-        };
+        let mut started = false;
         // SAFETY: `txn` outlives every borrow below, and the slices do not
         // escape an iteration.
-        while let Some((key, value)) = (unsafe { cursor.step(op, from) })? {
-            (op, from) = (MDB_NEXT, None);
-            if prefix.is_some_and(|p| !key.starts_with(p)) {
-                break; // sorted order: past the prefix means done
-            }
+        while let Some((key, value)) =
+            (unsafe { cursor.walk(&mut started, start, prefix) })?
+        {
             if let ControlFlow::Break(b) = f(key, value) {
                 return Ok(Some(b));
             }
