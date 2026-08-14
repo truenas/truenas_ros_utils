@@ -34,6 +34,7 @@ use crate::secret::Secret;
 use crate::txn::{Flags, Transaction};
 use std::panic::{self, AssertUnwindSafe};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, sync_channel};
+use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
 use std::{mem, ptr};
@@ -171,7 +172,10 @@ impl Stepped {
     /// Fails only if the thread cannot be created, in which case the stack has
     /// not run and the transaction is ended.
     pub fn begin(txn: Transaction, flags: Flags) -> Result<Stepped> {
-        Stepped::run(txn, flags, Op::Authenticate)
+        Stepped::run(txn, flags, Op::Authenticate).map_err(|(txn, e)| {
+            drop(txn); // the documented contract: the transaction is ended
+            e
+        })
     }
 
     /// Start `pam_chauthtok` on a worker thread, driven the same way.
@@ -180,10 +184,27 @@ impl Stepped {
     /// the old token, then the new one twice. Honours the same flags as
     /// [`Transaction::chauthtok`].
     pub fn begin_chauthtok(txn: Transaction, flags: Flags) -> Result<Stepped> {
-        Stepped::run(txn, flags, Op::Chauthtok)
+        Stepped::run(txn, flags, Op::Chauthtok).map_err(|(txn, e)| {
+            drop(txn); // as `begin`: the transaction is ended
+            e
+        })
     }
 
-    fn run(mut txn: Transaction, flags: Flags, op: Op) -> Result<Stepped> {
+    /// [`begin`](Stepped::begin), except a spawn failure hands the
+    /// transaction back instead of ending it, so a sequencer holding the
+    /// only handle can keep it for a retry.
+    pub(crate) fn begin_recover(
+        txn: Transaction,
+        flags: Flags,
+    ) -> std::result::Result<Stepped, (Transaction, Error)> {
+        Stepped::run(txn, flags, Op::Authenticate)
+    }
+
+    fn run(
+        mut txn: Transaction,
+        flags: Flags,
+        op: Op,
+    ) -> std::result::Result<Stepped, (Transaction, Error)> {
         // Rendezvous on both: the worker must not run ahead of the caller, and
         // a send that finds nobody there is how a cancellation is noticed.
         let (event_tx, event_rx) = sync_channel::<Event>(0);
@@ -194,11 +215,20 @@ impl Stepped {
             answers: answer_rx,
         }));
 
-        let worker = std::thread::Builder::new()
+        // The transaction rides to the worker in a parcel this side keeps
+        // a handle to: a failed spawn never ran the closure, so the parcel
+        // still holds the transaction for taking back.
+        let parcel = Arc::new(Mutex::new(Some((txn, restore))));
+        let theirs = Arc::clone(&parcel);
+        let spawned = std::thread::Builder::new()
             .name("pam-exchange".into())
             .spawn(move || {
                 block_signals();
-                let mut txn = txn;
+                let (mut txn, restore) = theirs
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .take()
+                    .expect("the parcel is taken only by the worker");
                 let result = panic::catch_unwind(AssertUnwindSafe(|| {
                     op.run(&mut txn, flags)
                 }));
@@ -208,8 +238,20 @@ impl Stepped {
                 // The driver may already have gone.
                 let _ = event_tx.send(Event::Finished);
                 (txn, result)
-            })
-            .map_err(|e| Error::Os(e.raw_os_error().unwrap_or(libc::EAGAIN)))?;
+            });
+        let worker = match spawned {
+            Ok(worker) => worker,
+            Err(e) => {
+                let (mut txn, restore) = parcel
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .take()
+                    .expect("a failed spawn never ran the worker");
+                txn.set_conversation(restore);
+                let e = Error::Os(e.raw_os_error().unwrap_or(libc::EAGAIN));
+                return Err((txn, e));
+            }
+        };
 
         Ok(Stepped {
             worker: Some(worker),

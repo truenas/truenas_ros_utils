@@ -14,9 +14,10 @@ use std::sync::atomic::{Ordering, compiler_fence};
 
 /// The answer to one prompt, overwritten when it is dropped.
 ///
-/// Scrubbing covers this buffer only. Bytes that reached here by copy — a
-/// `String` the caller still holds, the `Vec` a decoder produced — remain the
-/// caller's to manage.
+/// Scrubbing covers this buffer and a by-value source: a `String` or `Vec`
+/// moved in is burned to its full capacity once its bytes are copied
+/// across. What remains the caller's to manage is any copy the caller
+/// still holds — the `&str` a `Secret::from` borrowed, an earlier clone.
 ///
 /// ```
 /// # use truenas_pam::Secret;
@@ -29,7 +30,18 @@ pub struct Secret(Box<[u8]>);
 impl Secret {
     /// Take ownership of `bytes`.
     pub fn new(bytes: impl Into<Vec<u8>>) -> Secret {
-        Secret(bytes.into().into_boxed_slice())
+        let mut src = bytes.into();
+        if src.capacity() == src.len() {
+            // Exact already: boxing keeps the allocation in place.
+            return Secret(src.into_boxed_slice());
+        }
+        // Spare capacity: `into_boxed_slice` would move the bytes to an
+        // exact-length block and free this one unscrubbed. Copy across,
+        // then burn the source's whole buffer before it is released.
+        let boxed: Box<[u8]> = src.as_slice().into();
+        // SAFETY: `src` uniquely owns `capacity` writable bytes.
+        unsafe { scrub(src.as_mut_ptr(), src.capacity()) };
+        Secret(boxed)
     }
 
     /// The bytes, as they will reach the module.
@@ -141,5 +153,19 @@ mod tests {
         // SAFETY: a live local array of exactly this length.
         unsafe { scrub(buf.as_mut_ptr(), buf.len()) };
         assert_eq!(buf, [0; 8]);
+    }
+
+    /// A source with spare capacity takes the copy-and-burn path; the
+    /// bytes must come through it verbatim, as they do the in-place one.
+    #[test]
+    fn a_source_with_spare_capacity_round_trips() {
+        let mut v = Vec::with_capacity(64);
+        v.extend_from_slice(b"hunter2");
+        assert!(v.capacity() > v.len());
+        assert_eq!(Secret::from(v).as_bytes(), b"hunter2");
+
+        let mut s = String::with_capacity(32);
+        s.push_str("pw");
+        assert_eq!(Secret::from(s).as_bytes(), b"pw");
     }
 }
