@@ -46,7 +46,7 @@ fn the_sequence_runs_in_order() {
     assert_eq!(auth.stage(), Stage::Authenticated);
 
     auth.acct_mgmt().unwrap();
-    assert_eq!(auth.stage(), Stage::Authenticated);
+    assert_eq!(auth.stage(), Stage::AccountChecked);
 
     auth.login().unwrap();
     assert_eq!(auth.stage(), Stage::SessionOpen);
@@ -91,6 +91,11 @@ fn steps_out_of_order_are_refused() {
 
     // Authenticated, but the session has not been opened.
     assert_eq!(auth.logout(), Err(Error::OutOfSequence));
+    // The account check is a step of the sequence, not an option: a login
+    // that skipped it would open a session for an expired or locked
+    // account the account stack was never asked about.
+    assert_eq!(auth.login(), Err(Error::OutOfSequence));
+    auth.acct_mgmt().unwrap();
     auth.login().unwrap();
     // And not twice.
     assert_eq!(auth.login(), Err(Error::OutOfSequence));
@@ -126,8 +131,15 @@ fn a_step_timeout_bounds_each_round() {
     assert_eq!(auth.respond(answers), Err(Error::Timeout));
     assert_eq!(auth.stage(), Stage::Failed);
 
-    // The transaction is still recovered once the module returns.
-    assert!(auth.transaction().is_ok());
+    // The module is still in flight, so the transaction is not here:
+    // respond returned on the timeout instead of joining the worker,
+    // which would have recovered it and held this thread for the
+    // module's whole delay.
+    assert!(auth.transaction().is_err());
+
+    // Taking it back is the blocking step, and still recovers it once
+    // the module returns.
+    assert!(auth.into_transaction().is_ok());
 }
 
 /// A refusal leaves the transaction readable. A sequence that dropped it on
@@ -209,9 +221,10 @@ fn a_session_that_will_not_open_does_not_leave_credentials_granted() {
     let mut auth = login(dir.path(), "no-session", "alice");
 
     run(&mut auth, "token").unwrap();
+    auth.acct_mgmt().unwrap();
     assert_eq!(auth.login(), Err(Error::Pam(PamCode::SessionErr)));
     // The sequence stays where it was, so the caller may try again or give up.
-    assert_eq!(auth.stage(), Stage::Authenticated);
+    assert_eq!(auth.stage(), Stage::AccountChecked);
     assert_eq!(auth.logout(), Err(Error::OutOfSequence));
 }
 
@@ -231,6 +244,7 @@ fn the_environment_crosses_the_exchange() {
 
     let mut auth = Authenticator::new(txn);
     run(&mut auth, "token").unwrap();
+    auth.acct_mgmt().unwrap();
     auth.login().unwrap();
 
     assert_eq!(

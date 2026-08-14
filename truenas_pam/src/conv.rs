@@ -243,9 +243,9 @@ impl ConvSlot {
         &self.log
     }
 
-    /// Discard the recorded rounds.
-    pub(crate) fn clear_log(&mut self) {
-        self.log.clear();
+    /// Take the recorded rounds, leaving none behind.
+    pub(crate) fn take_log(&mut self) -> Vec<Vec<OwnedMessage>> {
+        mem::take(&mut self.log)
     }
 
     /// Take the failure, if the last call produced one.

@@ -445,6 +445,11 @@ impl Transaction {
     }
 
     /// The whole PAM environment, in the order libpam holds it.
+    ///
+    /// An entry whose name or value is not UTF-8 is skipped: one variable
+    /// another module set as raw bytes must not make the rest unreadable.
+    /// Asking for a variable by name through [`getenv`](Self::getenv)
+    /// reports `NotUtf8` for exactly the one asked about.
     pub fn env(&self) -> Result<Vec<(String, String)>> {
         // SAFETY: a live handle. The array and every string in it become ours.
         let list = unsafe { pam_getenvlist(self.hdl) };
@@ -452,9 +457,6 @@ impl Transaction {
             return Err(Error::Pam(PamCode::BufErr));
         }
         let mut out = Vec::new();
-        // Freeing continues past a malformed entry: the allocation is ours
-        // whether or not the contents can be read.
-        let mut failed = None;
         let mut i = 0;
         loop {
             // SAFETY: a null-terminated array of pointers.
@@ -464,9 +466,10 @@ impl Transaction {
             }
             // SAFETY: NUL-terminated, and ours to free.
             let bytes = unsafe { CStr::from_ptr(entry) }.to_bytes();
-            match split_env(bytes) {
-                Ok(pair) => out.push(pair),
-                Err(e) => failed = failed.or(Some(e)),
+            // A malformed entry is skipped; its allocation is freed all
+            // the same.
+            if let Ok(pair) = split_env(bytes) {
+                out.push(pair);
             }
             // SAFETY: from libpam's own allocator, freed exactly once.
             unsafe { libc::free(entry as *mut c_void) };
@@ -474,10 +477,7 @@ impl Transaction {
         }
         // SAFETY: the array itself, freed exactly once after its contents.
         unsafe { libc::free(list as *mut c_void) };
-        match failed {
-            Some(e) => Err(e),
-            None => Ok(out),
-        }
+        Ok(out)
     }
 
     // --- the conversation ------------------------------------------------
@@ -504,9 +504,7 @@ impl Transaction {
 
     /// Take the recorded rounds, leaving none behind.
     pub fn take_messages(&mut self) -> Vec<Vec<OwnedMessage>> {
-        let taken = self.messages().to_vec();
-        self.slot_mut().clear_log();
-        taken
+        self.slot_mut().take_log()
     }
 
     // --- internals -------------------------------------------------------
@@ -682,6 +680,9 @@ mod tests {
         assert_eq!(split_env(b"N="), Ok(("N".into(), String::new())));
         assert_eq!(split_env(b"N"), Ok(("N".into(), String::new())));
         assert_eq!(split_env(&[0xff, b'=']), Err(Error::NotUtf8));
+        // A non-UTF-8 value refuses the entry too; `env` skips exactly
+        // what this refuses.
+        assert_eq!(split_env(&[b'N', b'=', 0xff]), Err(Error::NotUtf8));
     }
 
     #[test]

@@ -98,6 +98,27 @@ fn erange_grows_the_buffer() {
     assert_eq!(after - before, 3);
 }
 
+/// The growth has a ceiling. A backend that answers TRYAGAIN/ERANGE
+/// however large the buffer gets must land as that settled failure after
+/// a bounded number of doublings — not drive allocation until the
+/// process dies.
+#[test]
+fn an_insatiable_backend_is_refused_at_the_ceiling() {
+    let Some((_dir, path)) = fixture("greedy", &["NSS_FIXTURE_INSATIABLE=1"])
+    else {
+        return;
+    };
+    let svc =
+        Service::open(&path, "greedy", EntScope::Process, Source::Sss).unwrap();
+
+    let before = common::counter(&path, "_nss_greedy_fixture_lookup_calls");
+    let err = svc.getpwnam("anyone").unwrap_err();
+    assert_eq!(err.errno(), Some(libc::ERANGE));
+    let after = common::counter(&path, "_nss_greedy_fixture_lookup_calls");
+    // 1 KiB doubling to the 16 MiB ceiling: fifteen calls, then refusal.
+    assert_eq!(after - before, 15);
+}
+
 /// The classification contract: TRYAGAIN with an errno is that errno;
 /// UNAVAIL without one is the status-only error the fan-out skips;
 /// NOTFOUND is a clean miss.

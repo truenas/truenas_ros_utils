@@ -6,7 +6,10 @@
 //! account once the credentials are accepted, grant the credentials before
 //! opening a session, and revoke them after closing it. This puts that order
 //! in one place, over a [`Stepped`] exchange, and refuses anything out of
-//! sequence.
+//! sequence — the account check included: [`login`](Authenticator::login)
+//! runs only once [`acct_mgmt`](Authenticator::acct_mgmt) has passed, since
+//! an expired or locked account fails exactly there. A consumer with cause
+//! to run a different order has [`Transaction`]'s own calls.
 //!
 //! It decides nothing. Which service to run, what a prompt means, whether a
 //! refusal should be retried against a different stack — all of that is policy
@@ -27,8 +30,10 @@ pub enum Stage {
     Start,
     /// An exchange is under way; the stack is waiting to be answered.
     Authenticating,
-    /// The credentials were accepted.
+    /// The credentials were accepted; the account has not been checked.
     Authenticated,
+    /// The account was checked and is usable.
+    AccountChecked,
     /// A session is open.
     SessionOpen,
     /// The session has been closed.
@@ -41,7 +46,7 @@ pub enum Stage {
 enum Held {
     Transaction(Transaction),
     Exchange(Stepped),
-    /// The exchange could not be started, so there is nothing left to hold.
+    /// The exchange ended without handing the transaction back.
     Nothing,
 }
 
@@ -101,7 +106,12 @@ impl Authenticator {
     /// How long to wait for each round of the exchange. Unset waits
     /// indefinitely.
     ///
-    /// This bounds the wait, not the module behind it; see [`Stepped`].
+    /// This bounds the wait, not the module behind it; see [`Stepped`]. A
+    /// round that times out returns at once and leaves the sequence
+    /// [`Failed`](Stage::Failed) with the transaction still on the
+    /// worker: [`into_transaction`](Self::into_transaction) — which waits
+    /// for the module to come back — is the way to recover it, and the
+    /// place a fresh attempt starts from.
     pub fn timeout(mut self, timeout: Duration) -> Authenticator {
         self.timeout = Some(timeout);
         self
@@ -117,7 +127,9 @@ impl Authenticator {
     /// Returns the first round to answer, or [`Step::Done`] if the stack
     /// wanted nothing. A refusal leaves the stage at [`Stage::Failed`], from
     /// where this may be called again to try afresh — against the same
-    /// service, since a transaction is bound to one.
+    /// service, since a transaction is bound to one. The one failure that
+    /// cannot be retried in place is a timed-out round, whose transaction
+    /// is still on the worker; see [`timeout`](Self::timeout).
     pub fn begin(&mut self) -> Result<Step> {
         if !matches!(self.stage, Stage::Start | Stage::Failed) {
             return Err(Error::OutOfSequence);
@@ -127,12 +139,15 @@ impl Authenticator {
         else {
             return Err(Error::OutOfSequence);
         };
-        match Stepped::begin(txn, self.flags) {
+        match Stepped::begin_recover(txn, self.flags) {
             Ok(exchange) => {
                 self.held = Held::Exchange(exchange);
                 self.stage = Stage::Authenticating;
             }
-            Err(e) => {
+            Err((txn, e)) => {
+                // The exchange never started; keeping the transaction is
+                // what lets the documented retry from `Failed` run.
+                self.held = Held::Transaction(txn);
                 self.stage = Stage::Failed;
                 return Err(e);
             }
@@ -154,7 +169,8 @@ impl Authenticator {
     /// Check that the account is usable: not expired, not locked, permitted
     /// from here and now.
     ///
-    /// ADG 3.1 puts this after authentication and before anything is granted.
+    /// ADG 3.1 puts this after authentication and before anything is granted,
+    /// and passing it is what lets [`login`](Self::login) run.
     /// [`NewAuthtokReqd`](crate::PamCode::NewAuthtokReqd) means the account is
     /// good and its password must change first; the stage is left where it
     /// was, so the caller can take the transaction and drive
@@ -164,15 +180,18 @@ impl Authenticator {
             return Err(Error::OutOfSequence);
         }
         let flags = self.flags;
-        self.transaction_mut()?.acct_mgmt(flags)
+        self.transaction_mut()?.acct_mgmt(flags)?;
+        self.stage = Stage::AccountChecked;
+        Ok(())
     }
 
     /// Grant the user's credentials and open a session, in that order.
     ///
-    /// Credentials granted for a session that does not open are revoked
-    /// again.
+    /// Runs only once [`acct_mgmt`](Self::acct_mgmt) has passed: the account
+    /// stack is the one place expiry and lockout are enforced. Credentials
+    /// granted for a session that does not open are revoked again.
     pub fn login(&mut self) -> Result<()> {
-        if self.stage != Stage::Authenticated {
+        if self.stage != Stage::AccountChecked {
             return Err(Error::OutOfSequence);
         }
         let flags = self.flags;
@@ -250,6 +269,14 @@ impl Authenticator {
             Ok(Step::Done) => {
                 self.settle(Stage::Authenticated);
                 Ok(Step::Done)
+            }
+            // A module cannot be stopped mid-call, and this call's return
+            // is what the timeout bounds — so the worker is not joined
+            // here. The exchange stays held, with the transaction on it;
+            // `into_transaction`, which waits, takes it back.
+            Err(Error::Timeout) => {
+                self.stage = Stage::Failed;
+                Err(Error::Timeout)
             }
             Err(e) => {
                 self.settle(Stage::Failed);

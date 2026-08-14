@@ -208,6 +208,42 @@ impl CursorGuard {
             _ => Err(crate::Error::from_raw(rc)),
         }
     }
+
+    /// One step of the in-order walk shared by `Db::scan*` and `Iter`:
+    /// seek on the first call — `MDB_SET_RANGE` for a non-empty start
+    /// key, else `MDB_FIRST`, since LMDB rejects a zero-length key and
+    /// "at or after nothing" is the beginning — `MDB_NEXT` after, and
+    /// `None` at the first key past `prefix` (sorted order: past the
+    /// prefix means done).
+    ///
+    /// # Safety
+    ///
+    /// As [`step`](Self::step): the caller bounds `'t` by the cursor's
+    /// transaction, and the slices must not outlive it.
+    pub(crate) unsafe fn walk<'t>(
+        &self,
+        started: &mut bool,
+        start: Option<&[u8]>,
+        prefix: Option<&[u8]>,
+    ) -> Result<Option<(&'t [u8], &'t [u8])>> {
+        let (op, from) = if *started {
+            (MDB_NEXT, None)
+        } else {
+            *started = true;
+            match start {
+                Some(key) if !key.is_empty() => (MDB_SET_RANGE, Some(key)),
+                _ => (MDB_FIRST, None),
+            }
+        };
+        // SAFETY: the caller's own contract, forwarded.
+        let Some((key, value)) = (unsafe { self.step(op, from) })? else {
+            return Ok(None);
+        };
+        if prefix.is_some_and(|p| !key.starts_with(p)) {
+            return Ok(None);
+        }
+        Ok(Some((key, value)))
+    }
 }
 
 impl Drop for CursorGuard {
