@@ -266,6 +266,19 @@ mod tests {
         assert_eq!(NssStatus::Return.raw(), 2);
     }
 
+    /// A bare status renders as its upstream symbol, written out by hand as
+    /// `nss.h` has it. The `Error` cases below carry a raw status through
+    /// `Error`'s `Display`, so nothing there reaches the impl a caller
+    /// logging a status of its own would use.
+    #[test]
+    fn a_status_displays_as_its_upstream_symbol() {
+        assert_eq!(NssStatus::TryAgain.to_string(), "NSS_STATUS_TRYAGAIN");
+        assert_eq!(NssStatus::Unavail.to_string(), "NSS_STATUS_UNAVAIL");
+        assert_eq!(NssStatus::NotFound.to_string(), "NSS_STATUS_NOTFOUND");
+        assert_eq!(NssStatus::Success.to_string(), "NSS_STATUS_SUCCESS");
+        assert_eq!(NssStatus::Return.to_string(), "NSS_STATUS_RETURN");
+    }
+
     /// A raw value outside the block must come back `None`, not be forced
     /// onto the nearest variant.
     #[test]

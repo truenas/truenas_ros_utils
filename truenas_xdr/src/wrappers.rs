@@ -258,6 +258,17 @@ mod tests {
     }
 
     #[test]
+    fn var_opaque_ref_converts_both_ways() {
+        let data = [1u8, 2, 3];
+        let opaque = VarOpaqueRef::from(&data[..]);
+        assert_eq!(opaque.as_ref(), &[1, 2, 3]);
+        assert_eq!(<&[u8]>::from(opaque), &[1, 2, 3]);
+        // The borrowed form promotes to the owned one by copying its bytes.
+        assert_eq!(VarOpaque::from(opaque).0, vec![1, 2, 3]);
+        assert_eq!(VarOpaqueRef::default().0, &[] as &[u8]);
+    }
+
+    #[test]
     fn fixed_opaque_converts_both_ways() {
         let opaque = FixedOpaque::from([1u8, 2, 3, 4]);
         assert_eq!(opaque.as_ref(), &[1, 2, 3, 4]);

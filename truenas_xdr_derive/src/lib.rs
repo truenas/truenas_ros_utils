@@ -326,3 +326,83 @@ fn expand_union(input: DeriveInput) -> syn::Result<TokenStream> {
     }
     .into())
 }
+
+#[cfg(test)]
+mod tests {
+    //! The parsing and validation helpers work on `syn` types and never touch
+    //! the `proc_macro` bridge, so they run outside the compiler. The
+    //! token-building paths do not: `TokenStream::from` panics anywhere but in
+    //! a macro expansion, which is why only the refusals — each of which
+    //! returns before a token is built — are driven here. `truenas_xdr`'s
+    //! `tests/derive.rs` covers what the macros expand to.
+    use super::*;
+
+    fn expr(src: &str) -> Expr {
+        syn::parse_str::<Expr>(src).unwrap()
+    }
+
+    fn input(src: &str) -> DeriveInput {
+        syn::parse_str::<DeriveInput>(src).unwrap()
+    }
+
+    fn data_enum(src: &str) -> DataEnum {
+        match input(src).data {
+            Data::Enum(d) => d,
+            _ => panic!("not an enum"),
+        }
+    }
+
+    #[test]
+    fn a_discriminant_is_the_literal_written() {
+        assert_eq!(parse_disc(&expr("5")).unwrap(), 5);
+        assert_eq!(parse_disc(&expr("-3")).unwrap(), -3);
+    }
+
+    /// The macro cannot evaluate a const expression, so accepting one would
+    /// encode a discriminant that is not the one written.
+    #[test]
+    fn a_non_literal_discriminant_is_refused() {
+        assert!(parse_disc(&expr("SOME_CONST")).is_err());
+        assert!(parse_disc(&expr("1 + 1")).is_err());
+        assert!(parse_disc(&expr("-SOME_CONST")).is_err());
+    }
+
+    /// An implicit value is the previous plus one, and an explicit one may go
+    /// backwards.
+    #[test]
+    fn discriminants_fill_in_and_refuse_overflow() {
+        let d = data_enum("enum E { A = 4, B, C = -1 }");
+        assert_eq!(discriminants(&d).unwrap(), vec![4, 5, -1]);
+        // i32::MAX leaves no room for the next, which must be refused rather
+        // than wrapped to i32::MIN.
+        let over = data_enum("enum E { A = 2147483647, B }");
+        assert!(discriminants(&over).is_err());
+    }
+
+    /// The layout is fixed per concrete type, so a parameter it could vary
+    /// over has no encoding.
+    #[test]
+    fn a_generic_type_is_refused() {
+        assert!(reject_generics(&input("enum E { A }")).is_ok());
+        assert!(reject_generics(&input("enum E<T> { A }")).is_err());
+        assert!(reject_generics(&input("struct S<'a> { x: &'a u8 }")).is_err());
+    }
+
+    #[test]
+    fn a_non_enum_is_refused_by_name() {
+        assert!(enum_data(&input("enum E { A }"), "XdrEnum").is_ok());
+        // `.err()` drops the `&DataEnum`, which has no `Debug`.
+        let err = enum_data(&input("struct S { x: u8 }"), "XdrUnion")
+            .err()
+            .unwrap();
+        assert!(err.to_string().contains("XdrUnion"), "{err}");
+    }
+
+    /// A data-bearing variant is a union; encoding it as a bare `i32` would
+    /// drop its fields.
+    #[test]
+    fn xdr_enum_refuses_a_data_bearing_variant() {
+        let err = expand_enum(input("enum E { A, B(u8) }")).err().unwrap();
+        assert!(err.to_string().contains("field-less"), "{err}");
+    }
+}
