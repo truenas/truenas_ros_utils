@@ -513,11 +513,29 @@ mod tests {
         let err = Error::Os(libc::ENOMEM);
         assert_eq!(err.as_pam(), None);
         assert_eq!(err.raw(), None);
+        assert_eq!(
+            err.to_string(),
+            io::Error::from_raw_os_error(libc::ENOMEM).to_string()
+        );
         assert_eq!(io::Error::from(err).raw_os_error(), Some(libc::ENOMEM));
         assert_eq!(
             io::Error::from(Error::Pam(PamCode::BufErr)).raw_os_error(),
             None
         );
+    }
+
+    /// A mistranscribed arm would downgrade a code the standard defines to
+    /// `Unknown` and lose its message.
+    #[test]
+    fn from_raw_recognises_every_code_in_the_block() {
+        for code in ALL {
+            assert_eq!(
+                PamCode::from_raw(code.raw()),
+                Some(code),
+                "{}",
+                code.name()
+            );
+        }
     }
 
     #[test]
@@ -527,6 +545,8 @@ mod tests {
         assert_eq!(Error::from_raw(-1), Error::Unknown(-1));
         assert_eq!(Error::from_raw(32), Error::Unknown(32));
         assert_eq!(Error::Unknown(32).as_pam(), None);
+        // The code itself is kept, so what the stack said is still legible.
+        assert_eq!(Error::Unknown(32).raw(), Some(32));
     }
 
     #[test]
@@ -563,6 +583,7 @@ mod tests {
         assert!(!Error::NulByte.to_string().is_empty());
         assert!(!Error::InvalidName.to_string().is_empty());
         assert!(!Error::NotUtf8.to_string().is_empty());
+        assert!(!Error::OutOfSequence.to_string().is_empty());
     }
 
     /// The variants this crate raises itself carry no libpam code, so nothing
@@ -574,6 +595,7 @@ mod tests {
             Error::NulByte,
             Error::InvalidName,
             Error::NotUtf8,
+            Error::OutOfSequence,
         ] {
             assert_eq!(err.raw(), None, "{err:?}");
             assert_eq!(err.as_pam(), None, "{err:?}");
@@ -601,6 +623,25 @@ mod tests {
             io::Error::from(Error::Pam(PamCode::SystemErr)).kind(),
             io::ErrorKind::Other
         );
+        assert_eq!(
+            io::Error::from(Error::Pam(PamCode::BufErr)).kind(),
+            io::ErrorKind::OutOfMemory
+        );
+
+        for err in [Error::NulByte, Error::InvalidName, Error::OutOfSequence] {
+            assert_eq!(
+                io::Error::from(err).kind(),
+                io::ErrorKind::InvalidInput,
+                "{err:?}"
+            );
+        }
+        for err in [Error::NotUtf8, Error::UnknownMsgStyle(7)] {
+            assert_eq!(
+                io::Error::from(err).kind(),
+                io::ErrorKind::InvalidData,
+                "{err:?}"
+            );
+        }
     }
 
     #[test]

@@ -423,6 +423,30 @@ fn maps_are_rejected_in_both_directions() {
     );
 }
 
+/// Asks its deserializer for an identifier, the one request a field or variant
+/// name would make. XDR carries no names on the wire, so there is nothing to
+/// answer it with.
+#[derive(Debug)]
+struct WantsIdentifier;
+
+impl<'de> Deserialize<'de> for WantsIdentifier {
+    fn deserialize<D: serde::Deserializer<'de>>(
+        d: D,
+    ) -> Result<Self, D::Error> {
+        struct V;
+        impl serde::de::Visitor<'_> for V {
+            type Value = WantsIdentifier;
+            fn expecting(
+                &self,
+                f: &mut std::fmt::Formatter,
+            ) -> std::fmt::Result {
+                f.write_str("an identifier")
+            }
+        }
+        d.deserialize_identifier(V)
+    }
+}
+
 #[test]
 fn self_describing_decoding_is_rejected() {
     // An untagged enum asks the decoder to look at the bytes and decide, which
@@ -436,6 +460,16 @@ fn self_describing_decoding_is_rejected() {
     let err = from_bytes::<Untagged>(&[0, 0, 0, 1]).unwrap_err();
     assert_eq!(err, Error::Unsupported("self-describing decoding"));
     assert!(err.to_string().contains("self-describing"));
+
+    // The two entry points that delegate to `deserialize_any` reach the same
+    // refusal rather than a different error or a panic: `IgnoredAny` routes
+    // through `deserialize_ignored_any`, a name request through
+    // `deserialize_identifier`.
+    let err = from_bytes::<serde::de::IgnoredAny>(&[0, 0, 0, 1]).unwrap_err();
+    assert_eq!(err, Error::Unsupported("self-describing decoding"));
+
+    let err = from_bytes::<WantsIdentifier>(&[0, 0, 0, 1]).unwrap_err();
+    assert_eq!(err, Error::Unsupported("self-describing decoding"));
 }
 
 #[test]
@@ -454,6 +488,40 @@ fn a_sequence_of_unknown_length_is_rejected() {
         to_bytes(&Unsized).unwrap_err(),
         Error::Unsupported("a sequence of unknown length")
     );
+}
+
+// --- format properties ---------------------------------------------------
+
+/// A serde impl may encode one way for a text format and another for a binary
+/// one. Both halves of this codec must answer binary, or such a type would go
+/// out as a string where the specification has an integer.
+#[test]
+fn the_codec_reports_itself_binary() {
+    #[derive(Debug, PartialEq)]
+    struct Asks;
+
+    impl Serialize for Asks {
+        fn serialize<S: serde::Serializer>(
+            &self,
+            s: S,
+        ) -> Result<S::Ok, S::Error> {
+            assert!(!s.is_human_readable());
+            s.serialize_u32(0)
+        }
+    }
+
+    impl<'de> Deserialize<'de> for Asks {
+        fn deserialize<D: serde::Deserializer<'de>>(
+            d: D,
+        ) -> Result<Self, D::Error> {
+            assert!(!d.is_human_readable());
+            u32::deserialize(d)?;
+            Ok(Asks)
+        }
+    }
+
+    assert_eq!(to_bytes(&Asks).unwrap(), [0, 0, 0, 0]);
+    assert_eq!(from_bytes::<Asks>(&[0, 0, 0, 0]).unwrap(), Asks);
 }
 
 // --- sizing --------------------------------------------------------------
