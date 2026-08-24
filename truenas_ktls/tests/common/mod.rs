@@ -73,6 +73,26 @@ pub fn connect(stream: TcpStream, sni: Option<&str>) -> SslStream<TcpStream> {
     config.connect(sni.unwrap_or("unnamed"), stream).unwrap()
 }
 
+/// As [`connect`], capped at TLS 1.2 - the version the zero-copy
+/// receive option does not apply to.
+pub fn connect_tls12(
+    stream: TcpStream,
+    sni: Option<&str>,
+) -> SslStream<TcpStream> {
+    let mut builder = SslConnector::builder(SslMethod::tls_client()).unwrap();
+    builder.set_verify(SslVerifyMode::NONE);
+    builder
+        .set_max_proto_version(Some(openssl::ssl::SslVersion::TLS1_2))
+        .unwrap();
+    let connector = builder.build();
+    let mut config = connector.configure().unwrap();
+    config.set_verify_hostname(false);
+    if sni.is_none() {
+        config.set_use_server_name_indication(false);
+    }
+    config.connect(sni.unwrap_or("unnamed"), stream).unwrap()
+}
+
 /// The subject common name of the certificate the server presented.
 pub fn peer_cn(stream: &SslStream<TcpStream>) -> String {
     let cert = stream.ssl().peer_certificate().unwrap();

@@ -11,7 +11,7 @@ mod common;
 
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::os::fd::AsFd;
+use std::os::fd::{AsFd, AsRawFd};
 use std::time::Duration;
 use truenas_ktls::{Acceptor, Error};
 
@@ -186,6 +186,8 @@ fn an_accepted_socket_carries_kernel_crypto() {
     assert_eq!(handshake.version, "TLSv1.3");
     assert!(!handshake.cipher.is_empty());
     assert_eq!(handshake.server_name.as_deref(), Some("named"));
+    assert!(handshake.rx_no_pad, "1.3 defaults to zero-copy receive");
+    assert_eq!(read_rx_no_pad(conn.as_raw_fd()), Ok(1), "kernel agrees");
 
     // Plain I/O on the socket: the kernel wraps and unwraps the records.
     conn.write_all(b"from the kernel").unwrap();
@@ -201,6 +203,75 @@ fn an_accepted_socket_carries_kernel_crypto() {
     let (conn, _) = listener.accept().unwrap();
     let handshake = acceptor.accept(conn.as_fd()).unwrap();
     assert_eq!(handshake.server_name, None);
+    client.join().unwrap();
+}
+
+/// The kernel's own record of `TLS_RX_EXPECT_NO_PAD` on `fd`, or the
+/// errno refusing to answer - which is the answer on a version the
+/// option does not exist for.
+#[allow(unsafe_code)]
+fn read_rx_no_pad(fd: std::os::fd::RawFd) -> Result<u32, i32> {
+    let mut val: u32 = 0;
+    let mut len = size_of::<u32>() as libc::socklen_t;
+    // SAFETY: `getsockopt` writes at most `len` bytes into `val`.
+    let rc = unsafe {
+        libc::getsockopt(
+            fd,
+            libc::SOL_TLS,
+            libc::TLS_RX_EXPECT_NO_PAD,
+            (&raw mut val).cast(),
+            &mut len,
+        )
+    };
+    if rc == 0 {
+        Ok(val)
+    } else {
+        Err(std::io::Error::last_os_error().raw_os_error().unwrap_or(0))
+    }
+}
+
+/// Declining the option must leave the kernel's setting off: the
+/// acceptor's builder is the one switch, and the readback is how a
+/// deployment verifies which side of it a connection landed on.
+#[test]
+fn zero_copy_receive_can_be_declined() {
+    let Some(()) = common::engaged() else { return };
+    let dir = tempfile::tempdir().unwrap();
+    let (acceptor, listener) = rig(dir.path(), "no-pad-off");
+    let acceptor = acceptor.without_rx_no_pad();
+    let addr = listener.local_addr().unwrap();
+
+    let client = std::thread::spawn(move || {
+        common::connect(TcpStream::connect(addr).unwrap(), None);
+    });
+    let (conn, _) = listener.accept().unwrap();
+    let handshake = acceptor.accept(conn.as_fd()).unwrap();
+    assert_eq!(handshake.version, "TLSv1.3");
+    assert!(!handshake.rx_no_pad, "declined");
+    assert_eq!(read_rx_no_pad(conn.as_raw_fd()), Ok(0), "kernel agrees");
+    client.join().unwrap();
+}
+
+/// TLS 1.2 takes no request - it is zero-copy capable as negotiated,
+/// and the kernel refuses the option outright on it - so the accept
+/// must skip the install rather than fail the handshake, and report
+/// the field false.
+#[test]
+fn tls12_skips_the_option_and_still_engages() {
+    let Some(()) = common::engaged() else { return };
+    let dir = tempfile::tempdir().unwrap();
+    let (acceptor, listener) = rig(dir.path(), "old-proto");
+    let addr = listener.local_addr().unwrap();
+
+    let client = std::thread::spawn(move || {
+        common::connect_tls12(TcpStream::connect(addr).unwrap(), None);
+    });
+    let (conn, _) = listener.accept().unwrap();
+    let handshake = acceptor.accept(conn.as_fd()).unwrap();
+    assert_eq!(handshake.version, "TLSv1.2");
+    assert!(!handshake.rx_no_pad, "nothing to request on 1.2");
+    // The option does not exist for this version; the kernel says so.
+    assert_eq!(read_rx_no_pad(conn.as_raw_fd()), Err(libc::EINVAL));
     client.join().unwrap();
 }
 
