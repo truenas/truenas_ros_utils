@@ -22,7 +22,7 @@ rust-version.workspace = true
 [dependencies]
 # `SOL_TLS`/`TLS_TX`/`TLS_RX` and `getsockopt`, for verifying the kernel's
 # crypto state on the socket.
-libc = "0.2.155"
+libc = "0.2.186"
 # Context construction and the handshake, over the system libssl.
 openssl = "0.10"
 # The socket-BIO calls the `openssl` crate does not wrap: the handshake must

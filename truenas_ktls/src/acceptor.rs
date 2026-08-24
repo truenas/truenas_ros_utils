@@ -43,6 +43,7 @@ const SSL_R_UNEXPECTED_EOF: c_int = 294;
 #[derive(Clone)]
 pub struct Acceptor {
     inner: SslAcceptor,
+    rx_no_pad: bool,
 }
 
 impl fmt::Debug for Acceptor {
@@ -58,6 +59,12 @@ impl fmt::Debug for Acceptor {
 pub struct Handshake {
     /// The negotiated protocol version, e.g. `"TLSv1.3"`.
     pub version: String,
+    /// Whether `TLS_RX_EXPECT_NO_PAD` was installed: receive-side
+    /// decryption may land directly in the reader's buffers. `false` on
+    /// TLS 1.2 - which needs no request to be zero-copy capable - and
+    /// when the acceptor declined it
+    /// ([`without_rx_no_pad`](Acceptor::without_rx_no_pad)).
+    pub rx_no_pad: bool,
     /// The negotiated cipher suite's name.
     pub cipher: String,
     /// The server name the client sent, when it sent one.
@@ -90,7 +97,24 @@ impl Acceptor {
         builder.set_options(SslOptions::from_bits_retain(SSL_OP_ENABLE_KTLS));
         Ok(Acceptor {
             inner: builder.build(),
+            rx_no_pad: true,
         })
+    }
+
+    /// Accept without requesting opportunistic zero-copy receive.
+    ///
+    /// By default a TLS 1.3 connection gets `TLS_RX_EXPECT_NO_PAD` set
+    /// after engagement, which lets the kernel decrypt records straight
+    /// into the caller's buffers when they carry no padding
+    /// (`tls_update_rx_zc_capable`, `net/tls/tls_sw.c`). The setting is
+    /// opportunistic - a padded record decrypts through the ordinary
+    /// path and is counted, never corrupted - so declining it is only
+    /// for a deployment that expects padding peers and wants the
+    /// per-record fallback accounting off its counters.
+    #[must_use]
+    pub fn without_rx_no_pad(mut self) -> Acceptor {
+        self.rx_no_pad = false;
+        self
     }
 
     /// Run the server handshake on a connected socket and hand the
@@ -142,13 +166,25 @@ impl Acceptor {
             return Err(classify(code, errno, &stack));
         }
         confirm_engaged(raw)?;
+        let version = ssl.version_str().to_owned();
+        // TLS 1.3 only: the kernel refuses the option on any other
+        // version (`do_tls_setsockopt_no_pad`, `net/tls/tls_main.c`),
+        // and 1.2 needs no request - it is zero-copy capable as
+        // negotiated (`tls_update_rx_zc_capable`, `net/tls/tls_sw.c`).
+        // After `confirm_engaged`, so the RX state the option requires
+        // is a fact, not a request.
+        let rx_no_pad = self.rx_no_pad && version == "TLSv1.3";
+        if rx_no_pad {
+            install_rx_no_pad(raw)?;
+        }
         Ok(Handshake {
-            version: ssl.version_str().to_owned(),
+            version,
             cipher: ssl
                 .current_cipher()
                 .map(|cipher| cipher.name().to_owned())
                 .unwrap_or_default(),
             server_name: ssl.servername(NameType::HOST_NAME).map(str::to_owned),
+            rx_no_pad,
         })
     }
 }
@@ -225,6 +261,50 @@ fn classify(code: c_int, errno: i32, stack: &ErrorStack) -> Error {
             }
         }
     }
+}
+
+/// Request opportunistic zero-copy receive, and read the setting back:
+/// the option alone is a request, the readback is the fact. Runs only
+/// on a TLS 1.3 socket whose RX state is already confirmed, which
+/// excludes every refusal the kernel documents for the option, so a
+/// failure here is drift worth surfacing rather than absorbing.
+fn install_rx_no_pad(fd: RawFd) -> Result<()> {
+    let val: u32 = 1;
+    // SAFETY: `setsockopt` reads exactly `optlen` bytes from `val`.
+    let rc = unsafe {
+        libc::setsockopt(
+            fd,
+            libc::SOL_TLS,
+            libc::TLS_RX_EXPECT_NO_PAD,
+            (&raw const val).cast(),
+            size_of::<u32>() as libc::socklen_t,
+        )
+    };
+    if rc != 0 {
+        return Err(Error::Io {
+            op: "setsockopt(TLS_RX_EXPECT_NO_PAD)",
+            errno: io::Error::last_os_error().raw_os_error().unwrap_or(0),
+        });
+    }
+    let mut back: u32 = 0;
+    let mut len = size_of::<u32>() as libc::socklen_t;
+    // SAFETY: `getsockopt` writes at most `len` bytes into `back`.
+    let rc = unsafe {
+        libc::getsockopt(
+            fd,
+            libc::SOL_TLS,
+            libc::TLS_RX_EXPECT_NO_PAD,
+            (&raw mut back).cast(),
+            &mut len,
+        )
+    };
+    if rc != 0 || back != 1 {
+        return Err(Error::Io {
+            op: "getsockopt(TLS_RX_EXPECT_NO_PAD)",
+            errno: io::Error::last_os_error().raw_os_error().unwrap_or(0),
+        });
+    }
+    Ok(())
 }
 
 /// Refuse unless the kernel holds TLS crypto state for both directions

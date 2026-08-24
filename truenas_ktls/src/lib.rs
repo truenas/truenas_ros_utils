@@ -36,6 +36,15 @@
 //! [`Error::NonBlocking`] before the handshake starts. One handshake
 //! per connection.
 //!
+//! # Zero-copy receive
+//!
+//! On TLS 1.3 the accept also sets `TLS_RX_EXPECT_NO_PAD`, letting the
+//! kernel decrypt records directly into the reader's buffers when they
+//! carry no padding; a padded record decrypts through the ordinary path
+//! and is counted, never corrupted. TLS 1.2 needs no request and gets
+//! none. [`Handshake::rx_no_pad`] reports what was installed, and
+//! [`Acceptor::without_rx_no_pad`] declines it.
+//!
 //! # Rotation
 //!
 //! [`Acceptor`] is `Clone + Send + Sync` over a reference-counted
