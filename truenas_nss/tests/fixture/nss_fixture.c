@@ -22,6 +22,10 @@
  *                                  *errnop ERANGE, however large the
  *                                  buffer — a backend that never stops
  *                                  asking for more
+ *   -DNSS_FIXTURE_SUCCESS_UNFILLED=1  the four lookups return SUCCESS
+ *                                  without writing the caller's entry
+ *                                  struct, which the ABI requires them to
+ *                                  fill
  *   -DNSS_FIXTURE_ENT_BARE_TRYAGAIN=n  the nth get*ent_r call returns
  *                                  TRYAGAIN and leaves *errnop alone,
  *                                  reporting through the thread's errno
@@ -302,6 +306,18 @@ insatiable(void)
 #endif
 }
 
+/* Returns 1 when every lookup should report success without writing the
+ * entry — the ABI break a caller cannot detect from the status alone. */
+static int
+success_unfilled(void)
+{
+#if defined(NSS_FIXTURE_SUCCESS_UNFILLED)
+	return 1;
+#else
+	return 0;
+#endif
+}
+
 /* --- passwd -------------------------------------------------------------- */
 
 enum nss_status
@@ -312,6 +328,8 @@ FN(getpwnam_r)(const char *name, struct passwd *result, char *buffer,
 	size_t i;
 
 	FN(fixture_lookup_calls)++;
+	if (success_unfilled())
+		return NSS_STATUS_SUCCESS;
 	if (insatiable()) {
 		*errnop = ERANGE;
 		return NSS_STATUS_TRYAGAIN;
@@ -338,6 +356,8 @@ FN(getpwuid_r)(uid_t uid, struct passwd *result, char *buffer,
 	size_t i;
 
 	FN(fixture_lookup_calls)++;
+	if (success_unfilled())
+		return NSS_STATUS_SUCCESS;
 	if (m != MODE_OK)
 		return mode_result(m, errnop);
 	for (i = 0; i < ARRAY_SIZE(users); i++) {
@@ -447,6 +467,8 @@ FN(getgrnam_r)(const char *name, struct group *result, char *buffer,
 	size_t i;
 
 	FN(fixture_lookup_calls)++;
+	if (success_unfilled())
+		return NSS_STATUS_SUCCESS;
 	if (m != MODE_OK)
 		return mode_result(m, errnop);
 	for (i = 0; i < ARRAY_SIZE(groups); i++) {
@@ -465,6 +487,8 @@ FN(getgrgid_r)(gid_t gid, struct group *result, char *buffer,
 	size_t i;
 
 	FN(fixture_lookup_calls)++;
+	if (success_unfilled())
+		return NSS_STATUS_SUCCESS;
 	if (m != MODE_OK)
 		return mode_result(m, errnop);
 	for (i = 0; i < ARRAY_SIZE(groups); i++) {

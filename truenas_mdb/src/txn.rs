@@ -67,7 +67,12 @@ fn claim(env: usize) -> Result<()> {
 /// neither `Send` nor `Sync`: a guard is always dropped on the thread that
 /// claimed the slot, so this never touches another thread's list.
 fn release(env: usize) {
-    ACTIVE.with_borrow_mut(|active| {
+    // `try_with`, because a guard held in thread-local storage is dropped
+    // during this thread's teardown, when the list may already be gone.
+    // Nothing can claim a slot on a dying thread, so having no list to
+    // update is the same as an empty one.
+    let _ = ACTIVE.try_with(|active| {
+        let mut active = active.borrow_mut();
         if let Some(i) = active.iter().rposition(|e| *e == env) {
             active.swap_remove(i);
         }

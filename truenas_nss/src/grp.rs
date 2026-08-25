@@ -48,9 +48,8 @@ impl Group {
 ///
 /// # Safety
 ///
-/// `gr` was filled by a successful service call: its string pointers are
-/// null or NUL-terminated and live, and `gr_mem` is null or a
-/// null-terminated array of such pointers.
+/// `gr`'s string pointers are null or NUL-terminated and live, and
+/// `gr_mem` is null or a null-terminated array of such pointers.
 unsafe fn extract_group(gr: &libc::group, source: Source) -> Result<Group> {
     // `gr_passwd` is deliberately never read; see [`Group`].
     let mut members = Vec::new();
@@ -221,9 +220,13 @@ pub fn getgrgid(gid: u32) -> Result<Option<Group>> {
 /// order. Membership is additive, so this is a union of all three modules
 /// — not the first-hit walk of the entry lookups — under the same skip
 /// rule: a module reporting unavailable contributes nothing, and any other
-/// failure, a module that cannot be loaded included, propagates. A partial
-/// union must not pass for a whole one: supplementary groups both grant
-/// and, where a group carries a deny, withhold.
+/// failure, a module that cannot be loaded included, propagates.
+///
+/// A skipped module is indistinguishable here from one with no memberships
+/// to add, so the union covers whichever modules could answer rather than
+/// all three. A caller whose decision turns on a group being absent asks
+/// that module directly with [`Source::getgrouplist`], which reports its
+/// unavailability as an error.
 pub fn getgrouplist(name: &str, gid: u32) -> Result<Vec<u32>> {
     service::fan_out_groups(gid, |source| {
         source.service()?.grouplist_raw(name, gid)

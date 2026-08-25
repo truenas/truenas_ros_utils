@@ -275,8 +275,10 @@ pub(crate) unsafe extern "C" fn trampoline(
     resp: *mut *mut ffi::pam_response,
     appdata: *mut c_void,
 ) -> c_int {
-    // Nothing here can be reported anywhere: there is no slot to record it in
-    // and no handle to raise it on.
+    // Neither the message array nor the out-parameter is optional, and a null
+    // `appdata` leaves no slot. Neither of these two returns records a
+    // failure: no round reached the conversation, and the return code is
+    // what carries the refusal.
     if appdata.is_null() || msg.is_null() || resp.is_null() {
         return ffi::PAM_CONV_ERR;
     }
@@ -343,10 +345,16 @@ pub(crate) unsafe extern "C" fn trampoline(
         }
         Ok(Err(e)) => {
             slot.fail(Failure::Err(e));
+            // Nulled rather than left alone: a module that reads `resp`
+            // after a refusal finds nothing to free.
+            // SAFETY: a valid out-parameter.
+            unsafe { *resp = ptr::null_mut() };
             ffi::PAM_CONV_ERR
         }
         Err(payload) => {
             slot.fail(Failure::Panic(payload));
+            // SAFETY: as above.
+            unsafe { *resp = ptr::null_mut() };
             ffi::PAM_CONV_ERR
         }
     }

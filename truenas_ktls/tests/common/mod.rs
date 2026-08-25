@@ -6,6 +6,8 @@
 
 // Not every case uses every helper.
 #![allow(dead_code)]
+// `SslRef::set_session` is unsafe; `resumes_tls12` is the only caller.
+#![allow(unsafe_code)]
 
 use openssl::asn1::Asn1Time;
 use openssl::bn::{BigNum, MsbOption};
@@ -13,7 +15,9 @@ use openssl::ec::{EcGroup, EcKey};
 use openssl::hash::MessageDigest;
 use openssl::nid::Nid;
 use openssl::pkey::PKey;
-use openssl::ssl::{SslConnector, SslMethod, SslStream, SslVerifyMode};
+use openssl::ssl::{
+    SslConnector, SslMethod, SslSessionRef, SslStream, SslVerifyMode,
+};
 use openssl::x509::{X509, X509NameBuilder};
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
@@ -91,6 +95,25 @@ pub fn connect_tls12(
         config.set_use_server_name_indication(false);
     }
     config.connect(sni.unwrap_or("unnamed"), stream).unwrap()
+}
+
+/// Connect at TLS 1.2 offering `session`, and report whether the server
+/// resumed from it rather than negotiating afresh.
+pub fn resumes_tls12(stream: TcpStream, session: &SslSessionRef) -> bool {
+    let mut builder = SslConnector::builder(SslMethod::tls_client()).unwrap();
+    builder.set_verify(SslVerifyMode::NONE);
+    builder
+        .set_max_proto_version(Some(openssl::ssl::SslVersion::TLS1_2))
+        .unwrap();
+    let connector = builder.build();
+    let mut config = connector.configure().unwrap();
+    config.set_verify_hostname(false);
+    config.set_use_server_name_indication(false);
+    let mut ssl = config.into_ssl("unnamed").unwrap();
+    // SAFETY: `session` came from a connection made through a context
+    // built the same way, which is what `SSL_set_session` requires.
+    unsafe { ssl.set_session(session) }.unwrap();
+    ssl.connect(stream).unwrap().ssl().session_reused()
 }
 
 /// The subject common name of the certificate the server presented.

@@ -247,6 +247,15 @@ impl std::fmt::Debug for Builder {
 ///
 /// Ended when it drops, reporting the status of the last operation to every
 /// module's cleanup handler.
+///
+/// A transaction moves between threads — [`Stepped`](crate::Stepped) drives
+/// one on a worker — but libpam does no locking over a handle, so one is
+/// held by a single thread at a time and never shared:
+///
+/// ```compile_fail,E0277
+/// fn assert_sync<T: Sync>() {}
+/// assert_sync::<truenas_pam::Transaction>();
+/// ```
 pub struct Transaction {
     hdl: *mut pam_handle_t,
     /// The `appdata_ptr` libpam captured. Owned here; see the module note.
@@ -255,10 +264,11 @@ pub struct Transaction {
     last: c_int,
 }
 
-// SAFETY: the handle is owned exclusively — every operation takes `&mut self`
-// and it is never exposed — so at most one thread uses it at a time whichever
-// thread that is. libpam keeps no per-thread state for a handle. Not `Sync`:
-// there is no shared use of one to make sound.
+// SAFETY: at most one thread reaches a handle at a time, whichever thread that
+// is. `Transaction` is not `Sync` — its fields are raw pointers and only
+// `Send` is lifted here — so a shared reference to one cannot cross a thread
+// boundary, and the fields themselves are private, so neither can a copy of
+// the handle. libpam keeps no per-thread state for a handle.
 unsafe impl Send for Transaction {}
 
 impl Transaction {

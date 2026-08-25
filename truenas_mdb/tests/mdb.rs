@@ -767,6 +767,38 @@ fn other_threads_are_unaffected() {
     assert_eq!(db.len().unwrap(), 10, "...but the writes all landed");
 }
 
+/// An `Iter` is neither `Send` nor `Sync`, so thread-local storage is where a
+/// caller keeps one across calls. The slot it holds must still be released
+/// when that storage is torn down, on a thread whose own tables are already
+/// going away: the release runs in a drop, and a panic there aborts the
+/// process.
+#[test]
+fn an_iterator_in_thread_local_storage_releases_on_thread_exit() {
+    use std::cell::RefCell;
+
+    thread_local! {
+        /// Registered for destruction before the thread's first transaction,
+        /// so it is torn down after the crate's own thread-local bookkeeping.
+        static PARKED: RefCell<Option<Iter>> = const { RefCell::new(None) };
+    }
+
+    let (_dir, _env, db) = ordered();
+    let parker = std::thread::spawn({
+        let db = db.clone();
+        move || {
+            PARKED.with(|parked| assert!(parked.borrow().is_none()));
+            let mut iter = db.iter().unwrap();
+            iter.next().unwrap().unwrap();
+            PARKED.with(|parked| *parked.borrow_mut() = Some(iter));
+        }
+    });
+    assert!(parker.join().is_ok());
+
+    // The parked transaction was aborted during teardown, so the reader slot
+    // and the environment came back and this thread still reads.
+    assert_eq!(drain(db.iter().unwrap()).len(), 6);
+}
+
 // --- errors --------------------------------------------------------------
 
 #[test]
