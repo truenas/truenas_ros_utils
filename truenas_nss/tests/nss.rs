@@ -119,6 +119,25 @@ fn an_insatiable_backend_is_refused_at_the_ceiling() {
     assert_eq!(after - before, 15);
 }
 
+/// A module that reports success without filling the entry must be
+/// refused. The entry is zeroed before the call, so every field reads
+/// back null and the missing name settles it.
+#[test]
+fn success_without_an_entry_is_refused() {
+    let Some((_dir, path)) =
+        fixture("hollow", &["NSS_FIXTURE_SUCCESS_UNFILLED=1"])
+    else {
+        return;
+    };
+    let svc =
+        Service::open(&path, "hollow", EntScope::Process, Source::Sss).unwrap();
+
+    assert_eq!(svc.getpwnam("alice"), Err(Error::NullName));
+    assert_eq!(svc.getpwuid(1000), Err(Error::NullName));
+    assert_eq!(svc.getgrnam("first"), Err(Error::NullName));
+    assert_eq!(svc.getgrgid(2000), Err(Error::NullName));
+}
+
 /// The classification contract: TRYAGAIN with an errno is that errno;
 /// UNAVAIL without one is the status-only error the fan-out skips;
 /// NOTFOUND is a clean miss.

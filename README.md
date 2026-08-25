@@ -80,13 +80,17 @@ To run the suites under valgrind, as CI does:
 ```sh
 CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER="valgrind --error-exitcode=99 \
     --leak-check=full --errors-for-leak-kinds=definite --keep-debuginfo=yes \
-    --quiet" \
+    --quiet --trace-children=yes --trace-children-skip=*/cc,*/python3*" \
     cargo test --workspace
 ```
 
 `--keep-debuginfo=yes` is for `truenas_pam`: libpam loads each module with
 `dlopen(3)` and unloads it at the end of the transaction, and without this a
 report from inside one has no symbols left to name.
+
+`--trace-children=yes` is for `truenas_nss`: its fan-out suite drives the
+module registry only in a re-executed child. `cc` and `python3` are skipped —
+they are not under test and are not memcheck-clean.
 
 ## License
 

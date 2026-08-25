@@ -20,8 +20,9 @@ use truenas_pam::{
 // --- types ---------------------------------------------------------------
 
 /// A transaction is moved onto a worker thread to be driven step by step, so
-/// it must be `Send`. It must not be `Sync`: libpam does no locking, so two
-/// threads in one handle would corrupt it.
+/// it must be `Send`, and the errors it reports must be shareable. That it is
+/// not `Sync` — libpam does no locking over a handle — is held by a
+/// `compile_fail` doctest on `Transaction` itself.
 #[test]
 fn a_transaction_is_send_and_errors_are_shareable() {
     fn assert_send<T: Send>() {}

@@ -96,8 +96,8 @@ socket carry the connection.
 an elapsed timeout is `Error::Stalled`. An `Acceptor` is `Clone` over a
 reference-counted context, so certificate rotation is building a new one
 and swapping which the caller uses — an in-flight handshake keeps its own
-context alive. Session tickets are disabled: nothing retains the state
-resumption would need.
+context alive. Resumption is refused on every path the negotiated version
+can offer, so nothing retains the state it would need.
 
 [`tests/ktls.rs`](truenas_ktls/tests/ktls.rs) generates certificate
 material in-process and drives accepts against a userspace TLS client
@@ -120,6 +120,10 @@ deadlock on the writer mutex or fail with `MDB_BAD_RSLOT`.
 
 One environment per path per process, reference counted through the pool in
 [`src/env.rs`](truenas_mdb/src/env.rs).
+
+An environment directory is trusted like the process's own memory: LMDB
+dereferences the mapped pages and a value's length is data on them, so only an
+environment this process controls may be opened.
 
 Values are stored byte for byte. No header, envelope, or encoding is added, so
 another reader of the database sees what was written. `EnvFlags` exposes
@@ -161,8 +165,9 @@ other status is not a request for a larger buffer.
 `getgrouplist` drives `_nss_<module>_initgroups_dyn`, the only path to a
 directory user's full membership: sssd and winbind compute the closure
 server-side and do not enumerate. Membership is additive, so its fan-out is
-a union of all three modules under the lookup fan-out's skip rule — a
-partial union is a wrong answer, not a smaller one. The gid array is
+a union of all three modules under the lookup fan-out's skip rule: a
+skipped module is indistinguishable from one with no memberships to add,
+so the union covers whichever modules could answer. The gid array is
 `malloc`-owned because the module grows it with `realloc`, and the limit is
 passed unbounded: a module at a positive limit truncates the list and still
 reports success, so a ceiling belongs to the caller, where exceeding it is

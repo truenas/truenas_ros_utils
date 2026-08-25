@@ -17,6 +17,7 @@ use foreign_types::ForeignType;
 use openssl::error::ErrorStack;
 use openssl::ssl::{
     NameType, Ssl, SslAcceptor, SslFiletype, SslMethod, SslOptions,
+    SslSessionCacheMode,
 };
 use std::os::fd::{AsRawFd, BorrowedFd, RawFd};
 use std::os::raw::c_int;
@@ -77,8 +78,9 @@ impl Acceptor {
     /// The context asks libssl to install kernel TLS when a handshake
     /// completes; [`accept`](Acceptor::accept) verifies per connection
     /// that it did. The key must match the certificate, checked at
-    /// construction. Session tickets are disabled: nothing retains the
-    /// session state resumption would need.
+    /// construction. Resumption is refused on every path the negotiated
+    /// version can offer, so nothing retains the session state it would
+    /// need.
     pub fn from_pem_files(
         cert_chain: impl AsRef<Path>,
         key: impl AsRef<Path>,
@@ -93,8 +95,15 @@ impl Acceptor {
             .set_private_key_file(key.as_ref(), SslFiletype::PEM)
             .map_err(setup)?;
         builder.check_private_key().map_err(setup)?;
+        // One call per resumption path: `num_tickets` covers the TLS 1.3
+        // ticket, `NO_TICKET` the TLS 1.2 stateless one, and the cache mode
+        // the TLS 1.2 session ID.
         builder.set_num_tickets(0).map_err(setup)?;
-        builder.set_options(SslOptions::from_bits_retain(SSL_OP_ENABLE_KTLS));
+        builder.set_session_cache_mode(SslSessionCacheMode::OFF);
+        builder.set_options(
+            SslOptions::NO_TICKET
+                | SslOptions::from_bits_retain(SSL_OP_ENABLE_KTLS),
+        );
         Ok(Acceptor {
             inner: builder.build(),
             rx_no_pad: true,

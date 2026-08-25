@@ -51,8 +51,8 @@ impl Passwd {
 ///
 /// # Safety
 ///
-/// `pw` was filled by a successful service call, and every pointer in it
-/// is null or a NUL-terminated string live for this call.
+/// Every pointer in `pw` is null or a NUL-terminated string live for this
+/// call.
 unsafe fn extract_passwd(pw: &libc::passwd, source: Source) -> Result<Passwd> {
     // `pw_passwd` is deliberately never read; see [`Passwd`].
     Ok(Passwd {

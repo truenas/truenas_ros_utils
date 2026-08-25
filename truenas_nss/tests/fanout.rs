@@ -10,8 +10,9 @@
 //! loaded, covers the walk over a module that is not there. The loader
 //! reads `LD_LIBRARY_PATH` at process start, which is why the cases need a
 //! child at all. A case reads its fixtures' counters back, so a child that
-//! reached the host's own modules cannot pass. The children escape
-//! CI's valgrind runner; the identical FFI paths run under it in-process
+//! reached the host's own modules cannot pass. The memcheck lane follows
+//! the children (`--trace-children=yes`, with the fixture compiler
+//! skipped), so these paths run under it here as well as in-process
 //! through the `nss` suite.
 
 mod common;
@@ -258,9 +259,10 @@ fn child_getgrouplist_skips_unavail() {
     assert_eq!(gids, [9000, 5000, 5001, 5002]);
 }
 
-/// SSS cannot be loaded: the union must stop and surface that. A partial
-/// union is not a smaller answer but a wrong one — a missing module's
-/// groups both grant and, where one carries a deny, withhold.
+/// SSS cannot be loaded: the union must stop and surface that. Only a
+/// module's own UNAVAIL is skippable — a load failure is this crate's, and
+/// swallowing it would leave the shortfall in the answer with nothing to
+/// mark it.
 #[test]
 #[ignore = "child case, run by fan_out_matrix"]
 fn child_getgrouplist_load_failure_propagates() {

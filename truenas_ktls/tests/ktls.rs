@@ -275,6 +275,33 @@ fn tls12_skips_the_option_and_still_engages() {
     client.join().unwrap();
 }
 
+/// A second TLS 1.2 connection offering the first's session must
+/// negotiate afresh. Both of that version's resumption paths — the
+/// stateless ticket and the server's session cache — would otherwise
+/// carry one connection's master secret into the next, under a key the
+/// acceptor mints once and never rotates.
+#[test]
+fn tls12_refuses_to_resume() {
+    let Some(()) = common::engaged() else { return };
+    let dir = tempfile::tempdir().unwrap();
+    let (acceptor, listener) = rig(dir.path(), "no-resume");
+    let addr = listener.local_addr().unwrap();
+
+    // Both connections run on one thread: `SslSession` is `!Send`.
+    let client = std::thread::spawn(move || {
+        let first =
+            common::connect_tls12(TcpStream::connect(addr).unwrap(), None);
+        let session = first.ssl().session().unwrap().to_owned();
+        common::resumes_tls12(TcpStream::connect(addr).unwrap(), &session)
+    });
+    for _ in 0..2 {
+        let (conn, _) = listener.accept().unwrap();
+        let handshake = acceptor.accept(conn.as_fd()).unwrap();
+        assert_eq!(handshake.version, "TLSv1.2");
+    }
+    assert!(!client.join().unwrap(), "the server resumed the session");
+}
+
 /// Rotation is a swap of acceptors, and clones share a context by
 /// reference: connections accepted through a clone present the same
 /// certificate after the original is dropped, and a second acceptor

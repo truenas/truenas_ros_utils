@@ -357,9 +357,13 @@ impl Stepped {
     /// the stack to come back to the conversation. The transaction is returned
     /// however it ended, so its [`messages`](Transaction::messages) can still
     /// be read.
+    ///
+    /// `Ok` here says the transaction came back, and nothing about how the
+    /// stack ruled: the verdict is what [`wait`](Self::wait) and
+    /// [`respond`](Self::respond) report.
     pub fn finish(mut self) -> Result<Transaction> {
-        // The transaction is returned whatever the result was: that has
-        // already been reported, and the record has not.
+        // The transaction comes back whatever the outcome was; the outcome
+        // itself stands in only when there is no transaction to return.
         let outcome = self.reap();
         match self.done.take() {
             Some(txn) => Ok(txn),

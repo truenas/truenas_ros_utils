@@ -128,16 +128,22 @@ impl Authenticator {
     /// wanted nothing. A refusal leaves the stage at [`Stage::Failed`], from
     /// where this may be called again to try afresh — against the same
     /// service, since a transaction is bound to one. The one failure that
-    /// cannot be retried in place is a timed-out round, whose transaction
-    /// is still on the worker; see [`timeout`](Self::timeout).
+    /// cannot be retried in place is a timed-out round, whose transaction is
+    /// still on the worker: that is [`Error::OutOfSequence`], and
+    /// [`into_transaction`](Self::into_transaction) recovers it; see
+    /// [`timeout`](Self::timeout).
     pub fn begin(&mut self) -> Result<Step> {
         if !matches!(self.stage, Stage::Start | Stage::Failed) {
             return Err(Error::OutOfSequence);
         }
-        let Held::Transaction(txn) =
-            mem::replace(&mut self.held, Held::Nothing)
-        else {
-            return Err(Error::OutOfSequence);
+        // Anything else goes back where it was: a refusal consumes nothing,
+        // so a timed-out round keeps the exchange holding its transaction.
+        let txn = match mem::replace(&mut self.held, Held::Nothing) {
+            Held::Transaction(txn) => txn,
+            held => {
+                self.held = held;
+                return Err(Error::OutOfSequence);
+            }
         };
         match Stepped::begin_recover(txn, self.flags) {
             Ok(exchange) => {

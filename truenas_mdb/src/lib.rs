@@ -92,6 +92,14 @@
 //!   a statically bundled copy must not be loaded alongside the system
 //!   library. [`version`] reports which one this process linked.
 //!
+//! # Trusting the environment directory
+//!
+//! An environment directory and its files are trusted like the process's own
+//! memory: LMDB dereferences the mapped pages directly, and a value's length
+//! is data on them. Open only an environment this process controls. The
+//! [`EnvOptions`] defaults create the directory `0o700` and its files
+//! `0o600`, both before `umask`.
+//!
 //! # Requirements
 //!
 //! `liblmdb-dev` to build, `liblmdb0` to run. Checked against 0.9.31.

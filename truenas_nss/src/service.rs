@@ -454,8 +454,8 @@ pub(crate) fn grow_and_call(
             return (status, errno);
         }
         // A fresh allocation, not a copy: the module rewrites the whole
-        // result on the retry.
-        *buf = vec![0; buf.len() * 2];
+        // result on the retry. An empty buffer doubles from one.
+        *buf = vec![0; buf.len().max(1) * 2];
     }
 }
 
@@ -493,13 +493,17 @@ pub(crate) fn classify_lookup(
 /// lookups. `raw` makes the service call with the entry struct, buffer,
 /// and errno slot; `extract` runs only on a module-initialised entry
 /// whose aliased buffer is still live — its safety contract.
+///
+/// `C` is an entry struct that is valid all-zero. The entry is zeroed
+/// before the call, so a module that reports success without filling it
+/// yields null fields, which [`name_field`] refuses.
 pub(crate) fn lookup_entry<C, T>(
     svc: &Service,
     op: &'static str,
     mut raw: impl FnMut(*mut C, *mut c_char, libc::size_t, *mut c_int) -> c_int,
     extract: unsafe fn(&C, Source) -> Result<T>,
 ) -> Result<Option<T>> {
-    let mut entry = MaybeUninit::<C>::uninit();
+    let mut entry = MaybeUninit::<C>::zeroed();
     let mut buf = vec![0u8; INITIAL_BUFLEN];
     let (status, errno) = grow_and_call(&mut buf, |b, len, ep| {
         raw(entry.as_mut_ptr(), b, len, ep)
@@ -507,11 +511,12 @@ pub(crate) fn lookup_entry<C, T>(
     if !classify_lookup(svc.module(), op, status, errno)? {
         return Ok(None);
     }
-    // SAFETY: a success return means the module initialised the entry;
-    // its pointers alias `buf`, which lives to the end of this function.
+    // SAFETY: the entry was zeroed above and `C` is valid all-zero, so it
+    // is initialised whatever the module did with it. Its pointers alias
+    // `buf`, which lives to the end of this function.
     let entry = unsafe { entry.assume_init_ref() };
-    // SAFETY: the entry was filled by a successful service call, which
-    // is `extract`'s contract.
+    // SAFETY: every pointer in the entry is null or an alias into `buf`,
+    // which is `extract`'s contract.
     let out = unsafe { extract(entry, svc.source()) }?;
     Ok(Some(out))
 }
@@ -649,13 +654,14 @@ pub(crate) fn call_initgroups(
         )
     };
     // Copy out and free before classifying, so every path releases the
-    // possibly-realloc-moved array exactly once. The filled count is
-    // bounded by the capacity, so a module that mis-advanced `start`
-    // cannot walk the copy past the allocation.
+    // possibly-realloc-moved array exactly once. `start` is clamped to
+    // `size` because a module may advance the one without growing the
+    // other; both are the module's own report, and the array it may
+    // have reallocated is reachable no other way.
     let filled = start.max(0).min(size.max(0)) as usize;
-    // SAFETY: `groups` has capacity for `size` entries, of which the
-    // first `filled` were written — the seed above, then the module's
-    // appends.
+    // SAFETY: `groups` holds the `size` entries the module reports, of
+    // which the first `filled` were written — the seed above, then the
+    // module's appends.
     let copied = unsafe { std::slice::from_raw_parts(groups, filled) }.to_vec();
     // SAFETY: this function's allocation, or the module's realloc of it.
     unsafe { libc::free(groups.cast()) };
@@ -686,8 +692,9 @@ pub(crate) fn dedup_gids(gids: Vec<u32>) -> Vec<u32> {
 /// seeded with `gid`. Membership is additive across modules, so every
 /// module is consulted — unlike the first-hit lookups — under the same
 /// skip rule: a module whose failure is [`unavail`](Error::is_unavail)
-/// contributes nothing, and any other error propagates. First appearance
-/// keeps its position.
+/// contributes nothing, and any other error propagates. A skipped module
+/// leaves no mark on the answer, so the union covers whichever modules
+/// could answer. First appearance keeps its position.
 pub(crate) fn fan_out_groups(
     gid: u32,
     mut lookup: impl FnMut(Source) -> Result<Vec<u32>>,
@@ -861,7 +868,7 @@ impl<C, T> Iterator for EntIter<C, T> {
         let slot = self.slot.as_ref()?;
         let svc = slot.svc;
         let f = self.getent;
-        let mut entry = MaybeUninit::<C>::uninit();
+        let mut entry = MaybeUninit::<C>::zeroed();
         let (status, errno) = grow_and_call(&mut self.buf, |b, len, ep| {
             // SAFETY: a resolved `_nss_*_get*ent_r`; every pointer is
             // live for the call.
@@ -880,11 +887,13 @@ impl<C, T> Iterator for EntIter<C, T> {
                 None
             }
             Ok(true) => {
-                // SAFETY: success initialised the entry, whose pointers
-                // alias `self.buf` — untouched since the call.
+                // SAFETY: the entry was zeroed above and `C` is valid
+                // all-zero, so it is initialised whatever the module did
+                // with it. Its pointers alias `self.buf` — untouched
+                // since the call.
                 let entry = unsafe { entry.assume_init_ref() };
-                // SAFETY: the entry was filled by a successful service
-                // call, which is `extract`'s contract.
+                // SAFETY: every pointer in the entry is null or an alias
+                // into `self.buf`, which is `extract`'s contract.
                 Some(unsafe { (self.extract)(entry, svc.source()) })
             }
         }
@@ -1057,6 +1066,28 @@ mod tests {
         assert_eq!((status, errno), (ffi::NSS_STATUS_SUCCESS, 0));
         assert_eq!(calls, 3);
         assert_eq!(buf.len(), 4096);
+    }
+
+    /// An empty buffer must still grow. Doubling zero leaves it empty, so
+    /// the retry loop would neither satisfy the module nor reach the
+    /// ceiling that ends it.
+    #[test]
+    fn grow_and_call_grows_an_empty_buffer() {
+        let mut buf = Vec::new();
+        let mut calls = 0;
+        let (status, _) = grow_and_call(&mut buf, |_, len, errnop| {
+            calls += 1;
+            if len == 0 {
+                // SAFETY: the driver passes a live out-parameter.
+                unsafe { *errnop = libc::ERANGE };
+                ffi::NSS_STATUS_TRYAGAIN
+            } else {
+                ffi::NSS_STATUS_SUCCESS
+            }
+        });
+        assert_eq!(status, ffi::NSS_STATUS_SUCCESS);
+        assert_eq!(calls, 2);
+        assert_eq!(buf.len(), 2);
     }
 
     /// `ERANGE` under a status other than `TRYAGAIN` is not a request for a

@@ -6,7 +6,7 @@ mod common;
 
 use common::{confdir, modules};
 use std::path::Path;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use truenas_pam::{
     Authenticator, Error, Flags, PamCode, Secret, Stage, Step, Stepped,
     Transaction,
@@ -140,6 +140,51 @@ fn a_step_timeout_bounds_each_round() {
     // Taking it back is the blocking step, and still recovers it once
     // the module returns.
     assert!(auth.into_transaction().is_ok());
+}
+
+/// A retry from `Stage::Failed` must refuse a timed-out round without
+/// consuming it. A refusal that took the exchange would join the worker the
+/// timeout declined to wait for, and would drop the transaction and the
+/// record of the round with it.
+#[test]
+fn a_retry_refuses_a_timed_out_round_without_consuming_it() {
+    let Some(()) = modules() else { return };
+    let dir = confdir();
+    let txn = Transaction::builder("slow-deny")
+        .user("alice")
+        .confdir(dir.path())
+        .build()
+        .unwrap();
+    let mut auth = Authenticator::new(txn).timeout(Duration::from_secs(10));
+
+    let step = auth.begin().unwrap();
+    let Step::Prompt(messages) = step else {
+        panic!("expected a prompt")
+    };
+    let answers = messages
+        .iter()
+        .map(|_| Some(Secret::from("token")))
+        .collect();
+    let mut auth = auth.timeout(Duration::from_millis(50));
+    assert_eq!(auth.respond(answers), Err(Error::Timeout));
+    assert_eq!(auth.stage(), Stage::Failed);
+
+    // The refusal returns on its own, without waiting on the module.
+    let start = Instant::now();
+    assert!(matches!(auth.begin(), Err(Error::OutOfSequence)));
+    let elapsed = start.elapsed();
+    assert!(
+        elapsed < Duration::from_millis(500),
+        "the refusal waited on the module: {elapsed:?}"
+    );
+
+    // The exchange is still held, so taking the transaction back recovers
+    // it, and with it the record of the round that timed out.
+    let txn = auth.into_transaction().unwrap();
+    assert!(
+        !txn.messages().is_empty(),
+        "the record of the round is lost"
+    );
 }
 
 /// A refusal leaves the transaction readable. A sequence that dropped it on
