@@ -9,6 +9,7 @@ other; depend on the one you need.
 
 | Crate | Contents |
 |---|---|
+| [`truenas_jsonrpc`](truenas_jsonrpc/) | JSON-RPC 2.0 for both roles, doing no I/O: framing a byte stream, reading a call or an answer, and building either |
 | [`truenas_ktls`](truenas_ktls/) | Kernel TLS for accepted sockets: the system libssl runs the handshake, the kernel carries the connection from then on |
 | [`truenas_mdb`](truenas_mdb/) | Bindings to the system LMDB (`liblmdb`): a pooled environment and a byte-oriented key/value store |
 | [`truenas_nss`](truenas_nss/) | Direct passwd, group, and group-membership lookups against the system NSS service modules (`libnss_files`, `libnss_sss`, `libnss_winbind`), bypassing `nsswitch.conf` |
@@ -26,6 +27,8 @@ other; depend on the one you need.
   newer) built with kTLS support
 - Nothing extra to build `truenas_nss`; it loads the modules a lookup names
   at run time (glibc 2.34 or newer; `libnss_files.so.2` ships in `libc6`)
+- Nothing extra to build `truenas_jsonrpc` or `truenas_xdr`; neither links a
+  C library and neither needs anything at run time
 
 Optional, for the full test suite:
 

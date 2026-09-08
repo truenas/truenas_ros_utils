@@ -80,6 +80,87 @@ When a crate implements a specification:
   for the error conventions they use. Record what they establish in the crate's
   documentation, not what they are called or where they live.
 
+## `truenas_jsonrpc`
+
+Conforms to JSON-RPC 2.0, with no dialect and nothing configurable: what §4
+admits is accepted and what §5 requires is emitted.
+[`tests/jsonrpc20.rs`](truenas_jsonrpc/tests/jsonrpc20.rs) follows the
+specification clause by clause and reproduces every worked example from its
+§7; [`tests/batch.rs`](truenas_jsonrpc/tests/batch.rs) does the same for §6,
+and [`tests/client.rs`](truenas_jsonrpc/tests/client.rs) for §4's request
+and §5's response as a client sees them. Any change to what is accepted or
+emitted is checked against the document first.
+
+Sans-io, and both roles. `frame` finds where one message ends in a stream,
+`parse` reads an inbound call, `Response` and `batch_frame` build the answer
+to one, and `Caller` with `parse_answer` make a call and read what came
+back. Nothing reads a socket, owns a runtime, spawns anything, or holds a
+connection.
+
+The crate never buffers, so it applies no ceiling to a message: a peer can
+hold `Frame::Incomplete` open indefinitely and the transport's own limit on
+a buffered message is what bounds that.
+
+`frame`'s three verdicts are what a stream transport's framer has to answer,
+and map onto `truenas_ros`'s contract one for one — `Complete(n)` to
+`Framing::Complete { header_len: 0, body_len: n }`, `Incomplete` to
+`Framing::More` or `MoreInMessage`, `Invalid` to `Framing::Invalid`. Once
+bytes of a message have been seen the answer must be `MoreInMessage`: the
+two read identically, but `More` returns the connection to the idle clock
+and disarms its receipt budget, so a peer that sends half a message and
+stops is held by nothing. A transport carrying a length prefix does not need
+`frame` at all, its own prefix framer having delimited the message already.
+
+Only an Object or an Array can be framed. §4 makes a request an Object and
+§6 makes a batch an Array, and those are also the only shapes whose end is
+knowable without the next byte — a bare Number has no end until a non-digit
+arrives. Framing finds the boundary and does not validate: a mismatched
+pair is delimited here and refused by `parse`, which reads the bytes anyway,
+so the check is not paid for twice.
+
+No method registry and no dispatch. Which methods exist, what one does, and
+how long it may run need the application, and anything long-running needs to
+own concurrency. Correlating an answer to its call is a map from `Id` to
+whatever the caller wants resumed, which only the caller knows — `Caller`
+hands back the id it minted and stops there.
+
+`params` and `result` cross the boundary as
+[`RawValue`](https://docs.rs/serde_json/latest/serde_json/value/struct.RawValue.html),
+so an inbound payload is decoded once by whoever knows its type and an
+outbound one encoded once by whoever built it. Neither is ever materialized
+as a `Value`.
+
+The three shapes §6 distinguishes are the three arms of `Incoming`. A frame
+that is neither an Object nor a non-empty Array is answered with one
+Response object. A non-empty Array is a batch whose elements are judged
+separately, so one bad element does not condemn its neighbours. A batch that
+produces no responses — every element a notification — is answered with
+nothing at all, which `batch_frame` reports as `None` rather than as an
+empty Array, and a batch answer that arrives as an empty Array is refused
+for the same reason.
+
+A refusal carries §5.1's code and message and no `data`. Why it was refused
+travels beside the error as `Reason`: §5.1 leaves `data` to the server, and
+detail naming the validation step that refused a frame describes the
+validator to whoever sent it. `ErrorObject::with_reason` attaches it, and
+doing so is a decision.
+
+An id is echoed as it arrived. §5 requires the response to carry the same
+value, so a Number keeps the `serde_json::Number` it was written as rather
+than being narrowed to an integer — narrowing would answer `1` to a request
+that asked as `1.0`. A refusal is answered against the request's own id
+wherever it could be read, and against Null only where it could not. On the
+calling side the id member is required in a response, unlike in a request
+where its absence means a notification.
+
+Outbound, §4.2 is enforced before the wire: `params` that encode to
+anything but an Array or an Object are `BuildError::ParamsNotStructured`
+rather than a frame the peer will refuse. A build that fails consumes no id,
+so a gap in the sequence cannot be mistaken for a lost call.
+
+The crate knows JSON-RPC 2.0 and nothing above it. No transport, no
+framing policy, no authentication, and no method vocabulary belongs in it.
+
 ## `truenas_ktls`
 
 Links the system libssl. Nothing in it implements TLS: the crate drives
