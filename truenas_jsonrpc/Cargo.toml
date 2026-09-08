@@ -1,0 +1,56 @@
+# SPDX-FileCopyrightText: 2026 iXsystems, Inc, DBA TrueNAS
+# SPDX-License-Identifier: MIT
+# `truenas_jsonrpc` — JSON-RPC 2.0 for both roles, doing no I/O itself.
+#
+# `serde_json`'s `raw_value` feature is required, not incidental: `params` and
+# `result` cross this layer as unparsed bytes, so the consumer decodes each
+# once into its own type and this crate never builds a `Value` for them.
+[package]
+name = "truenas_jsonrpc"
+version = "0.1.0"
+description = "Sans-io JSON-RPC 2.0: both roles, no I/O"
+categories = ["encoding", "network-programming"]
+keywords = ["jsonrpc", "rpc", "serde", "sans-io"]
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+serde = { version = "1", default-features = false, features = ["std"] }
+serde_json = { version = "1", features = ["raw_value"] }
+
+[dev-dependencies]
+# `derive` is a dev-dependency only, so the crate itself pulls no
+# `serde_derive`, while a test can still declare a fixture parameter type
+# with `#[derive(Deserialize)]`.
+serde = { version = "1", features = ["derive"] }
+
+[lints]
+workspace = true
+
+# The specification clause by clause, and every worked example from its §7.
+[[test]]
+name = "jsonrpc20"
+path = "tests/jsonrpc20.rs"
+
+# Batch framing: §6's shapes, and what a batch of notifications answers.
+[[test]]
+name = "batch"
+path = "tests/batch.rs"
+
+# The client's half: building a call, and reading the answer to one.
+[[test]]
+name = "client"
+path = "tests/client.rs"
+
+# Finding where one message ends in a stream of bytes.
+[[test]]
+name = "framing"
+path = "tests/framing.rs"
+
+# Every entry point returns Ok or Err over a hostile corpus, never a panic.
+[[test]]
+name = "robustness"
+path = "tests/robustness.rs"
