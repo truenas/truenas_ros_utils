@@ -1,0 +1,55 @@
+# SPDX-FileCopyrightText: 2026 iXsystems, Inc, DBA TrueNAS
+# SPDX-License-Identifier: MIT
+# `truenas_gssapi` — an acceptor over the system GSSAPI (`libgssapi_krb5`):
+# names, acceptor credentials from a key table, and the accept-side security
+# context loop, for SPNEGO and Kerberos.
+#
+# Links the system library because a GSSAPI exchange is only meaningful
+# against the host's Kerberos state — the keytab, `/etc/krb5.conf`, and the
+# mechanisms the mechglue carries. Build needs `libkrb5-dev`; runtime needs
+# `libgssapi-krb5-2`.
+#
+# Acceptor only: no initiator side and no per-message wrap/unwrap, which an
+# incoming Negotiate token does not need.
+[package]
+name = "truenas_gssapi"
+version = "0.1.0"
+description = "A GSSAPI acceptor over the system libgssapi_krb5: names, keytab credentials, and the accept-side context loop for SPNEGO and Kerberos"
+categories = ["authentication", "api-bindings"]
+keywords = ["gssapi", "spnego", "kerberos", "negotiate", "truenas"]
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+# The C ABI's integer types. No bindgen — the declarations are hand-written
+# in src/ffi.rs, so no libclang and nothing generated at build time.
+libc = "0.2.155"
+# Typed flag set for the context flags, matching the sibling crates.
+bitflags = "2.6"
+
+[dev-dependencies]
+tempfile = "3"
+# Builds the key tables the acceptor suites accept against, and acquires
+# the client tickets the live loop initiates with.
+truenas_krb5 = { path = "../truenas_krb5" }
+
+[lints]
+workspace = true
+
+# Behavioral tests: names, OIDs, error classification, and the acceptor
+# against tokens no KDC is needed for. Hermetic: every case re-executes
+# with a generated Kerberos configuration.
+[[test]]
+name = "gssapi"
+path = "tests/gssapi.rs"
+
+# The real exchange: a throwaway KDC, a client ticket, and a raw-FFI
+# initiator driving this crate's acceptor over SPNEGO and Kerberos. Skips
+# when the MIT KDC tools are not installed; set TRUENAS_GSSAPI_REQUIRE_KDC=1
+# (as CI does on hosts that carry them) to make that a hard failure.
+[[test]]
+name = "negotiate"
+path = "tests/negotiate.rs"

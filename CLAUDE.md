@@ -80,6 +80,102 @@ When a crate implements a specification:
   for the error conventions they use. Record what they establish in the crate's
   documentation, not what they are called or where they live.
 
+## `truenas_krb5`
+
+Links the system MIT `libkrb5` (and `libk5crypto`, where
+`krb5_c_string_to_key` lives). Kerberos state is host state — `krb5.conf`,
+key tables, credential caches — shared with every other consumer, and one
+implementation must interpret it, so there is nothing to vendor.
+
+Every handle owns its `krb5_context`. libkrb5 binds a handle to the context
+that produced it and forbids concurrent use, so [`src/context.rs`](truenas_krb5/src/context.rs)
+gives each `Keytab` and `Ccache` a context of its own: the types are `Send`
+and not `Sync`, handles never mix across values, and there is no context
+type in the API. The cost is one configuration read per value, which is why
+`kinit_keytab` takes names and resolves the handles itself rather than
+accepting them.
+
+Error messages are captured, not deferred. `krb5_get_error_message` can
+carry detail about the specific failing call and only until the next call on
+the context, so [`Error`](truenas_krb5/src/error.rs) records the message the
+moment a non-zero code is seen and owns it thereafter. `ErrCode` is the krb5
+com_err table — variant names verbatim from `krb5.h`, values pinned to the
+linked library — and the table has retired slots, so it is `from_raw` over a
+match, not a range. System `errno` values pass through raw, and this crate's
+own refusals (interior NUL, non-UTF-8 identity) are `EINVAL`.
+
+Key tables go through the library in every direction. [`Keytab::from_bytes`](truenas_krb5/src/keytab.rs)
+backs a `FILE` table with an anonymous `memfd` reached through
+`/proc/self/fd`, and `as_bytes` serializes by writing entries into a fresh
+one and reading the file back, so the on-disk format is always libkrb5's
+own — key material from a database column never touches a filesystem path.
+The `FILE` writer stamps its own write time, so a serialize round trip
+preserves principals, keys, versions, and enctypes but not timestamps, which
+[`tests/krb5.rs`](truenas_krb5/tests/krb5.rs) states. Key bytes are scrubbed
+before release and redacted in `Debug`.
+
+Principals parse and unparse through the library, whose quoting rules are the
+wire contract; realm and components must be UTF-8, because they are identity.
+[`tests/krb5.rs`](truenas_krb5/tests/krb5.rs) is hermetic — each case
+re-executes with a generated `KRB5_CONFIG` — and reproduces RFC 3961
+Appendix A.4's DES3 string-to-key vector byte for byte; the AES vectors are
+not reachable through the default-parameter path, so they are pinned instead
+by [`tests/kdc.rs`](truenas_krb5/tests/kdc.rs), where a key table this crate
+derives from a password must satisfy a real AS exchange against a throwaway
+KDC. That suite skips without the MIT KDC tools;
+`TRUENAS_KRB5_REQUIRE_KDC=1` makes the skip a failure.
+
+The crate knows MIT Kerberos and nothing above it. What a principal is
+allowed to do, and which key table or cache a deployment uses, are the
+consumer's.
+
+## `truenas_gssapi`
+
+Links the system `libgssapi_krb5`. A GSSAPI exchange is only meaningful
+against the host's Kerberos state and the mechanisms the mechglue carries, so
+there is nothing to vendor.
+
+Acceptor only. Everything on TrueNAS that initiates does so through other
+stacks, and an acceptor that cannot initiate has less to review, so the crate
+binds `gss_accept_sec_context` and the names, credentials, and OIDs around
+it, and not `gss_init_sec_context`. [`AcceptorCred`](truenas_gssapi/src/cred.rs)
+acquires from a key table through the `gssapi_ext.h` credential store
+(`gss_acquire_cred_from` with a `keytab` element) for every mechanism the
+glue offers, so one credential serves a `Negotiate` endpoint whichever way a
+peer arrives. [`Acceptor`](truenas_gssapi/src/accept.rs) is the accept-side
+context as a step loop: feed the initiator's token, send back any token the
+step yields, stop when it completes — Kerberos in one step, SPNEGO across an
+extra leg, the same loop either way.
+
+Identity comes from the mechanism, never a claim. The authenticated name is
+whatever the ticket proves; [`Name::localname`](truenas_gssapi/src/name.rs)
+maps it to a Unix account through the mechanism's own rules (`gss_localname`,
+which for Kerberos honours `auth_to_local`), and an unmappable name is an
+error, not a guess. `Name` also imports, displays, canonicalizes, exports
+(RFC 2743 §3.2), and compares — comparison and mapping are the library's, so
+name equivalence is never reimplemented here.
+
+[`Error`](truenas_gssapi/src/error.rs) carries the raw major and minor status
+and renders both with `gss_display_status`, captured under the mechanism that
+produced the minor status; the routine field classifies as `RoutineError`
+with the C bindings' `GSS_S_` names. [`Oid`](truenas_gssapi/src/oid.rs) holds
+the BER arc octets, written out from the RFCs that assign them, and a test
+pins each against the OID the linked library exports for the same identifier.
+
+[`tests/gssapi.rs`](truenas_gssapi/tests/gssapi.rs) is hermetic and exercises
+the surface where the outcome is fixed without a KDC — names, OIDs, errors,
+an empty credential store, a garbage token. [`tests/negotiate.rs`](truenas_gssapi/tests/negotiate.rs)
+runs the real exchange: `truenas_krb5` stands up a throwaway KDC and a
+service key table, and a minimal initiator local to the test — the one place
+`gss_init_sec_context` is bound — drives this crate's acceptor to completion
+over both Kerberos and SPNEGO, then maps the result to a local account. It
+skips without the MIT KDC tools; `TRUENAS_GSSAPI_REQUIRE_KDC=1` makes the
+skip a failure.
+
+The crate knows the GSSAPI accept side and nothing above it. The HTTP
+`Negotiate` framing, the account lookup, and what a mapped identity is
+allowed to do belong to the consumer.
+
 ## `truenas_jsonrpc`
 
 Conforms to JSON-RPC 2.0, with no dialect and nothing configurable: what §4
@@ -363,24 +459,44 @@ cargo clippy --workspace --all-targets -- -D warnings
 TRUENAS_MDB_REQUIRE_PYTHON=1 TRUENAS_PAM_REQUIRE_MODULES=1 \
     TRUENAS_NSS_REQUIRE_CC=1 TRUENAS_NSS_REQUIRE_SYSTEM=1 \
     TRUENAS_KTLS_REQUIRE_SYSTEM=1 \
+    TRUENAS_KRB5_REQUIRE_KDC=1 TRUENAS_GSSAPI_REQUIRE_KDC=1 \
     cargo test --workspace
 cargo test -p truenas_xdr --no-default-features
 cargo doc --workspace --no-deps          # must be warning-free
 CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER="valgrind --error-exitcode=99 \
     --leak-check=full --errors-for-leak-kinds=definite \
     --keep-debuginfo=yes --quiet \
-    --trace-children=yes --trace-children-skip=*/cc,*/python3*" \
+    --suppressions=$PWD/valgrind.supp \
+    --trace-children=yes \
+    --trace-children-skip=*/cc,*/python3*,*/krb5kdc,*/kadmin.local,*/kdb5_util,*/kinit" \
     TRUENAS_MDB_REQUIRE_PYTHON=1 TRUENAS_PAM_REQUIRE_MODULES=1 \
     TRUENAS_NSS_REQUIRE_CC=1 TRUENAS_NSS_REQUIRE_SYSTEM=1 \
     TRUENAS_KTLS_REQUIRE_SYSTEM=1 \
+    TRUENAS_KRB5_REQUIRE_KDC=1 TRUENAS_GSSAPI_REQUIRE_KDC=1 \
     cargo test --workspace
 ```
 
-Build needs `liblmdb-dev`, `libpam0g-dev`, and `libssl-dev`; the interop
-suite needs `python3-lmdb`, the PAM suites need `libpam-modules`, and the
-NSS fixture suites need a C compiler (`cc`); the memcheck run needs
-`valgrind`, and `--keep-debuginfo=yes` because libpam unloads each module
-before the process ends.
+[`valgrind.supp`](valgrind.supp) suppresses leaks *inside* a bound system
+library on a path the binding cannot release — currently one: MIT
+libgssapi_krb5 abandons the principal it builds while acquiring a credential
+that then fails. Each entry is scoped to the allocating library frame, so a
+leak in this workspace's own code cannot match one. A leak in a bound
+library on a path the crate *can* release is the crate's to fix, not to
+suppress.
+
+Build needs `libkrb5-dev`, `liblmdb-dev`, `libpam0g-dev`, and `libssl-dev`;
+the interop suite needs `python3-lmdb`, the PAM suites need `libpam-modules`,
+the NSS fixture suites need a C compiler (`cc`), and the Kerberos KDC-backed
+suites need the MIT KDC tools (`krb5-kdc`, `krb5-admin-server`, `krb5-user`);
+the memcheck run needs `valgrind`, and `--keep-debuginfo=yes` because libpam
+unloads each module before the process ends. The re-executed KDC tools are
+skipped under memcheck alongside `cc` and `python3`: they are not under test
+and are not memcheck-clean, and the crate under test drives them only as
+child processes.
+
+The Kerberos suites re-execute the test binary as a child (like the NSS
+fan-out suite), so `--trace-children=yes` already covers the in-crate code
+that runs there; only the KDC daemon and its admin tools are excluded.
 
 `TRUENAS_KTLS_REQUIRE_SYSTEM` is the one gate CI cannot set: the stock
 runners' OpenSSL is built without kTLS, so engagement cannot happen there

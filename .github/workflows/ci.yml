@@ -33,18 +33,22 @@ jobs:
     # links the system liblmdb0 — `pip install lmdb` bundles its own copy and
     # would test something else. libpam0g-dev links truenas_pam, and
     # libpam-modules supplies the modules its service files name. libssl-dev
-    # links truenas_ktls. valgrind backs the memcheck step below. truenas_nss
-    # needs nothing here: its fixture suites use the runner's C compiler, and
-    # the system module its smoke tests load, libnss_files.so.2, ships in
-    # libc6.
+    # links truenas_ktls. libkrb5-dev links truenas_krb5 and truenas_gssapi;
+    # the MIT KDC tools (krb5-kdc, krb5-admin-server, krb5-user) back their
+    # KDC-dependent suites, which stand a throwaway realm up in a tempdir.
+    # valgrind backs the memcheck step below. truenas_nss needs nothing here:
+    # its fixture suites use the runner's C compiler, and the system module
+    # its smoke tests load, libnss_files.so.2, ships in libc6.
     - name: Install system dependencies
       run: |
         sudo apt-get update
-        sudo apt-get install -y --no-install-recommends \
+        sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
           liblmdb-dev python3-lmdb libpam0g-dev libpam-modules libssl-dev \
+          libkrb5-dev krb5-kdc krb5-admin-server krb5-user \
           pkg-config valgrind
         python3 -c "import lmdb; print('py-lmdb', lmdb.__version__, 'liblmdb', lmdb.version())"
-        dpkg-query -W libpam0g-dev libpam-modules libssl-dev
+        dpkg-query -W libpam0g-dev libpam-modules libssl-dev libkrb5-dev
+        krb5-config --version
         valgrind --version
 
     - name: Install Rust toolchain
@@ -91,6 +95,8 @@ jobs:
         TRUENAS_PAM_REQUIRE_MODULES: "1"
         TRUENAS_NSS_REQUIRE_CC: "1"
         TRUENAS_NSS_REQUIRE_SYSTEM: "1"
+        TRUENAS_KRB5_REQUIRE_KDC: "1"
+        TRUENAS_GSSAPI_REQUIRE_KDC: "1"
 
     # `truenas_xdr`'s `derive` feature is on by default; prove the codec still
     # builds and passes without the proc-macro crate.
@@ -100,23 +106,29 @@ jobs:
     # Correctness at an FFI boundary is a memory-safety property, so the suites
     # run again under memcheck. Only `definite` leaks count as errors: the
     # environment pool is a process-lifetime static, which memcheck reports as
-    # possibly lost. `--keep-debuginfo=yes` is for truenas_pam: libpam unloads
-    # each module at the end of a transaction, and a report from inside one
-    # would otherwise have no symbols left to name. `--trace-children=yes`
-    # follows the NSS fan-out suite's re-executed children — the multi-module
-    # registry path runs only there — while cc and python3 are skipped: they
-    # are not under test and are not memcheck-clean.
+    # possibly lost. `--suppressions` covers one libgssapi-internal leak on a
+    # failed credential acquisition, scoped to the library frame.
+    # `--keep-debuginfo=yes` is for truenas_pam: libpam unloads each module at
+    # the end of a transaction, and a report from inside one would otherwise
+    # have no symbols left to name. `--trace-children=yes` follows the
+    # re-executed children the NSS fan-out and the Kerberos suites drive, while
+    # cc, python3, and the MIT KDC tools are skipped: they are not under test
+    # and are not memcheck-clean.
     - name: valgrind
       run: cargo test --workspace --locked
       env:
         CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER: >-
           valgrind --error-exitcode=99 --leak-check=full
           --errors-for-leak-kinds=definite --keep-debuginfo=yes --quiet
-          --trace-children=yes --trace-children-skip=*/cc,*/python3*
+          --suppressions=${{ github.workspace }}/valgrind.supp
+          --trace-children=yes
+          --trace-children-skip=*/cc,*/python3*,*/krb5kdc,*/kadmin.local,*/kdb5_util,*/kinit,*/klist
         TRUENAS_MDB_REQUIRE_PYTHON: "1"
         TRUENAS_PAM_REQUIRE_MODULES: "1"
         TRUENAS_NSS_REQUIRE_CC: "1"
         TRUENAS_NSS_REQUIRE_SYSTEM: "1"
+        TRUENAS_KRB5_REQUIRE_KDC: "1"
+        TRUENAS_GSSAPI_REQUIRE_KDC: "1"
 
     - name: docs
       run: cargo doc --workspace --no-deps --locked
@@ -135,8 +147,9 @@ jobs:
     - name: Install system dependencies
       run: |
         sudo apt-get update
-        sudo apt-get install -y --no-install-recommends \
+        sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
           liblmdb-dev python3-lmdb libpam0g-dev libpam-modules libssl-dev \
+          libkrb5-dev krb5-kdc krb5-admin-server krb5-user \
           pkg-config
 
     - name: Install Rust toolchain
@@ -166,3 +179,5 @@ jobs:
         TRUENAS_PAM_REQUIRE_MODULES: "1"
         TRUENAS_NSS_REQUIRE_CC: "1"
         TRUENAS_NSS_REQUIRE_SYSTEM: "1"
+        TRUENAS_KRB5_REQUIRE_KDC: "1"
+        TRUENAS_GSSAPI_REQUIRE_KDC: "1"
