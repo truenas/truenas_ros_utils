@@ -9,7 +9,9 @@
 [workspace]
 resolver = "2"
 members = [
+    "truenas_gssapi",
     "truenas_jsonrpc",
+    "truenas_krb5",
     "truenas_ktls",
     "truenas_mdb",
     "truenas_nss",

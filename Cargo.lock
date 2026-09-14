@@ -267,11 +267,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "truenas_gssapi"
+version = "0.1.0"
+dependencies = [
+ "bitflags",
+ "libc",
+ "tempfile",
+ "truenas_krb5",
+]
+
+[[package]]
 name = "truenas_jsonrpc"
 version = "0.1.0"
 dependencies = [
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "truenas_krb5"
+version = "0.1.0"
+dependencies = [
+ "bitflags",
+ "libc",
+ "tempfile",
 ]
 
 [[package]]

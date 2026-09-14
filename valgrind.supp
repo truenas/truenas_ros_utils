@@ -1,0 +1,32 @@
+# SPDX-FileCopyrightText: 2026 iXsystems, Inc, DBA TrueNAS
+# SPDX-License-Identifier: MIT
+#
+# Valgrind memcheck suppressions for leaks inside the system libraries these
+# crates bind, on paths their own code cannot release. Each entry is scoped
+# to the library frame that allocates, so a leak in this workspace's own code
+# can never match one.
+#
+# MIT libgssapi_krb5 leaks the internal principal it builds while acquiring a
+# credential when the acquisition then fails — e.g. acquiring for a named
+# acceptor principal against a key table that holds no key for it. The
+# allocation is krb5_build_principal, made and abandoned entirely within
+# gss_acquire_cred_from; the caller receives only the error. The success
+# path, and the common acceptor path that names no principal, do not leak.
+{
+   mit-gss-acquire-cred-from-builds-principal-and-leaks-on-error
+   Memcheck:Leak
+   match-leak-kinds: definite
+   fun:malloc
+   fun:krb5_build_principal_alloc_va
+   ...
+   fun:gss_acquire_cred_from
+}
+{
+   mit-gss-acquire-cred-builds-principal-and-leaks-on-error
+   Memcheck:Leak
+   match-leak-kinds: definite
+   fun:malloc
+   fun:krb5_build_principal_alloc_va
+   ...
+   fun:gss_acquire_cred
+}

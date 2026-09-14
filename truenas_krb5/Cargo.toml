@@ -1,0 +1,51 @@
+# SPDX-FileCopyrightText: 2026 iXsystems, Inc, DBA TrueNAS
+# SPDX-License-Identifier: MIT
+# `truenas_krb5` — bindings to the system MIT Kerberos library (`libkrb5`):
+# principals, key tables, credential caches, and initial-credential
+# acquisition.
+#
+# Links the system library because Kerberos state — /etc/krb5.conf, key
+# tables, credential caches — is host state shared with every other Kerberos
+# consumer on the machine, and exactly one implementation may interpret it.
+# Build needs `libkrb5-dev`; runtime needs `libkrb5-3` and `libk5crypto3`.
+[package]
+name = "truenas_krb5"
+version = "0.1.0"
+description = "Bindings to the system MIT libkrb5: principals, key tables, credential caches, and kinit"
+categories = ["authentication", "api-bindings"]
+keywords = ["kerberos", "krb5", "keytab", "gssapi", "truenas"]
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+# The C ABI: `memfd_create` for the in-memory key tables, and the platform
+# integer types the structs are declared over. No bindgen — the declarations
+# are hand-written in src/ffi.rs, so no libclang and nothing generated at
+# build time.
+libc = "0.2.155"
+# Typed flag set for the ticket flags, matching the sibling crates.
+bitflags = "2.6"
+
+[dev-dependencies]
+tempfile = "3"
+
+[lints]
+workspace = true
+
+# Behavioral tests: principals, key tables, and error classification. Need
+# libkrb5 at link time (like the library) but no KDC and no host Kerberos
+# configuration — every case runs against files of its own.
+[[test]]
+name = "krb5"
+path = "tests/krb5.rs"
+
+# Initial credentials against a throwaway KDC built in a temporary directory.
+# Skips when the MIT KDC tools (`kdb5_util`, `krb5kdc`, `kadmin.local`) are
+# not installed; set TRUENAS_KRB5_REQUIRE_KDC=1 (as CI does) to make that a
+# hard failure.
+[[test]]
+name = "kdc"
+path = "tests/kdc.rs"
