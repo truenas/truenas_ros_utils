@@ -21,7 +21,7 @@ other; depend on the one you need.
 
 ## Requirements
 
-- Rust 1.97.1 or newer, edition 2024
+- Rust 1.98.1 or newer, edition 2024
 - `libkrb5-dev` to build `truenas_krb5` (`libkrb5-3`, `libk5crypto3` to run
   it) and `truenas_gssapi` (`libgssapi-krb5-2` to run it)
 - `liblmdb-dev` to build `truenas_mdb`, `liblmdb0` to run it

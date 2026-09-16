@@ -5,7 +5,7 @@
 Virtual workspace, no umbrella crate. Members are independent of each other; a
 consumer depends on the one it wants. Crate names use underscores.
 
-Edition 2024 and `rust-version = "1.97.1"` are set once in
+Edition 2024 and `rust-version = "1.98.1"` are set once in
 `[workspace.package]`; members inherit both. Lints come from
 `[workspace.lints.rust]`, with `lints.workspace = true` in each member.
 `Cargo.lock` is committed. rustfmt uses `max_width = 80`.
