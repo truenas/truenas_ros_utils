@@ -139,7 +139,7 @@ jobs:
   # test on exactly that toolchain so raising the floor is a deliberate edit
   # rather than something that happens when a newer feature is used by accident.
   msrv:
-    name: build + test (MSRV 1.97.1)
+    name: build + test (MSRV 1.98.1)
     runs-on: ubuntu-latest
     steps:
     - uses: actions/checkout@v4
