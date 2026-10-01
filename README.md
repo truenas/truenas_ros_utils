@@ -9,6 +9,7 @@ other; depend on the one you need.
 
 | Crate | Contents |
 |---|---|
+| [`truenas_chrony`](truenas_chrony/) | Whether the local chronyd's time can be trusted: synchronization, sources and their NTS authentication, and chronyd's time |
 | [`truenas_gssapi`](truenas_gssapi/) | A GSSAPI acceptor over the system `libgssapi_krb5`: names, key-table credentials, and the accept-side security-context loop, for SPNEGO and Kerberos |
 | [`truenas_jsonrpc`](truenas_jsonrpc/) | JSON-RPC 2.0 for both roles, doing no I/O: framing a byte stream, reading a call or an answer, and building either |
 | [`truenas_krb5`](truenas_krb5/) | Bindings to the system MIT Kerberos (`libkrb5`): principals, key tables (including fully in-memory ones), credential caches, and initial-credential acquisition |
@@ -33,6 +34,9 @@ other; depend on the one you need.
   at run time (glibc 2.34 or newer; `libnss_files.so.2` ships in `libc6`)
 - Nothing extra to build `truenas_jsonrpc` or `truenas_xdr`; neither links a
   C library and neither needs anything at run time
+- Nothing extra to build `truenas_chrony`; at run time it needs chronyd
+  4.6.1 or later, root or the chrony user, and, under AppArmor, chronyd
+  allowed to write `/run/chrony/**`
 
 Optional, for the full test suite:
 
@@ -41,6 +45,9 @@ Optional, for the full test suite:
 - a C compiler (`cc`) for `truenas_nss`'s fixture suites
 - the MIT KDC tools (`krb5-kdc`, `krb5-admin-server`, `krb5-user`) for
   `truenas_krb5`'s and `truenas_gssapi`'s KDC-backed suites
+- `chrony` 4.6.1 or later with NTS, `openssl`, and `libfaketime` for
+  `truenas_chrony`'s chronyd-backed suite; its packaged-layout scenario
+  also needs root and `_chrony`
 - `valgrind` for the memcheck run
 
 ## Building and testing
@@ -87,6 +94,16 @@ tools are absent; `TRUENAS_KRB5_REQUIRE_KDC=1` and
 `TRUENAS_GSSAPI_REQUIRE_KDC=1`, which CI sets on hosts that carry them, make
 that a failure instead.
 
+`truenas_chrony`'s wire, version, and client suites need nothing. Its
+chronyd-backed suite runs real chronyd per scenario without touching the
+system clock, puts each to the documented gate, and checks every report
+against chronyc; as root it also runs the client against chronyd laid out
+as the Debian package runs it. It skips without its prerequisites;
+`TRUENAS_CHRONY_REQUIRE_CHRONYD=1` and `TRUENAS_CHRONY_REQUIRE_ROOT=1`,
+which CI sets, make those failures. `TRUENAS_CHRONY_CHRONYD`,
+`TRUENAS_CHRONY_CHRONYC`, and `TRUENAS_CHRONY_FAKETIME` override the search
+for the tools.
+
 `truenas_xdr`'s `derive` feature is on by default. To check the codec without
 the proc-macro crate:
 
@@ -100,7 +117,7 @@ To run the suites under valgrind, as CI does:
 CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER="valgrind --error-exitcode=99 \
     --leak-check=full --errors-for-leak-kinds=definite --keep-debuginfo=yes \
     --quiet --suppressions=$PWD/valgrind.supp --trace-children=yes \
-    --trace-children-skip=*/cc,*/python3*,*/krb5kdc,*/kadmin.local,*/kdb5_util,*/kinit" \
+    --trace-children-skip=*/cc,*/python3*,*/krb5kdc,*/kadmin.local,*/kdb5_util,*/kinit,*/chronyd,*/chronyc" \
     cargo test --workspace
 ```
 
@@ -114,8 +131,9 @@ in this workspace's own code.
 report from inside one has no symbols left to name.
 
 `--trace-children=yes` is for `truenas_nss`: its fan-out suite drives the
-module registry only in a re-executed child. `cc` and `python3` are skipped —
-they are not under test and are not memcheck-clean.
+module registry only in a re-executed child. `cc`, `python3`, the KDC tools,
+`chronyd`, and `chronyc` are skipped — they are not under test and are not
+memcheck-clean.
 
 ## License
 
