@@ -267,6 +267,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "truenas_chrony"
+version = "0.1.0"
+dependencies = [
+ "bitflags",
+ "tempfile",
+]
+
+[[package]]
 name = "truenas_gssapi"
 version = "0.1.0"
 dependencies = [

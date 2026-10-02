@@ -88,8 +88,11 @@ jobs:
     # engagement cases skip themselves on that probe; the rest of its suite
     # still runs. Hosts whose libssl can engage run the full battery with the
     # gate required.
+    #
+    # truenas_chrony runs in the `chrony` job: the runner's chronyd 4.5 is
+    # below its floor.
     - name: test
-      run: cargo test --workspace --locked
+      run: cargo test --workspace --locked --exclude truenas_chrony
       env:
         TRUENAS_MDB_REQUIRE_PYTHON: "1"
         TRUENAS_PAM_REQUIRE_MODULES: "1"
@@ -113,16 +116,17 @@ jobs:
     # have no symbols left to name. `--trace-children=yes` follows the
     # re-executed children the NSS fan-out and the Kerberos suites drive, while
     # cc, python3, and the MIT KDC tools are skipped: they are not under test
-    # and are not memcheck-clean.
+    # and are not memcheck-clean. truenas_chrony has no FFI boundary and is
+    # left out.
     - name: valgrind
-      run: cargo test --workspace --locked
+      run: cargo test --workspace --locked --exclude truenas_chrony
       env:
         CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER: >-
           valgrind --error-exitcode=99 --leak-check=full
           --errors-for-leak-kinds=definite --keep-debuginfo=yes --quiet
           --suppressions=${{ github.workspace }}/valgrind.supp
           --trace-children=yes
-          --trace-children-skip=*/cc,*/python3*,*/krb5kdc,*/kadmin.local,*/kdb5_util,*/kinit,*/klist
+          --trace-children-skip=*/cc,*/python3*,*/krb5kdc,*/kadmin.local,*/kdb5_util,*/kinit
         TRUENAS_MDB_REQUIRE_PYTHON: "1"
         TRUENAS_PAM_REQUIRE_MODULES: "1"
         TRUENAS_NSS_REQUIRE_CC: "1"
@@ -172,8 +176,9 @@ jobs:
     - name: build
       run: cargo build --workspace --all-targets --locked
 
+    # truenas_chrony runs in the `chrony` job; see the check job's test step.
     - name: test
-      run: cargo test --workspace --locked
+      run: cargo test --workspace --locked --exclude truenas_chrony
       env:
         TRUENAS_MDB_REQUIRE_PYTHON: "1"
         TRUENAS_PAM_REQUIRE_MODULES: "1"
@@ -181,3 +186,43 @@ jobs:
         TRUENAS_NSS_REQUIRE_SYSTEM: "1"
         TRUENAS_KRB5_REQUIRE_KDC: "1"
         TRUENAS_GSSAPI_REQUIRE_KDC: "1"
+
+  # truenas_chrony against Debian trixie's chrony 4.6.1, the crate's floor,
+  # with openssl and libfaketime for its live suite, as root for the
+  # packaged-layout scenario. policy-rc.d keeps the package from starting a
+  # daemon in the container.
+  chrony:
+    name: truenas_chrony (Debian trixie, chrony 4.6.1)
+    runs-on: ubuntu-latest
+    container: rust:1-trixie
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Install system dependencies
+      run: |
+        printf '#!/bin/sh\nexit 101\n' > /usr/sbin/policy-rc.d
+        chmod +x /usr/sbin/policy-rc.d
+        apt-get update
+        DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+          chrony libfaketime openssl
+        chronyd -v
+        chronyc -v
+        openssl version
+        getent passwd _chrony
+        dpkg-query -W libfaketime
+        cargo --version && rustc --version
+
+    - name: Cache cargo
+      uses: actions/cache@v4
+      with:
+        path: |
+          /usr/local/cargo/registry
+          /usr/local/cargo/git
+          target
+        key: cargo-trixie-stable-${{ hashFiles('**/Cargo.lock', '**/Cargo.toml') }}
+
+    - name: test
+      run: cargo test -p truenas_chrony --locked
+      env:
+        TRUENAS_CHRONY_REQUIRE_CHRONYD: "1"
+        TRUENAS_CHRONY_REQUIRE_ROOT: "1"

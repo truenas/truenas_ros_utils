@@ -80,6 +80,35 @@ When a crate implements a specification:
   for the error conventions they use. Record what they establish in the crate's
   documentation, not what they are called or where they live.
 
+## `truenas_chrony`
+
+chronyd's monitoring protocol over its Unix socket — tracking, sources,
+selection, authentication — enough to judge whether the local clock can be
+trusted. Thresholds are the consumer's. chronyd ships no header or library
+for the protocol, so the crate speaks the wire format itself and links no C.
+
+[`Request`](truenas_chrony/src/request.rs) encodes and decodes without I/O;
+[`Client`](truenas_chrony/src/client.rs) sends over the socket. Requests are
+padded to their reply's length. Layouts are unchanged since chronyd 4.0 and
+the floor is 4.6.1; another revision surfaces as an error
+`Error::is_unsupported` recognizes. `Client::sources` walks again if the
+list changes mid-walk.
+
+`Client` replies to a 0711 directory of its own, `/run/truenas_chrony` by
+default, setting modes and removing stale sockets by path: that directory
+must be on a path only the caller can modify. Reaching the daemon needs root or the chrony user. Where
+AppArmor mediates pathname sockets, chronyd needs
+`@{run}/truenas_chrony/*.sock w`.
+
+[`tests/chronyd.rs`](truenas_chrony/tests/chronyd.rs) puts real chronyd to
+the documented gate scenario by scenario, and in one checks every report
+against chronyc. Clock resets use libfaketime, with offsets over a second, as
+smaller ones are not measured faithfully under it. Certificates come from
+`openssl` at run time. The packaged-layout scenario needs root, `_chrony`,
+and a `TMPDIR` that user can search. `TRUENAS_CHRONY_REQUIRE_CHRONYD=1` and
+`TRUENAS_CHRONY_REQUIRE_ROOT=1` turn skips into failures. CI runs the crate
+in a Debian trixie container; Ubuntu's chrony 4.5 is below the floor.
+
 ## `truenas_krb5`
 
 Links the system MIT `libkrb5` (and `libk5crypto`, where
@@ -460,6 +489,7 @@ TRUENAS_MDB_REQUIRE_PYTHON=1 TRUENAS_PAM_REQUIRE_MODULES=1 \
     TRUENAS_NSS_REQUIRE_CC=1 TRUENAS_NSS_REQUIRE_SYSTEM=1 \
     TRUENAS_KTLS_REQUIRE_SYSTEM=1 \
     TRUENAS_KRB5_REQUIRE_KDC=1 TRUENAS_GSSAPI_REQUIRE_KDC=1 \
+    TRUENAS_CHRONY_REQUIRE_CHRONYD=1 TRUENAS_CHRONY_REQUIRE_ROOT=1 \
     cargo test --workspace
 cargo test -p truenas_xdr --no-default-features
 cargo doc --workspace --no-deps          # must be warning-free
@@ -473,7 +503,7 @@ CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER="valgrind --error-exitcode=99 \
     TRUENAS_NSS_REQUIRE_CC=1 TRUENAS_NSS_REQUIRE_SYSTEM=1 \
     TRUENAS_KTLS_REQUIRE_SYSTEM=1 \
     TRUENAS_KRB5_REQUIRE_KDC=1 TRUENAS_GSSAPI_REQUIRE_KDC=1 \
-    cargo test --workspace
+    cargo test --workspace --exclude truenas_chrony
 ```
 
 [`valgrind.supp`](valgrind.supp) suppresses leaks *inside* a bound system
@@ -486,13 +516,16 @@ suppress.
 
 Build needs `libkrb5-dev`, `liblmdb-dev`, `libpam0g-dev`, and `libssl-dev`;
 the interop suite needs `python3-lmdb`, the PAM suites need `libpam-modules`,
-the NSS fixture suites need a C compiler (`cc`), and the Kerberos KDC-backed
-suites need the MIT KDC tools (`krb5-kdc`, `krb5-admin-server`, `krb5-user`);
-the memcheck run needs `valgrind`, and `--keep-debuginfo=yes` because libpam
-unloads each module before the process ends. The re-executed KDC tools are
-skipped under memcheck alongside `cc` and `python3`: they are not under test
-and are not memcheck-clean, and the crate under test drives them only as
-child processes.
+the NSS fixture suites need a C compiler (`cc`), the Kerberos KDC-backed
+suites need the MIT KDC tools (`krb5-kdc`, `krb5-admin-server`, `krb5-user`),
+and the chrony suite needs `chrony` 4.6.1 or later, built with NTS,
+`openssl`, and `libfaketime`, with root and the package's `_chrony` user for
+its packaged scenario; the memcheck run needs `valgrind`, and `--keep-debuginfo=yes`
+because libpam unloads each module before the process ends. The
+re-executed KDC tools are skipped under memcheck alongside `cc` and
+`python3`: they are not under test and are not memcheck-clean, and the
+crates under test drive them only as child processes. `truenas_chrony` has
+no FFI boundary, so the memcheck run leaves it out.
 
 The Kerberos suites re-execute the test binary as a child (like the NSS
 fan-out suite), so `--trace-children=yes` already covers the in-crate code

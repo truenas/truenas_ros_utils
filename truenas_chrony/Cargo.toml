@@ -1,0 +1,53 @@
+# SPDX-FileCopyrightText: 2026 iXsystems, Inc, DBA TrueNAS
+# SPDX-License-Identifier: MIT
+# `truenas_chrony` — chronyd's monitoring protocol for the local daemon:
+# synchronization, sources, and authentication. Requests and replies without
+# I/O, and a blocking client over the Unix socket. Links no C.
+[package]
+name = "truenas_chrony"
+version = "0.1.0"
+description = "Synchronization, source, and NTS state from the local chronyd, over its monitoring protocol"
+categories = ["network-programming", "date-and-time"]
+keywords = ["chrony", "ntp", "nts", "time", "truenas"]
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+# Typed flag sets for selection options, matching the sibling crates.
+bitflags = "2.6"
+
+[dev-dependencies]
+tempfile = "3"
+
+[lints]
+workspace = true
+
+# Every request and reply layout against bytes written out by hand.
+[[test]]
+name = "wire"
+path = "tests/wire.rs"
+
+# Replies from other chronyd releases, reported as unsupported.
+[[test]]
+name = "versions"
+path = "tests/versions.rs"
+
+# The client against a scripted daemon.
+[[test]]
+name = "client"
+path = "tests/client.rs"
+
+# Every decode over a hostile corpus returns, never panics.
+[[test]]
+name = "robustness"
+path = "tests/robustness.rs"
+
+# Real chronyd, scenario by scenario, cross-checked against chronyc.
+# TRUENAS_CHRONY_REQUIRE_CHRONYD=1 and TRUENAS_CHRONY_REQUIRE_ROOT=1 turn its
+# skips into failures.
+[[test]]
+name = "chronyd"
+path = "tests/chronyd.rs"
