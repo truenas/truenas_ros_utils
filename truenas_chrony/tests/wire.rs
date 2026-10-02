@@ -241,7 +241,7 @@ fn tracking() {
             0x0580_0000, // -1.0
             0xc880_0000, // 2^-30
             0x06c0_0000, // 3.0
-            0x0000_0000, // 0.0
+            0x0780_0000, // -2.0
             0x0480_0000, // 1.0
             0x0080_0000, // 0.25
             0xfe80_0000, // 0.125
@@ -261,7 +261,7 @@ fn tracking() {
     assert_eq!(t.last_offset, -1.0);
     assert_eq!(t.rms_offset, 2f64.powi(-30));
     assert_eq!(t.frequency_ppm, 3.0);
-    assert_eq!(t.residual_frequency_ppm, 0.0);
+    assert_eq!(t.residual_frequency_ppm, -2.0);
     assert_eq!(t.skew_ppm, 1.0);
     assert_eq!(t.root_delay, 0.25);
     assert_eq!(t.root_dispersion, 0.125);
@@ -713,6 +713,9 @@ fn value_rendering() {
     assert_eq!(RefId(0xc000_0201).to_string(), "C0000201");
     assert_eq!(RefId::from(u32::from_be_bytes(*b"GPS\0")).name(), "GPS");
     assert_eq!(RefId(0x0147_0a50).name(), "GP");
+    // Both ends of the printable range: space is kept, 0x7f is not.
+    assert_eq!(RefId::from(u32::from_be_bytes(*b"GPS ")).name(), "GPS ");
+    assert_eq!(RefId::LOCAL.name(), "");
     assert_eq!(Status::NoSuchSource.to_string(), "source not found (4)");
     assert_eq!(Status::Unknown(20).to_string(), "status 20");
 }

@@ -23,18 +23,18 @@ fn tracking_data(stratum: u16) -> Vec<u8> {
     data
 }
 
-/// Entries in `dir` other than the daemon's socket.
+/// The reply sockets left in `dir`.
 fn leftovers(dir: &Path) -> Vec<PathBuf> {
     std::fs::read_dir(dir)
         .unwrap()
         .map(|e| e.unwrap().path())
-        .filter(|p| p.file_name().unwrap() != "chronyd.sock")
         .collect()
 }
 
-/// The reply socket, `sock` at 0666 in `truenas_chrony.` and sixteen hex
-/// digits at 0711, sits beside the daemon's and goes on drop. Catches a
-/// socket the daemon cannot write, one others can reach, and leftovers.
+/// The reply socket, sixteen hex digits and `.sock` at 0666, sits in the
+/// reply directory, made at 0711, and goes on drop; the directory stays.
+/// Catches a socket the daemon cannot write, one others can reach, and
+/// leftovers.
 #[test]
 fn reply_socket() {
     let seen = Arc::new(Mutex::new(None));
@@ -50,47 +50,83 @@ fn reply_socket() {
         ));
         ok(&r.bytes, 5, &tracking_data(2))
     });
-    let mut client = Client::connect(fake.path()).unwrap();
+    let mut client = fake.connect();
     assert_eq!(client.tracking().unwrap().stratum, 2);
     let (from, is_socket, sock_mode, dir_mode) =
         seen.lock().unwrap().clone().unwrap();
     assert!(is_socket);
     assert_eq!(sock_mode, 0o666);
     assert_eq!(dir_mode, 0o711);
-    assert_eq!(from.file_name().unwrap(), "sock");
-    let dir = from.parent().unwrap();
-    assert_eq!(dir.parent().unwrap(), fake.dir());
-    let name = dir.file_name().unwrap().to_str().unwrap();
-    let tag = name.strip_prefix("truenas_chrony.").unwrap();
+    assert_eq!(from.parent().unwrap(), fake.replies());
+    let name = from.file_name().unwrap().to_str().unwrap();
+    let tag = name.strip_suffix(".sock").unwrap();
     assert_eq!(tag.len(), 16);
     assert!(tag.bytes().all(|b| b.is_ascii_hexdigit()));
 
-    // A second client gets a directory of its own.
-    let other = Client::connect(fake.path()).unwrap();
-    assert_eq!(leftovers(fake.dir()).len(), 2);
+    // A second client gets a socket of its own.
+    let other = fake.connect();
+    assert_eq!(leftovers(&fake.replies()).len(), 2);
     drop(other);
     drop(client);
-    assert!(leftovers(fake.dir()).is_empty());
+    assert!(leftovers(&fake.replies()).is_empty());
+    assert!(fake.replies().is_dir());
+}
+
+/// An existing reply directory is set to 0711. Catches one the daemon
+/// cannot search.
+#[test]
+fn reply_directory_mode() {
+    let fake = Fake::answering(|r| ok(&r.bytes, 5, &tracking_data(2)));
+    let replies = fake.replies();
+    std::fs::create_dir(&replies).unwrap();
+    let private = std::fs::Permissions::from_mode(0o700);
+    std::fs::set_permissions(&replies, private).unwrap();
+    let mut client = fake.connect();
+    let mode = std::fs::metadata(&replies).unwrap().permissions().mode();
+    assert_eq!(mode & 0o7777, 0o711);
+    assert_eq!(client.tracking().unwrap().stratum, 2);
+}
+
+/// A reply socket nothing is bound to, as a client that exits without
+/// dropping leaves, goes when the next client connects. A live client's
+/// stays, as do other names and files that are not sockets.
+#[test]
+fn stale_reply_sockets() {
+    let fake = Fake::answering(|r| ok(&r.bytes, 5, &tracking_data(2)));
+    let mut live = fake.connect();
+    let replies = fake.replies();
+    let stale = replies.join("0123456789abcdef.sock");
+    let foreign = replies.join("chronyd.sock");
+    drop(UnixDatagram::bind(&stale).unwrap());
+    drop(UnixDatagram::bind(&foreign).unwrap());
+    let file = replies.join("fedcba9876543210.sock");
+    std::fs::write(&file, b"").unwrap();
+    let _next = fake.connect();
+    assert!(!stale.exists());
+    assert!(foreign.exists() && file.exists());
+    assert_eq!(live.tracking().unwrap().stratum, 2);
 }
 
 /// A daemon that is not running: no socket is `NotFound`, a socket
-/// nothing is bound to is `ConnectionRefused`. Nothing is left behind.
+/// nothing is bound to is `ConnectionRefused`. The reply directory is not
+/// made.
 #[test]
 fn absent_daemon() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("chronyd.sock");
-    match Client::connect(&path).unwrap_err() {
+    let replies = dir.path().join("replies");
+    match Client::connect_in(&path, &replies).unwrap_err() {
         Error::Io(err) => assert_eq!(err.kind(), io::ErrorKind::NotFound),
         other => panic!("{other:?}"),
     }
     drop(UnixDatagram::bind(&path).unwrap());
-    match Client::connect(&path).unwrap_err() {
+    match Client::connect_in(&path, &replies).unwrap_err() {
         Error::Io(err) => {
             assert_eq!(err.kind(), io::ErrorKind::ConnectionRefused)
         }
         other => panic!("{other:?}"),
     }
-    assert_eq!(leftovers(dir.path()), Vec::<PathBuf>::new());
+    assert!(!replies.exists());
 }
 
 /// The client sends exactly the datagram `Request` builds, with a fresh
@@ -118,7 +154,7 @@ fn retries() {
         0 => vec![],
         _ => vec![ok(&r.bytes, 5, &tracking_data(4))],
     });
-    let mut client = Client::connect(fake.path()).unwrap();
+    let mut client = fake.connect();
     client.set_timeout(Duration::from_millis(50));
     assert_eq!(client.tracking().unwrap().stratum, 4);
     let log = fake.finish();
@@ -146,7 +182,7 @@ fn late_replies_are_ignored() {
             ]
         }
     });
-    let mut client = Client::connect(fake.path()).unwrap();
+    let mut client = fake.connect();
     client.set_timeout(Duration::from_millis(50));
     assert_eq!(client.tracking().unwrap().stratum, 5);
 }
@@ -174,7 +210,7 @@ fn unrelated_datagrams_are_skipped() {
 #[test]
 fn timeout() {
     let fake = Fake::start(|_, _| vec![]);
-    let mut client = Client::connect(fake.path()).unwrap();
+    let mut client = fake.connect();
     client.set_timeout(Duration::from_millis(40));
     client.set_attempts(3);
     let start = Instant::now();
@@ -189,7 +225,7 @@ fn timeout() {
 #[test]
 fn settings_floor() {
     let fake = Fake::start(|_, _| vec![]);
-    let mut client = Client::connect(fake.path()).unwrap();
+    let mut client = fake.connect();
     client.set_attempts(0);
     client.set_timeout(Duration::ZERO);
     assert!(matches!(client.tracking(), Err(Error::Timeout)));

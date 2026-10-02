@@ -271,7 +271,6 @@ name = "truenas_chrony"
 version = "0.1.0"
 dependencies = [
  "bitflags",
- "libc",
  "tempfile",
 ]
 

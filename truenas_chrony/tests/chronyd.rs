@@ -11,7 +11,8 @@
 //! runs the client as root and, re-executing this binary, as other users.
 //! The `openssl` command makes the certificates once per run.
 //!
-//! chronyd and chronyc must be 4.6.1 or later, chronyd built with NTS. The
+//! chronyd and chronyc must be 4.6.1 or later, chronyd built with NTS, and
+//! the packaged scenario needs a TMPDIR the chrony user can search. The
 //! suite skips without chronyd, chronyc, or openssl, the resets without
 //! libfaketime, and the packaged scenario without root and the chrony
 //! user. TRUENAS_CHRONY_REQUIRE_CHRONYD=1 makes the first two failures,
@@ -19,6 +20,7 @@
 //! TRUENAS_CHRONY_CHRONYC, and TRUENAS_CHRONY_FAKETIME override the search
 //! for them.
 
+use std::collections::BTreeSet;
 use std::fs::{self, File};
 use std::io;
 use std::net::{Ipv4Addr, TcpListener, UdpSocket};
@@ -28,7 +30,7 @@ use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -42,6 +44,9 @@ const REQUIRE_ROOT: &str = "TRUENAS_CHRONY_REQUIRE_ROOT";
 
 /// The daemon socket a child case connects to.
 const CHILD_SOCKET: &str = "TRUENAS_CHRONY_CHILD_SOCKET";
+
+/// The directory a child case replies to.
+const CHILD_REPLIES: &str = "TRUENAS_CHRONY_CHILD_REPLIES";
 
 /// The oldest chronyd release this crate is held to.
 const FLOOR: (u32, u32, u32) = (4, 6, 1);
@@ -134,8 +139,16 @@ fn judge(chronyd: &mut Client) -> Vec<Refusal> {
 /// Following the NTS server at 127.0.0.1 with keys, and settled: the
 /// first updates carry a root distance near a second.
 fn follows_nts(client: &mut Client) -> bool {
+    follows_nts_and(client, |_| true)
+}
+
+/// `follows_nts`, with `also` true of the same tracking report.
+fn follows_nts_and(
+    client: &mut Client,
+    also: impl Fn(&Tracking) -> bool,
+) -> bool {
     client.tracking().is_ok_and(|t| {
-        t.address == Address::V4(NTS) && t.root_distance() < 0.01
+        t.address == Address::V4(NTS) && t.root_distance() < 0.01 && also(&t)
     }) && client.authentication(NTS).is_ok_and(|a| a.key_bits > 0)
 }
 
@@ -157,7 +170,7 @@ fn nts_time_is_trusted() {
         ),
         None,
     );
-    let mut client = Client::connect(&socket).unwrap();
+    let mut client = lab.connect(&socket);
     lab.wait("NTS synchronization", || {
         follows_nts(&mut client)
             && client.sources().is_ok_and(|sources| {
@@ -224,9 +237,9 @@ fn nts_time_is_trusted() {
     cross_check_sources(&tools, &socket, &mut client);
     cross_check_authentication(&tools, &socket, &mut client);
 
-    // The client leaves nothing behind in the daemons' directory.
+    // The client leaves no socket behind.
     drop(client);
-    assert_eq!(leftovers(&lab.dir), [] as [String; 0]);
+    assert_eq!(leftovers(&lab.replies()), [] as [String; 0]);
 }
 
 /// `prefer` with no NTS source configured leaves plain sources
@@ -238,7 +251,7 @@ fn plain_ntp_is_refused() {
     let plain = lab.plain_server();
     let socket =
         lab.client(&format!("authselectmode prefer\n{}\n", plain.line()), None);
-    let mut client = Client::connect(&socket).unwrap();
+    let mut client = lab.connect(&socket);
     lab.wait("synchronization to the plain server", || {
         client.tracking().is_ok_and(|t| {
             t.address == Address::V4(PLAIN) && t.root_distance() < 0.01
@@ -257,7 +270,7 @@ fn unreachable_nts_server_is_refused() {
     let mut lab = Lab::new(&tools);
     let nobody = Server::absent(NTS, true);
     let socket = lab.client(&nobody.line(), None);
-    let mut client = Client::connect(&socket).unwrap();
+    let mut client = lab.connect(&socket);
     lab.wait("an NTS-KE attempt", || {
         client.authentication(NTS).is_ok_and(|a| a.ke_attempts >= 1)
     });
@@ -288,9 +301,15 @@ fn untrusted_nts_certificate_is_refused() {
         &format!("{}\nntstrustedcerts {}\n", nts.line(), untrusted.display()),
         None,
     );
-    let mut client = Client::connect(&socket).unwrap();
+    let mut client = lab.connect(&socket);
     lab.wait("an NTS-KE attempt", || {
         client.authentication(NTS).is_ok_and(|a| a.ke_attempts >= 1)
+    });
+    // A failed handshake needs a server that answered; with none, the
+    // assertions below hold as well.
+    let log = lab.dir.join("client.log");
+    lab.wait("a failed TLS handshake", || {
+        fs::read_to_string(&log).is_ok_and(|l| l.contains("TLS handshake"))
     });
     assert_no_keys(&mut client);
     assert_unsynchronized(&client.tracking().unwrap());
@@ -313,7 +332,7 @@ fn local_reference_is_refused() {
     let nobody = Server::absent(PLAIN, false);
     let socket =
         lab.client(&format!("local stratum 10\n{}\n", nobody.line()), None);
-    let mut client = Client::connect(&socket).unwrap();
+    let mut client = lab.connect(&socket);
     lab.wait("the local reference", || {
         client
             .tracking()
@@ -350,7 +369,7 @@ fn reference_clock_is_refused() {
     );
     let stop = Arc::new(AtomicBool::new(false));
     let feeder = feed_refclock(path, stop.clone());
-    let mut client = Client::connect(&socket).unwrap();
+    let mut client = lab.connect(&socket);
     lab.wait("synchronization to the reference clock", || {
         client.tracking().is_ok_and(|t| t.is_synchronized())
     });
@@ -385,7 +404,7 @@ fn select_under(
         ),
         None,
     );
-    let mut client = Client::connect(&socket).unwrap();
+    let mut client = lab.connect(&socket);
     lab.wait("both sources sampled and one selected", || {
         client.authentication(NTS).is_ok_and(|a| a.key_bits > 0)
             && client.tracking().is_ok_and(|t| t.root_distance() < 0.01)
@@ -473,7 +492,7 @@ fn preferred_authentication_never_falls_back() {
         ),
         None,
     );
-    let mut client = Client::connect(&socket).unwrap();
+    let mut client = lab.connect(&socket);
     lab.wait("an NTS-KE attempt and a plain sample", || {
         client.authentication(NTS).is_ok_and(|a| a.ke_attempts >= 1)
             && client.sources().is_ok_and(|sources| {
@@ -508,7 +527,7 @@ fn required_authentication_without_nts() {
     let plain = lab.plain_server();
     let socket = lab
         .client(&format!("authselectmode require\n{}\n", plain.line()), None);
-    let mut client = Client::connect(&socket).unwrap();
+    let mut client = lab.connect(&socket);
     lab.wait("a plain sample", || {
         client
             .sources()
@@ -555,7 +574,7 @@ fn two_nts_servers_are_trusted() {
         ),
         None,
     );
-    let mut client = Client::connect(&socket).unwrap();
+    let mut client = lab.connect(&socket);
     lab.wait("NTS synchronization with keys from both", || {
         client.authentication(NTS).is_ok_and(|a| a.key_bits > 0)
             && client.authentication(NTS_2).is_ok_and(|a| a.key_bits > 0)
@@ -576,7 +595,7 @@ fn lost_nts_server_is_refused() {
     let nts = lab.nts_server(NTS);
     let socket =
         lab.client(&format!("authselectmode require\n{}\n", nts.line()), None);
-    let mut client = Client::connect(&socket).unwrap();
+    let mut client = lab.connect(&socket);
     lab.wait("NTS synchronization", || follows_nts(&mut client));
     assert_eq!(judge(&mut client), []);
 
@@ -597,7 +616,7 @@ fn distance_bound_is_applied() {
     let nts = lab.nts_server(NTS);
     let socket =
         lab.client(&format!("authselectmode require\n{}\n", nts.line()), None);
-    let mut client = Client::connect(&socket).unwrap();
+    let mut client = lab.connect(&socket);
     lab.wait("NTS synchronization", || follows_nts(&mut client));
     let tight = Limits {
         distance: 1e-9,
@@ -625,7 +644,7 @@ fn clock_reset_is_refused() {
         &format!("authselectmode require\n{}\n", nts.line()),
         Some(&clock),
     );
-    let mut client = Client::connect(&socket).unwrap();
+    let mut client = lab.connect(&socket);
     lab.wait("NTS synchronization", || follows_nts(&mut client));
     assert_eq!(judge(&mut client), []);
 
@@ -642,10 +661,9 @@ fn clock_reset_is_refused() {
         );
 
         lab.wait("synchronization after the reset", || {
-            follows_nts(&mut client)
-                && client
-                    .tracking()
-                    .is_ok_and(|t| (t.correction + offset as f64).abs() < 0.01)
+            follows_nts_and(&mut client, |t| {
+                (t.correction + offset as f64).abs() < 0.01
+            })
         });
         // chronyd's clock reads `offset` seconds past true time; its
         // corrected time is true time.
@@ -672,17 +690,14 @@ fn small_clock_reset_is_refused() {
         &format!("authselectmode require\n{}\n", nts.line()),
         Some(&clock),
     );
-    let mut client = Client::connect(&socket).unwrap();
+    let mut client = lab.connect(&socket);
     lab.wait("NTS synchronization", || follows_nts(&mut client));
 
     clock.set(5);
-    // The first update after a reset can carry a dispersion over a
-    // second; wait for it to settle.
+    // Updates just after a reset carry a root distance near a second; wait
+    // for a report that has settled and holds the correction.
     lab.wait("the correction", || {
-        follows_nts(&mut client)
-            && client
-                .tracking()
-                .is_ok_and(|t| (t.correction + 5.0).abs() < 0.05)
+        follows_nts_and(&mut client, |t| (t.correction + 5.0).abs() < 0.05)
     });
     let tracking = client.tracking().unwrap();
     assert!(tracking.is_synchronized());
@@ -707,24 +722,21 @@ fn packaged_layout() {
     let mut lab = Lab::new(&tools);
     let nts = lab.nts_server(NTS);
     let mut packaged = Packaged::start(&lab, &system, &nts);
-    let mut client = Client::connect(&packaged.socket).unwrap();
+    let mut client = packaged.connect().unwrap();
     lab.wait("NTS synchronization", || follows_nts(&mut client));
     assert_eq!(judge(&mut client), []);
     drop(client);
+    assert_eq!(leftovers(&packaged.replies), [] as [String; 0]);
 
     let chrony = &system.chrony;
     let nobody = &system.nobody;
     packaged.child("child_trusts_the_clock", chrony.uid, chrony.gid);
     packaged.child("child_is_refused", nobody.uid, nobody.gid);
     packaged.child("child_is_refused", nobody.uid, chrony.gid);
-    assert_eq!(
-        leftovers(packaged.socket.parent().unwrap()),
-        [] as [String; 0]
-    );
 
     packaged.daemon.kill();
     assert!(packaged.socket.exists());
-    let err = Client::connect(&packaged.socket).unwrap_err();
+    let err = packaged.connect().unwrap_err();
     assert!(
         matches!(&err, Error::Io(e) if e.kind() == io::ErrorKind::ConnectionRefused),
         "{err:?}"
@@ -736,9 +748,7 @@ fn packaged_layout() {
 #[test]
 #[ignore = "child case, run by packaged_layout"]
 fn child_trusts_the_clock() {
-    let socket =
-        std::env::var_os(CHILD_SOCKET).expect("the parent names the socket");
-    let mut client = Client::connect(socket).unwrap();
+    let mut client = child_connect().unwrap();
     assert_eq!(judge(&mut client), []);
 }
 
@@ -746,13 +756,18 @@ fn child_trusts_the_clock() {
 #[test]
 #[ignore = "child case, run by packaged_layout"]
 fn child_is_refused() {
-    let socket =
-        std::env::var_os(CHILD_SOCKET).expect("the parent names the socket");
-    let err = Client::connect(socket).unwrap_err();
+    let err = child_connect().unwrap_err();
     assert!(
         matches!(&err, Error::Io(e) if e.kind() == io::ErrorKind::PermissionDenied),
         "{err:?}"
     );
+}
+
+/// A client of the daemon the parent names, replying to the directory it
+/// names.
+fn child_connect() -> truenas_chrony::Result<Client> {
+    let var = |name| std::env::var_os(name).expect("the parent names it");
+    Client::connect_in(var(CHILD_SOCKET), var(CHILD_REPLIES))
 }
 
 /// An NTS source that has no keys.
@@ -776,12 +791,11 @@ fn assert_unsynchronized(tracking: &Tracking) {
     assert_eq!((tracking.root_delay, tracking.root_dispersion), (1.0, 1.0));
 }
 
-/// The client's reply directories left in `dir`.
+/// The reply sockets left in `dir`.
 fn leftovers(dir: &Path) -> Vec<String> {
     fs::read_dir(dir)
         .unwrap()
         .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
-        .filter(|n| n.starts_with("truenas_chrony."))
         .collect()
 }
 
@@ -833,7 +847,11 @@ fn cross_check_tracking(tools: &Tools, socket: &Path, client: &mut Client) {
     let t = client.tracking().unwrap();
     let row = &tools.csv(socket, &["tracking"])[0];
     assert_eq!(row[0], format!("{:08X}", t.reference_id.0));
-    assert_eq!(row[1], t.address.to_string());
+    let name = match t.address {
+        Address::Unspecified => t.reference_id.name(),
+        address => address.to_string(),
+    };
+    assert_eq!(row[1], name);
     assert_eq!(row[2], t.stratum.to_string());
     assert_eq!(row[3], timestamp(t.reference_time));
     // The correction and the root dispersion move with time.
@@ -1359,6 +1377,16 @@ impl Lab {
         self.daemons[server.daemon.unwrap()].kill();
     }
 
+    /// The directory clients reply to.
+    fn replies(&self) -> PathBuf {
+        self.dir.join("replies")
+    }
+
+    /// A client of the daemon at `socket`.
+    fn connect(&self, socket: &Path) -> Client {
+        Client::connect_in(socket, self.replies()).unwrap()
+    }
+
     /// An offset file for a client daemon's clock, starting at true time.
     fn fake_clock(&self, library: &Path) -> FakeClock {
         let clock = FakeClock {
@@ -1414,9 +1442,10 @@ impl Lab {
                 .env("FAKETIME_DONT_FAKE_MONOTONIC", "1");
         }
         let child = spawn(&mut command);
+        let replies = self.replies();
         self.daemons.push(Daemon { child, log });
         let daemon = self.daemons.last_mut().unwrap();
-        await_socket(daemon, &socket, name);
+        await_socket(daemon, &socket, &replies, name);
         socket
     }
 
@@ -1438,11 +1467,17 @@ impl Lab {
     }
 }
 
-/// Wait for a daemon's command socket to answer.
-fn await_socket(daemon: &mut Daemon, socket: &Path, name: &str) {
+/// Wait for a daemon's command socket to answer a client replying to
+/// `replies`.
+fn await_socket(
+    daemon: &mut Daemon,
+    socket: &Path,
+    replies: &Path,
+    name: &str,
+) {
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
-        if let Ok(mut client) = Client::connect(socket)
+        if let Ok(mut client) = Client::connect_in(socket, replies)
             && client.tracking().is_ok()
         {
             return;
@@ -1491,14 +1526,16 @@ impl System {
 
 /// chronyd as the Debian package runs it, under a temporary root: started
 /// as root under the package's seccomp filter, dropping to the chrony
-/// user, its socket in `run/chrony` (0700, that user's). The test binary
-/// is copied in for every user to run.
+/// user, its socket in `run/chrony` (0700, that user's). Root's clients
+/// reply to `run/truenas_chrony`. The test binary is copied in for every
+/// user to run.
 struct Packaged {
     // The daemon goes before its directory.
     daemon: Daemon,
     socket: PathBuf,
+    replies: PathBuf,
     test: PathBuf,
-    _root: tempfile::TempDir,
+    root: tempfile::TempDir,
 }
 
 impl Packaged {
@@ -1550,7 +1587,8 @@ impl Packaged {
                 .stderr(out),
         );
         let mut daemon = Daemon { child, log };
-        await_socket(&mut daemon, &socket, "packaged");
+        let replies = run.join("truenas_chrony");
+        await_socket(&mut daemon, &socket, &replies, "packaged");
 
         let test = root.path().join("test");
         fs::copy(std::env::current_exe().unwrap(), &test).unwrap();
@@ -1558,19 +1596,30 @@ impl Packaged {
         Packaged {
             daemon,
             socket,
+            replies,
             test,
-            _root: root,
+            root,
         }
     }
 
+    /// A client of this daemon, replying as root's do.
+    fn connect(&self) -> truenas_chrony::Result<Client> {
+        Client::connect_in(&self.socket, &self.replies)
+    }
+
     /// Run child case `case` as `uid`:`gid`, with no supplementary groups,
-    /// against this daemon.
+    /// against this daemon, replying to a directory of that user's, which
+    /// it must leave empty.
     fn child(&self, case: &str, uid: u32, gid: u32) {
+        let replies = self.root.path().join(format!("replies.{uid}.{gid}"));
+        fs::create_dir(&replies).unwrap();
+        std::os::unix::fs::chown(&replies, Some(uid), Some(gid)).unwrap();
         let output = spawn(
             Command::new(&self.test)
                 .arg(case)
                 .args(["--exact", "--ignored"])
                 .env(CHILD_SOCKET, &self.socket)
+                .env(CHILD_REPLIES, &replies)
                 .current_dir("/")
                 .uid(uid)
                 .gid(gid)
@@ -1592,6 +1641,7 @@ impl Packaged {
             stdout.contains("1 passed"),
             "case {case} did not run\nstdout:\n{stdout}"
         );
+        assert_eq!(leftovers(&replies), [] as [String; 0]);
     }
 }
 
@@ -1647,18 +1697,37 @@ fn user_name(uid: u32) -> String {
         .unwrap_or_else(|| panic!("uid {uid} has no /etc/passwd entry"))
 }
 
+/// A free UDP port on `ip`.
 fn free_udp(ip: Ipv4Addr) -> u16 {
-    UdpSocket::bind((ip, 0))
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
+    unshared(|| {
+        UdpSocket::bind((ip, 0))
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port()
+    })
 }
 
+/// A free TCP port on `ip`.
 fn free_tcp(ip: Ipv4Addr) -> u16 {
-    TcpListener::bind((ip, 0))
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
+    unshared(|| {
+        TcpListener::bind((ip, 0))
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port()
+    })
+}
+
+/// A port from `pick` not handed out before in this process. `pick`'s
+/// socket is gone before a daemon binds the port, and chronyd servers
+/// share a port without complaint, each taking part of its traffic.
+fn unshared(mut pick: impl FnMut() -> u16) -> u16 {
+    static HANDED_OUT: Mutex<BTreeSet<u16>> = Mutex::new(BTreeSet::new());
+    loop {
+        let port = pick();
+        if HANDED_OUT.lock().unwrap().insert(port) {
+            return port;
+        }
+    }
 }

@@ -2,12 +2,10 @@
 // SPDX-License-Identifier: MIT
 //! [`Client`]: [`Request`]s over chronyd's Unix socket, one at a time.
 
-use std::fs::{self, DirBuilder, File, OpenOptions, Permissions};
+use std::ffi::OsStr;
+use std::fs::{self, DirBuilder, File, Permissions};
 use std::io::{self, Read};
-use std::os::fd::{AsFd, AsRawFd};
-use std::os::unix::fs::{
-    DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt,
-};
+use std::os::unix::fs::{DirBuilderExt, FileTypeExt, PermissionsExt};
 use std::os::unix::net::UnixDatagram;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -22,6 +20,9 @@ use crate::types::Address;
 /// chronyd's command socket on TrueNAS and Debian.
 pub const DEFAULT_SOCKET: &str = "/run/chrony/chronyd.sock";
 
+/// The directory [`Client::connect`] binds its reply socket in.
+pub const DEFAULT_REPLY_DIR: &str = "/run/truenas_chrony";
+
 /// Room for any reply; the longest read here is 104 bytes.
 const RECV_BUF: usize = 1024;
 
@@ -29,31 +30,31 @@ const RECV_BUF: usize = 1024;
 /// error.
 const SOURCE_WALKS: u32 = 3;
 
-/// The reply socket's name inside its directory.
-const REPLY_SOCKET: &str = "sock";
-
 /// A connection to chronyd's command socket.
 ///
-/// chronyd replies to the sender's address, so the client binds `sock`
-/// (mode 0666, for a daemon running as another user) in a directory
-/// beside the daemon's socket, `truenas_chrony.` and sixteen random hex
-/// digits (mode 0711). Both are removed on drop.
+/// chronyd replies to the sender's address, so the client binds a reply
+/// socket, sixteen random hex digits and `.sock` (mode 0666, for a daemon
+/// running as another user), in a directory of its own (mode 0711, made
+/// if missing). The socket is removed on drop, or by a later client if
+/// its own never dropped; the directory is kept.
 ///
-/// That needs write access to the daemon's socket directory (root or the
-/// chrony user for `/run/chrony`), and the reply socket's path, the
-/// directory's plus 37 bytes, must fit in 107 bytes. The daemon owns that
-/// directory, so the client checks that the directory it opened is the
-/// one it created and changes the socket's mode through it, not by path.
-/// Under AppArmor, chronyd needs write access to `@{run}/chrony/**`.
+/// Modes are set and stale sockets removed by path, so the directory must
+/// be on a path only the caller can modify. chronyd must reach it, which
+/// rules out `/tmp` under Debian's unit. The directory's path plus 22
+/// bytes must fit in 107 bytes. Where AppArmor mediates sends to pathname
+/// sockets, a profile confining chronyd must allow it to write the reply
+/// socket, as `@{run}/truenas_chrony/*.sock w,` does for
+/// [`DEFAULT_REPLY_DIR`]. Reaching the daemon's socket in `/run/chrony`
+/// needs root or the chrony user.
 ///
 /// Calls take `&mut self`: one request at a time. An unanswered request
 /// is resent with a fresh sequence number, each wait double the last.
 #[derive(Debug)]
 pub struct Client {
-    // Fields drop in order: the socket is closed before its file and
-    // directory are removed.
+    // Fields drop in order: the socket is closed before its file is
+    // removed.
     socket: UnixDatagram,
-    _dir: ReplyDir,
+    _reply: ReplySocket,
     urandom: File,
     timeout: Duration,
     attempts: u32,
@@ -65,16 +66,28 @@ impl Client {
         Client::connect(DEFAULT_SOCKET)
     }
 
-    /// Connect to chronyd's command socket at `path`.
+    /// Connect to chronyd's command socket at `path`, with the reply
+    /// socket in [`DEFAULT_REPLY_DIR`], which needs root.
     ///
     /// A daemon that is not running fails here: [`Error::Io`] with
     /// `NotFound` (no socket) or `ConnectionRefused` (a stale one).
     pub fn connect(path: impl AsRef<Path>) -> Result<Client> {
+        Client::connect_in(path, DEFAULT_REPLY_DIR)
+    }
+
+    /// Connect to chronyd's command socket at `path`, with the reply
+    /// socket in `dir`. A daemon that is not running fails as for
+    /// [`connect`](Self::connect), before `dir` is touched.
+    pub fn connect_in(
+        path: impl AsRef<Path>,
+        dir: impl AsRef<Path>,
+    ) -> Result<Client> {
         let mut urandom = File::open("/dev/urandom")?;
-        let (socket, dir) = bind_reply_socket(path.as_ref(), &mut urandom)?;
+        let (socket, reply) =
+            bind_reply_socket(path.as_ref(), dir.as_ref(), &mut urandom)?;
         Ok(Client {
             socket,
-            _dir: dir,
+            _reply: reply,
             urandom,
             timeout: Duration::from_secs(1),
             attempts: 3,
@@ -208,86 +221,76 @@ fn timed_out(err: &io::Error) -> bool {
     )
 }
 
-/// The directory holding the client's reply socket. Dropping it removes
-/// the socket and the directory.
+/// The client's reply socket file, removed when dropped.
 #[derive(Debug)]
-struct ReplyDir {
-    path: PathBuf,
-    /// The directory, opened and checked; `None` until then.
-    dir: Option<File>,
-}
+struct ReplySocket(PathBuf);
 
-impl ReplyDir {
-    /// `name` in the open directory, by a path through its descriptor,
-    /// whatever has since happened to the path it was created at.
-    fn through(dir: &File, name: &str) -> PathBuf {
-        PathBuf::from(format!("/proc/self/fd/{}/{name}", dir.as_raw_fd()))
-    }
-}
-
-impl Drop for ReplyDir {
+impl Drop for ReplySocket {
     fn drop(&mut self) {
-        if let Some(dir) = &self.dir {
-            let _ = fs::remove_file(ReplyDir::through(dir, REPLY_SOCKET));
-        }
-        let _ = fs::remove_dir(&self.path);
+        let _ = fs::remove_file(&self.0);
     }
 }
 
-/// Bind the client's reply socket beside the daemon's at `server`, and
-/// connect it there.
+/// Bind the client's reply socket in `dir`, and connect it to the
+/// daemon's at `server`.
 fn bind_reply_socket(
     server: &Path,
+    dir: &Path,
     urandom: &mut File,
-) -> Result<(UnixDatagram, ReplyDir)> {
-    // chronyd replies to the reply socket's path as bound, resolved from
-    // its own working directory, so the path must be absolute.
-    let server = std::path::absolute(server)?;
+) -> Result<(UnixDatagram, ReplySocket)> {
+    // Reach the daemon before creating anything.
+    UnixDatagram::unbound()?.connect(server)?;
 
-    // Reach the daemon before creating anything beside it.
-    let probe = UnixDatagram::unbound()?;
-    probe.connect(&server)?;
-    // A new socket's inode belongs to its creator's filesystem uid, which
-    // is also the owner a new directory gets.
-    let owner = File::from(probe.as_fd().try_clone_to_owned()?)
-        .metadata()?
-        .uid();
-    drop(probe);
+    // chronyd resolves the reply socket's path from its own working
+    // directory, so the path must be absolute.
+    let dir = std::path::absolute(dir)?;
+    if let Err(err) = DirBuilder::new().mode(0o711).create(&dir)
+        && err.kind() != io::ErrorKind::AlreadyExists
+    {
+        return Err(err.into());
+    }
+    // Whatever the umask or an earlier mode left: the bind needs the
+    // search bit, and so does chronyd.
+    fs::set_permissions(&dir, Permissions::from_mode(0o711))?;
+    sweep(&dir);
 
-    let parent = server.parent().ok_or_else(|| {
-        io::Error::new(io::ErrorKind::InvalidInput, "socket path has no parent")
-    })?;
     let mut tag = [0u8; 8];
     urandom.read_exact(&mut tag)?;
-    let tag: String = tag.iter().map(|b| format!("{b:02x}")).collect();
-    let path = parent.join(format!("truenas_chrony.{tag}"));
-    DirBuilder::new().mode(0o711).create(&path)?;
-    let mut reply_dir = ReplyDir { path, dir: None };
+    let name: String = tag.iter().map(|b| format!("{b:02x}")).collect();
+    let path = dir.join(format!("{name}.sock"));
+    let socket = UnixDatagram::bind(&path)?;
+    let reply = ReplySocket(path);
+    fs::set_permissions(&reply.0, Permissions::from_mode(0o666))?;
+    socket.connect(server)?;
+    Ok((socket, reply))
+}
 
-    let dir = OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
-        .open(&reply_dir.path)?;
-    let meta = dir.metadata()?;
-    // The umask can only remove bits from 0711, so other bits or another
-    // owner mean a directory swapped in after the mkdir.
-    if !meta.is_dir()
-        || meta.mode() & 0o777 & !0o711 != 0
-        || meta.uid() != owner
-    {
-        return Err(Error::Io(io::Error::other(
-            "reply socket directory replaced before it was opened",
-        )));
+/// Remove the reply sockets in `dir` that refuse a connection: no client
+/// is bound to them, so one exited without dropping its own.
+fn sweep(dir: &Path) {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let stale = entry.file_type().is_ok_and(|t| t.is_socket())
+            && is_reply_name(&entry.file_name())
+            && UnixDatagram::unbound().is_ok_and(|probe| {
+                probe.connect(&path).is_err_and(|e| {
+                    e.kind() == io::ErrorKind::ConnectionRefused
+                })
+            });
+        if stale {
+            let _ = fs::remove_file(&path);
+        }
     }
-    let socket = UnixDatagram::bind(reply_dir.path.join(REPLY_SOCKET))?;
-    let dir = reply_dir.dir.insert(dir);
-    // Through the descriptor: a redirected path finds no socket and
-    // fails, rather than changing the mode of whatever it reaches.
-    fs::set_permissions(
-        ReplyDir::through(dir, REPLY_SOCKET),
-        Permissions::from_mode(0o666),
-    )?;
-    dir.set_permissions(Permissions::from_mode(0o711))?;
-    socket.connect(&server)?;
-    Ok((socket, reply_dir))
+}
+
+/// Whether `name` is a reply socket's: sixteen hex digits and `.sock`.
+fn is_reply_name(name: &OsStr) -> bool {
+    name.to_str()
+        .and_then(|name| name.strip_suffix(".sock"))
+        .is_some_and(|tag| {
+            tag.len() == 16 && tag.bytes().all(|b| b.is_ascii_hexdigit())
+        })
 }

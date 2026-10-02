@@ -16,8 +16,6 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-# `O_DIRECTORY`/`O_NOFOLLOW` constants only; nothing calls into C.
-libc = "0.2.155"
 # Typed flag sets for selection options, matching the sibling crates.
 bitflags = "2.6"
 

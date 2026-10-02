@@ -196,7 +196,7 @@ pub struct Selection {
     /// differ from the configured ones.
     pub effective_options: SelectOptions,
     /// Seconds from the source's latest measurement to the selection;
-    /// `None` when there is none.
+    /// zero, not `None`, before the first.
     pub last_sample_ago: Option<u32>,
     /// How the source has compared with the selected one; at 10 the
     /// selection moves to it.

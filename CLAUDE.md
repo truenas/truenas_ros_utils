@@ -94,16 +94,18 @@ the floor is 4.6.1; another revision surfaces as an error
 `Error::is_unsupported` recognizes. `Client::sources` walks again if the
 list changes mid-walk.
 
-The reply socket lives in a 0711 directory beside the daemon's, which needs
-root or the chrony user. An AppArmor profile confining chronyd must allow
-writes to `@{run}/chrony/**`.
+`Client` replies to a 0711 directory of its own, `/run/truenas_chrony` by
+default, setting modes and removing stale sockets by path: that directory
+must be on a path only the caller can modify. Reaching the daemon needs root or the chrony user. Where
+AppArmor mediates pathname sockets, chronyd needs
+`@{run}/truenas_chrony/*.sock w`.
 
 [`tests/chronyd.rs`](truenas_chrony/tests/chronyd.rs) puts real chronyd to
 the documented gate scenario by scenario, and in one checks every report
 against chronyc. Clock resets use libfaketime, with offsets over a second, as
 smaller ones are not measured faithfully under it. Certificates come from
-`openssl` at run time. The packaged-layout scenario
-needs root and `_chrony`. `TRUENAS_CHRONY_REQUIRE_CHRONYD=1` and
+`openssl` at run time. The packaged-layout scenario needs root, `_chrony`,
+and a `TMPDIR` that user can search. `TRUENAS_CHRONY_REQUIRE_CHRONYD=1` and
 `TRUENAS_CHRONY_REQUIRE_ROOT=1` turn skips into failures. CI runs the crate
 in a Debian trixie container; Ubuntu's chrony 4.5 is below the floor.
 
@@ -496,13 +498,12 @@ CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER="valgrind --error-exitcode=99 \
     --keep-debuginfo=yes --quiet \
     --suppressions=$PWD/valgrind.supp \
     --trace-children=yes \
-    --trace-children-skip=*/cc,*/python3*,*/krb5kdc,*/kadmin.local,*/kdb5_util,*/kinit,*/chronyd,*/chronyc" \
+    --trace-children-skip=*/cc,*/python3*,*/krb5kdc,*/kadmin.local,*/kdb5_util,*/kinit" \
     TRUENAS_MDB_REQUIRE_PYTHON=1 TRUENAS_PAM_REQUIRE_MODULES=1 \
     TRUENAS_NSS_REQUIRE_CC=1 TRUENAS_NSS_REQUIRE_SYSTEM=1 \
     TRUENAS_KTLS_REQUIRE_SYSTEM=1 \
     TRUENAS_KRB5_REQUIRE_KDC=1 TRUENAS_GSSAPI_REQUIRE_KDC=1 \
-    TRUENAS_CHRONY_REQUIRE_CHRONYD=1 TRUENAS_CHRONY_REQUIRE_ROOT=1 \
-    cargo test --workspace
+    cargo test --workspace --exclude truenas_chrony
 ```
 
 [`valgrind.supp`](valgrind.supp) suppresses leaks *inside* a bound system
@@ -521,10 +522,10 @@ and the chrony suite needs `chrony` 4.6.1 or later, built with NTS,
 `openssl`, and `libfaketime`, with root and the package's `_chrony` user for
 its packaged scenario; the memcheck run needs `valgrind`, and `--keep-debuginfo=yes`
 because libpam unloads each module before the process ends. The
-re-executed KDC tools, chronyd, and chronyc are skipped under memcheck
-alongside `cc` and `python3`: they are not under test and are not
-memcheck-clean, and the crates under test drive them only as child
-processes.
+re-executed KDC tools are skipped under memcheck alongside `cc` and
+`python3`: they are not under test and are not memcheck-clean, and the
+crates under test drive them only as child processes. `truenas_chrony` has
+no FFI boundary, so the memcheck run leaves it out.
 
 The Kerberos suites re-execute the test binary as a child (like the NSS
 fan-out suite), so `--trace-children=yes` already covers the in-crate code

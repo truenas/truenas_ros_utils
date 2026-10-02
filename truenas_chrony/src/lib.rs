@@ -105,7 +105,7 @@ mod types;
 mod wire;
 
 pub use auth::{Algorithm, AuthMode, Authentication};
-pub use client::{Client, DEFAULT_SOCKET};
+pub use client::{Client, DEFAULT_REPLY_DIR, DEFAULT_SOCKET};
 pub use error::{Error, Result, Status};
 pub use request::{Request, Verdict};
 pub use source::{

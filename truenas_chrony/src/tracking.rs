@@ -22,7 +22,8 @@ pub struct Tracking {
     /// The NTP source the clock follows; [`Address::Unspecified`] for a
     /// reference clock, a local reference, or none.
     pub address: Address,
-    /// The clock's stratum; zero when unsynchronized.
+    /// The clock's stratum; zero with no reference, and the configured one
+    /// under a local reference.
     pub stratum: u16,
     /// The leap status chronyd passes on to its own NTP clients.
     pub leap: Leap,
@@ -37,7 +38,7 @@ pub struct Tracking {
     /// Root mean square of the measured offsets.
     pub rms_offset: f64,
     /// The uncorrected clock's frequency error; positive when it runs
-    /// slow.
+    /// fast.
     pub frequency_ppm: f64,
     /// The frequency error left relative to the reference.
     pub residual_frequency_ppm: f64,

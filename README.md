@@ -35,8 +35,9 @@ other; depend on the one you need.
 - Nothing extra to build `truenas_jsonrpc` or `truenas_xdr`; neither links a
   C library and neither needs anything at run time
 - Nothing extra to build `truenas_chrony`; at run time it needs chronyd
-  4.6.1 or later, root or the chrony user, and, under AppArmor, chronyd
-  allowed to write `/run/chrony/**`
+  4.6.1 or later and root or the chrony user, and, where AppArmor mediates
+  sends to pathname sockets, chronyd allowed to write
+  `/run/truenas_chrony/*.sock`
 
 Optional, for the full test suite:
 
@@ -47,7 +48,7 @@ Optional, for the full test suite:
   `truenas_krb5`'s and `truenas_gssapi`'s KDC-backed suites
 - `chrony` 4.6.1 or later with NTS, `openssl`, and `libfaketime` for
   `truenas_chrony`'s chronyd-backed suite; its packaged-layout scenario
-  also needs root and `_chrony`
+  also needs root, `_chrony`, and a `TMPDIR` that user can search
 - `valgrind` for the memcheck run
 
 ## Building and testing
@@ -117,8 +118,8 @@ To run the suites under valgrind, as CI does:
 CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER="valgrind --error-exitcode=99 \
     --leak-check=full --errors-for-leak-kinds=definite --keep-debuginfo=yes \
     --quiet --suppressions=$PWD/valgrind.supp --trace-children=yes \
-    --trace-children-skip=*/cc,*/python3*,*/krb5kdc,*/kadmin.local,*/kdb5_util,*/kinit,*/chronyd,*/chronyc" \
-    cargo test --workspace
+    --trace-children-skip=*/cc,*/python3*,*/krb5kdc,*/kadmin.local,*/kdb5_util,*/kinit" \
+    cargo test --workspace --exclude truenas_chrony
 ```
 
 `valgrind.supp` suppresses leaks inside a bound system library on paths the
@@ -131,9 +132,9 @@ in this workspace's own code.
 report from inside one has no symbols left to name.
 
 `--trace-children=yes` is for `truenas_nss`: its fan-out suite drives the
-module registry only in a re-executed child. `cc`, `python3`, the KDC tools,
-`chronyd`, and `chronyc` are skipped — they are not under test and are not
-memcheck-clean.
+module registry only in a re-executed child. `cc`, `python3`, and the KDC
+tools are skipped — they are not under test and are not memcheck-clean.
+`truenas_chrony` has no FFI boundary and is left out.
 
 ## License
 

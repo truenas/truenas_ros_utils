@@ -70,8 +70,14 @@ impl Fake {
         let thread = thread::spawn(move || {
             let mut log = Vec::new();
             let mut buf = [0u8; 4096];
-            while !stopping.load(Ordering::SeqCst) {
+            loop {
+                // Read before the receive, so a request sent before the
+                // stop is received before the loop can end.
+                let stopped = stopping.load(Ordering::SeqCst);
                 let Ok((len, from)) = socket.recv_from(&mut buf) else {
+                    if stopped {
+                        break;
+                    }
                     continue;
                 };
                 let request = Received {
@@ -107,14 +113,19 @@ impl Fake {
         &self.path
     }
 
-    /// The directory the daemon socket is in.
-    pub fn dir(&self) -> &Path {
-        self.dir.path()
+    /// The directory clients of this daemon reply to.
+    pub fn replies(&self) -> PathBuf {
+        self.dir.path().join("replies")
+    }
+
+    /// A client of this daemon.
+    pub fn connect(&self) -> Client {
+        Client::connect_in(&self.path, self.replies()).unwrap()
     }
 
     /// A client of this daemon that gives up quickly.
     pub fn client(&self) -> Client {
-        let mut client = Client::connect(&self.path).unwrap();
+        let mut client = self.connect();
         client.set_timeout(Duration::from_millis(200));
         client.set_attempts(1);
         client

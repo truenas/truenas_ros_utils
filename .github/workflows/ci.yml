@@ -115,8 +115,9 @@ jobs:
     # the end of a transaction, and a report from inside one would otherwise
     # have no symbols left to name. `--trace-children=yes` follows the
     # re-executed children the NSS fan-out and the Kerberos suites drive, while
-    # cc, python3, the MIT KDC tools, chronyd, and chronyc are skipped: they
-    # are not under test and are not memcheck-clean.
+    # cc, python3, and the MIT KDC tools are skipped: they are not under test
+    # and are not memcheck-clean. truenas_chrony has no FFI boundary and is
+    # left out.
     - name: valgrind
       run: cargo test --workspace --locked --exclude truenas_chrony
       env:
@@ -125,7 +126,7 @@ jobs:
           --errors-for-leak-kinds=definite --keep-debuginfo=yes --quiet
           --suppressions=${{ github.workspace }}/valgrind.supp
           --trace-children=yes
-          --trace-children-skip=*/cc,*/python3*,*/krb5kdc,*/kadmin.local,*/kdb5_util,*/kinit,*/klist,*/chronyd,*/chronyc
+          --trace-children-skip=*/cc,*/python3*,*/krb5kdc,*/kadmin.local,*/kdb5_util,*/kinit
         TRUENAS_MDB_REQUIRE_PYTHON: "1"
         TRUENAS_PAM_REQUIRE_MODULES: "1"
         TRUENAS_NSS_REQUIRE_CC: "1"
