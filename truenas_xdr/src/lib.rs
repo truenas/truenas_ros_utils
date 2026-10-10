@@ -37,6 +37,10 @@
 //!   [`XdrEnum`] or [`XdrUnion`]; a stock `#[derive(Serialize)]` enum encodes
 //!   the declaration index.
 //!
+//! A union's default arm (§4.15) is its last variant, marked
+//! `#[xdr(default)]`. The first field of that variant holds the discriminant
+//! and any further fields are the arm's body.
+//!
 //! A single-field newtype is wire-transparent, so wrappers cost no bytes.
 //!
 //! Maps have no XDR representation and are rejected as
@@ -103,6 +107,30 @@ use serde::{Deserialize, Serialize};
 /// Bytes in one XDR unit (RFC 4506 §3). Every encoded item is a whole number
 /// of these.
 pub const BYTES_PER_XDR_UNIT: usize = 4;
+
+/// Support for the code the derive macros generate. Not a stable part of the
+/// API.
+#[cfg(feature = "derive")]
+#[doc(hidden)]
+pub mod __private {
+    use crate::{BYTES_PER_XDR_UNIT, Error, Result, to_writer};
+    use serde::Serialize;
+
+    /// The discriminant `value` encodes as. A discriminant is one XDR unit
+    /// (RFC 4506 §4.15), so a value that encodes to any other size is
+    /// refused.
+    pub fn discriminant<T: ?Sized + Serialize>(value: &T) -> Result<i32> {
+        let mut unit = [0u8; BYTES_PER_XDR_UNIT];
+        let mut rest: &mut [u8] = &mut unit;
+        if to_writer(&mut rest, value).is_ok() && rest.is_empty() {
+            Ok(i32::from_be_bytes(unit))
+        } else {
+            Err(Error::Unsupported(
+                "a union discriminant that is not one XDR unit",
+            ))
+        }
+    }
+}
 
 /// Newtype name by which [`FixedOpaque`] tells the codec "raw bytes, no length
 /// prefix". Not a stable part of the API.

@@ -340,6 +340,32 @@ fn section_4_15_union_is_a_discriminant_then_the_implied_arm() {
     );
 }
 
+/// `union switch (int status) { case 0: string value<>; default: void; }`
+#[derive(truenas_xdr::XdrUnion, PartialEq, Debug)]
+#[repr(i32)]
+enum Lookup {
+    Found(String) = 0,
+    #[xdr(default)]
+    Failed(i32),
+}
+
+#[test]
+fn section_4_15_a_default_arm_takes_the_unspecified_discriminants() {
+    // "default: default-declaration;" and "The default arm is optional."
+    round_trips(
+        &Lookup::Found("x".to_string()),
+        &[0, 0, 0, 0, 0, 0, 0, 1, b'x', 0, 0, 0],
+    );
+    round_trips(&Lookup::Failed(2), &[0, 0, 0, 2]);
+}
+
+#[test]
+fn section_4_15_without_a_default_arm_other_discriminants_are_invalid() {
+    // "If it is not specified, then a valid encoding of the union cannot
+    // take on unspecified discriminant values."
+    assert!(from_bytes::<Filetype>(&[0, 0, 0, 3]).is_err());
+}
+
 #[test]
 fn section_4_16_a_void_arm_adds_nothing_after_the_discriminant() {
     // "An XDR void is a 0-byte quantity."
