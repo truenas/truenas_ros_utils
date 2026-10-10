@@ -16,13 +16,18 @@
 //! Discriminants must be integer literals, explicit (`= 4`) or implicit
 //! (`prev + 1`); a const-expression discriminant or a generic type is a
 //! compile error.
+//!
+//! A union may borrow from the input. [`XdrUnion`] accepts lifetime
+//! parameters, so an arm can hold a `&'a str` or a `VarOpaqueRef<'a>`. Type
+//! and const parameters are still refused.
 #![forbid(unsafe_code)]
 
 use proc_macro::TokenStream;
+use proc_macro2::Span;
 use quote::{format_ident, quote};
 use syn::{
-    Data, DataEnum, DeriveInput, Expr, ExprLit, ExprUnary, Fields, Lit, UnOp,
-    parse_macro_input,
+    Data, DataEnum, DeriveInput, Expr, ExprLit, ExprUnary, Fields,
+    GenericParam, Lifetime, LifetimeParam, Lit, UnOp, parse_macro_input,
 };
 
 /// Derive `Serialize`/`Deserialize` for a field-less enum, encoding it as its
@@ -96,6 +101,32 @@ fn reject_generics(input: &DeriveInput) -> syn::Result<()> {
     }
 }
 
+/// The lifetimes a union borrows for. A union may borrow from the input, so
+/// lifetime parameters pass. The wire layout is fixed per concrete type, so
+/// type and const parameters are refused. `'de` is refused because the
+/// generated impl gives that name to the input.
+fn union_lifetimes(input: &DeriveInput) -> syn::Result<Vec<Lifetime>> {
+    let mut out = Vec::new();
+    for param in &input.generics.params {
+        match param {
+            GenericParam::Lifetime(l) if l.lifetime.ident == "de" => {
+                return Err(syn::Error::new_spanned(
+                    l,
+                    "XdrUnion names the input `'de`, rename this lifetime",
+                ));
+            }
+            GenericParam::Lifetime(l) => out.push(l.lifetime.clone()),
+            other => {
+                return Err(syn::Error::new_spanned(
+                    other,
+                    "XdrUnion supports lifetime parameters only",
+                ));
+            }
+        }
+    }
+    Ok(out)
+}
+
 fn enum_data<'a>(
     input: &'a DeriveInput,
     macro_name: &str,
@@ -162,7 +193,16 @@ fn expand_enum(input: DeriveInput) -> syn::Result<TokenStream> {
 }
 
 fn expand_union(input: DeriveInput) -> syn::Result<TokenStream> {
-    reject_generics(&input)?;
+    let lifetimes = union_lifetimes(&input)?;
+    let (impl_generics, ty_generics, where_clause) =
+        input.generics.split_for_impl();
+    // `'de` outlives every lifetime the union borrows for, so a borrowed arm
+    // can point into the input.
+    let mut de_generics = input.generics.clone();
+    let mut de = LifetimeParam::new(Lifetime::new("'de", Span::call_site()));
+    de.bounds.extend(lifetimes.iter().cloned());
+    de_generics.params.insert(0, GenericParam::Lifetime(de));
+    let (de_impl_generics, _, _) = de_generics.split_for_impl();
     let name = &input.ident;
     let data = enum_data(&input, "XdrUnion")?;
     let discs = discriminants(data)?;
@@ -269,7 +309,9 @@ fn expand_union(input: DeriveInput) -> syn::Result<TokenStream> {
     }
 
     Ok(quote! {
-        impl ::serde::Serialize for #name {
+        impl #impl_generics ::serde::Serialize
+            for #name #ty_generics #where_clause
+        {
             fn serialize<S: ::serde::Serializer>(
                 &self,
                 serializer: S,
@@ -277,13 +319,19 @@ fn expand_union(input: DeriveInput) -> syn::Result<TokenStream> {
                 match self { #( #ser_arms )* }
             }
         }
-        impl<'de> ::serde::Deserialize<'de> for #name {
+        impl #de_impl_generics ::serde::Deserialize<'de>
+            for #name #ty_generics #where_clause
+        {
             fn deserialize<D: ::serde::Deserializer<'de>>(
                 deserializer: D,
             ) -> ::core::result::Result<Self, D::Error> {
-                struct __Visitor;
-                impl<'de> ::serde::de::Visitor<'de> for __Visitor {
-                    type Value = #name;
+                struct __Visitor #impl_generics (
+                    ::core::marker::PhantomData<( #( &#lifetimes (), )* )>,
+                ) #where_clause;
+                impl #de_impl_generics ::serde::de::Visitor<'de>
+                    for __Visitor #ty_generics #where_clause
+                {
+                    type Value = #name #ty_generics;
                     fn expecting(
                         &self,
                         f: &mut ::core::fmt::Formatter,
@@ -296,7 +344,10 @@ fn expand_union(input: DeriveInput) -> syn::Result<TokenStream> {
                     fn visit_seq<A: ::serde::de::SeqAccess<'de>>(
                         self,
                         mut seq: A,
-                    ) -> ::core::result::Result<#name, A::Error> {
+                    ) -> ::core::result::Result<
+                        #name #ty_generics,
+                        A::Error,
+                    > {
                         let tag: i32 =
                             ::serde::de::SeqAccess::next_element(&mut seq)?
                                 .ok_or_else(|| {
@@ -319,7 +370,9 @@ fn expand_union(input: DeriveInput) -> syn::Result<TokenStream> {
                     }
                 }
                 ::serde::Deserializer::deserialize_tuple(
-                    deserializer, #max_elems, __Visitor,
+                    deserializer,
+                    #max_elems,
+                    __Visitor(::core::marker::PhantomData),
                 )
             }
         }
@@ -386,6 +439,23 @@ mod tests {
         assert!(reject_generics(&input("enum E { A }")).is_ok());
         assert!(reject_generics(&input("enum E<T> { A }")).is_err());
         assert!(reject_generics(&input("struct S<'a> { x: &'a u8 }")).is_err());
+    }
+
+    /// This catches a type or const parameter being accepted, which has no
+    /// fixed layout, and a `'de` that would collide with the generated impl.
+    #[test]
+    fn a_union_takes_lifetimes_and_no_other_parameter() {
+        let two =
+            union_lifetimes(&input("enum E<'a, 'b> { A(&'a str, &'b str) }"));
+        assert_eq!(two.unwrap().len(), 2);
+        assert!(union_lifetimes(&input("enum E { A }")).unwrap().is_empty());
+        assert!(union_lifetimes(&input("enum E<T> { A(T) }")).is_err());
+        assert!(
+            union_lifetimes(&input("enum E<const N: usize> { A }")).is_err()
+        );
+        assert!(
+            union_lifetimes(&input("enum E<'de> { A(&'de str) }")).is_err()
+        );
     }
 
     #[test]

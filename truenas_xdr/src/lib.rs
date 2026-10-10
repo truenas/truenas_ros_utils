@@ -71,6 +71,9 @@
 //! # Ok::<(), truenas_xdr::Error>(())
 //! ```
 //!
+//! A union derived with [`XdrUnion`] borrows the same way. It declares a
+//! lifetime and needs no attribute on its arms.
+//!
 //! # Decoding
 //!
 //! [`from_bytes`] requires the input to be consumed exactly; [`from_prefix`]
