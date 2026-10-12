@@ -3,10 +3,12 @@
 //! Wrapper types for the XDR shapes a stock serde call would encode wrongly.
 
 use serde::de::{self, Visitor};
+use serde::ser::SerializeTupleStruct;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::fmt;
+use std::marker::PhantomData;
 
-use crate::SENTINEL_FIXED;
+use crate::{SENTINEL_BOUNDED, SENTINEL_FIXED};
 
 /// Variable-length opaque, RFC 4506 §4.10 (`opaque<>`): a `u32` length, the
 /// bytes, then zero padding to a 4-byte boundary.
@@ -233,6 +235,101 @@ impl<'de, const N: usize> Visitor<'de> for FixedVisitor<N> {
             E::custom(format!("expected {N} bytes, got {}", v.len()))
         })?;
         Ok(FixedOpaque(bytes))
+    }
+}
+
+/// A variable-length value held to an upper bound, RFC 4506 §4.10, §4.11 and
+/// §4.13 (`opaque<N>`, `string<N>`, `T<N>`).
+///
+/// The bound counts bytes for opaque data and strings and elements for an
+/// array. Decoding checks the length the input declares before it reads
+/// anything that length covers, and encoding refuses a longer value. Either
+/// failure is [`Error::TooLong`](crate::Error::TooLong). The bytes of a value
+/// within its bound are the same with or without the wrapper.
+///
+/// ```
+/// # use truenas_xdr::{from_bytes, to_bytes, Bounded, Error, VarOpaqueRef};
+/// // opaque handle<4>
+/// type Handle<'a> = Bounded<VarOpaqueRef<'a>, 4>;
+///
+/// let wire = to_bytes(&Bounded::<_, 4>(VarOpaqueRef(&[1, 2, 3])))?;
+/// assert_eq!(wire, [0, 0, 0, 3, 1, 2, 3, 0]);
+/// let handle: Handle<'_> = from_bytes(&wire)?;
+/// assert_eq!(handle.0.0, &[1, 2, 3]);
+///
+/// let long = [0, 0, 0, 5, 1, 2, 3, 4, 5, 0, 0, 0];
+/// assert_eq!(
+///     from_bytes::<Handle<'_>>(&long),
+///     Err(Error::TooLong { len: 5, max: 4 }),
+/// );
+/// # Ok::<(), truenas_xdr::Error>(())
+/// ```
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct Bounded<T, const MAX: usize>(
+    /// The value the bound applies to.
+    pub T,
+);
+
+/// A type whose encoding begins with a length, which is the length a
+/// [`Bounded`] bound applies to.
+///
+/// It is implemented for variable opaque data, strings, and `Vec`, and it is
+/// sealed. A bound waits for the next length the codec handles, so a type
+/// that began with anything else would leave the bound waiting for a field
+/// it does not belong to.
+pub trait Counted: sealed::Sealed {}
+
+mod sealed {
+    pub trait Sealed {}
+}
+
+impl<T: sealed::Sealed> Counted for T {}
+impl sealed::Sealed for VarOpaque {}
+impl sealed::Sealed for VarOpaqueRef<'_> {}
+impl sealed::Sealed for String {}
+impl sealed::Sealed for &str {}
+impl<T> sealed::Sealed for Vec<T> {}
+
+impl<T: Serialize + Counted, const MAX: usize> Serialize for Bounded<T, MAX> {
+    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        // The sentinel name carries the bound to the codec, which holds the
+        // next length it writes to that bound.
+        let mut held = s.serialize_tuple_struct(SENTINEL_BOUNDED, MAX)?;
+        held.serialize_field(&self.0)?;
+        held.end()
+    }
+}
+
+impl<'de, T: Deserialize<'de> + Counted, const MAX: usize> Deserialize<'de>
+    for Bounded<T, MAX>
+{
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        d.deserialize_tuple_struct(
+            SENTINEL_BOUNDED,
+            MAX,
+            BoundedVisitor(PhantomData),
+        )
+    }
+}
+
+struct BoundedVisitor<T, const MAX: usize>(PhantomData<T>);
+
+impl<'de, T: Deserialize<'de> + Counted, const MAX: usize> Visitor<'de>
+    for BoundedVisitor<T, MAX>
+{
+    type Value = Bounded<T, MAX>;
+
+    fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "a value no longer than {MAX}")
+    }
+
+    fn visit_newtype_struct<D: Deserializer<'de>>(
+        self,
+        d: D,
+    ) -> Result<Self::Value, D::Error> {
+        // The codec has the bound by now and holds the length `T` reads
+        // first to it.
+        T::deserialize(d).map(Bounded)
     }
 }
 

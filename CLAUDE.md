@@ -475,6 +475,12 @@ Strings and opaque data decode as borrows of the input. A wire format has to
 round-trip through itself, which `&[u8]` does not — serde encodes it as a
 sequence and decodes it as opaque — so `VarOpaqueRef` exists for that.
 
+A declared upper bound is `Bounded`, which wraps a variable-length type and
+holds its length to the bound in both directions. The decoder checks the
+declared length before it reads what that length covers, so a hostile length
+costs four bytes. The bound waits for the next length the codec handles, so
+`Bounded` accepts only the types whose encoding begins with one.
+
 A derived union may borrow from the input and may declare the default arm of
 §4.15. The default arm keeps the discriminant it matched as its first field,
 so a value decoded through it encodes back to the same bytes. Encoding

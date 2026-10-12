@@ -11,7 +11,7 @@ use serde::ser::{
 };
 use std::io::Write;
 
-use crate::{Error, Result, SENTINEL_FIXED, pad4};
+use crate::{Error, Result, SENTINEL_BOUNDED, SENTINEL_FIXED, pad4};
 
 /// Writes XDR to an [`io::Write`](std::io::Write) sink.
 pub(crate) struct Serializer<W> {
@@ -19,6 +19,9 @@ pub(crate) struct Serializer<W> {
     /// Set by `serialize_newtype_struct(SENTINEL_FIXED, ..)`, so the next
     /// `serialize_bytes` emits fixed opaque: bytes and padding, no length.
     fixed_pending: bool,
+    /// Set by `serialize_tuple_struct(SENTINEL_BOUNDED, max)`. The next
+    /// length written is held to this bound and clears it.
+    bound_pending: Option<usize>,
 }
 
 impl<W: Write> Serializer<W> {
@@ -26,6 +29,7 @@ impl<W: Write> Serializer<W> {
         Serializer {
             w,
             fixed_pending: false,
+            bound_pending: None,
         }
     }
 
@@ -47,6 +51,13 @@ impl<W: Write> Serializer<W> {
     /// count at `u32::MAX`; a longer value has no encoding, so it is
     /// refused rather than truncated.
     fn put_len(&mut self, len: usize) -> Result<()> {
+        // A pending bound belongs to this length and to no later one, so it
+        // is taken whether or not the length passes.
+        if let Some(max) = self.bound_pending.take()
+            && len > max
+        {
+            return Err(Error::TooLong { len, max });
+        }
         let len = u32::try_from(len)
             .map_err(|_| Error::Unsupported("a length beyond u32::MAX"))?;
         self.put_u32(len)
@@ -208,9 +219,13 @@ impl<W: Write> serde::Serializer for &mut Serializer<W> {
     }
     fn serialize_tuple_struct(
         self,
-        _name: &'static str,
-        _len: usize,
+        name: &'static str,
+        len: usize,
     ) -> Result<Self::SerializeTupleStruct> {
+        // Under the sentinel, `len` is a bound and not a field count.
+        if name == SENTINEL_BOUNDED {
+            self.bound_pending = Some(len);
+        }
         Ok(self)
     }
     fn serialize_tuple_variant(

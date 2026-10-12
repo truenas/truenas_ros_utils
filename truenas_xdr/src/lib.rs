@@ -37,6 +37,10 @@
 //!   [`XdrEnum`] or [`XdrUnion`]; a stock `#[derive(Serialize)]` enum encodes
 //!   the declaration index.
 //!
+//! A declared upper bound (`opaque<N>`, `string<N>`, `T<N>`) is [`Bounded`]
+//! around the variable-length type. A length over the bound is
+//! [`Error::TooLong`] when decoding and when encoding.
+//!
 //! A union's default arm (§4.15) is its last variant, marked
 //! `#[xdr(default)]`. The first field of that variant holds the discriminant
 //! and any further fields are the arm's body.
@@ -97,7 +101,7 @@ mod wrappers;
 pub use de::Deserializer;
 pub use error::{Error, Result};
 pub use strict::Strictness;
-pub use wrappers::{FixedOpaque, VarOpaque, VarOpaqueRef};
+pub use wrappers::{Bounded, Counted, FixedOpaque, VarOpaque, VarOpaqueRef};
 
 #[cfg(feature = "derive")]
 pub use truenas_xdr_derive::{XdrEnum, XdrUnion};
@@ -135,6 +139,10 @@ pub mod __private {
 /// Newtype name by which [`FixedOpaque`] tells the codec "raw bytes, no length
 /// prefix". Not a stable part of the API.
 pub(crate) const SENTINEL_FIXED: &str = "\u{0}truenas-xdr-fixed-opaque";
+
+/// Tuple-struct name by which [`Bounded`] hands the codec its bound, in place
+/// of a field count. Not a stable part of the API.
+pub(crate) const SENTINEL_BOUNDED: &str = "\u{0}truenas-xdr-bounded";
 
 /// Zero padding needed to bring `len` up to a 4-byte boundary, `0..=3`.
 pub(crate) const fn pad4(len: usize) -> usize {

@@ -14,7 +14,7 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 
 use serde::Deserialize;
 use truenas_xdr::{
-    FixedOpaque, Strictness, VarOpaque, VarOpaqueRef, from_bytes_with,
+    Bounded, FixedOpaque, Strictness, VarOpaque, VarOpaqueRef, from_bytes_with,
 };
 
 #[derive(Deserialize)]
@@ -158,6 +158,10 @@ fn no_target_type_panics_on_hostile_input() {
     total += probe::<Vec<u32>>(&inputs);
     total += probe::<Vec<String>>(&inputs);
     total += probe::<Vec<Vec<u8>>>(&inputs);
+    total += probe::<Bounded<String, 3>>(&inputs);
+    total += probe::<Bounded<VarOpaqueRef, 3>>(&inputs);
+    total += probe::<Bounded<Vec<u32>, 2>>(&inputs);
+    total += probe::<Bounded<Vec<Bounded<VarOpaque, 2>>, 2>>(&inputs);
     total += probe::<(i32, String)>(&inputs);
     total += probe::<[i32; 3]>(&inputs);
     total += probe::<Option<u32>>(&inputs);

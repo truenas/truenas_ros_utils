@@ -14,8 +14,8 @@
 
 use serde::{Deserialize, Serialize};
 use truenas_xdr::{
-    BYTES_PER_XDR_UNIT, Error, FixedOpaque, Strictness, VarOpaque, from_bytes,
-    from_bytes_with, serialized_size, to_bytes,
+    BYTES_PER_XDR_UNIT, Bounded, Error, FixedOpaque, Strictness, VarOpaque,
+    from_bytes, from_bytes_with, serialized_size, to_bytes,
 };
 
 #[track_caller]
@@ -241,6 +241,27 @@ fn section_4_10_variable_opaque_is_a_count_then_bytes_then_pad() {
     round_trips(&VarOpaque(vec![0, 0, 0]), &[0, 0, 0, 3, 0, 0, 0, 0]);
 }
 
+#[test]
+fn section_4_10_a_declared_bound_limits_the_byte_count() {
+    // "The constant m denotes an upper bound of the number of bytes that the
+    // sequence may contain." This is `opaque filedata<4>`.
+    type Filedata = Bounded<VarOpaque, 4>;
+    round_trips::<Filedata>(
+        &Bounded(VarOpaque(vec![1, 2, 3, 4])),
+        &[0, 0, 0, 4, 1, 2, 3, 4],
+    );
+    // "It is an error to encode a length greater than the maximum described
+    // in the specification."
+    let too_long = Error::TooLong { len: 5, max: 4 };
+    let five: Filedata = Bounded(VarOpaque(vec![0; 5]));
+    assert_eq!(to_bytes(&five).unwrap_err(), too_long);
+    assert_eq!(
+        from_bytes::<Filedata>(&[0, 0, 0, 5, 1, 2, 3, 4, 5, 0, 0, 0])
+            .unwrap_err(),
+        too_long
+    );
+}
+
 // --- §4.11 String --------------------------------------------------------
 
 #[test]
@@ -255,6 +276,27 @@ fn section_4_11_string_is_a_count_then_bytes_then_pad() {
     assert_eq!(
         to_bytes(&"abc".to_string()).unwrap(),
         to_bytes(&VarOpaque(b"abc".to_vec())).unwrap()
+    );
+}
+
+#[test]
+fn section_4_11_a_declared_bound_limits_the_string_length() {
+    // "The constant m denotes an upper bound of the number of bytes that a
+    // string may contain." This is `string filename<3>`.
+    type Filename = Bounded<String, 3>;
+    round_trips::<Filename>(
+        &Bounded("abc".to_string()),
+        &[0, 0, 0, 3, b'a', b'b', b'c', 0],
+    );
+    // "It is an error to encode a length greater than the maximum described
+    // in the specification."
+    let too_long = Error::TooLong { len: 4, max: 3 };
+    let four: Filename = Bounded("abcd".to_string());
+    assert_eq!(to_bytes(&four).unwrap_err(), too_long);
+    assert_eq!(
+        from_bytes::<Filename>(&[0, 0, 0, 4, b'a', b'b', b'c', b'd'])
+            .unwrap_err(),
+        too_long
     );
 }
 
@@ -292,6 +334,27 @@ fn section_4_13_counted_array_is_a_count_then_elements() {
     round_trips(
         &vec!["ab".to_string()],
         &[0, 0, 0, 1, 0, 0, 0, 2, b'a', b'b', 0, 0],
+    );
+}
+
+#[test]
+fn section_4_13_a_declared_bound_limits_the_element_count() {
+    // "The constant m specifies the maximum acceptable element count of an
+    // array". This is `int values<2>`.
+    type Values = Bounded<Vec<i32>, 2>;
+    round_trips::<Values>(
+        &Bounded(vec![1, 2]),
+        &[0, 0, 0, 2, 0, 0, 0, 1, 0, 0, 0, 2],
+    );
+    // "It is an error to encode a value of n that is greater than the
+    // maximum described in the specification."
+    let too_long = Error::TooLong { len: 3, max: 2 };
+    let three: Values = Bounded(vec![1, 2, 3]);
+    assert_eq!(to_bytes(&three).unwrap_err(), too_long);
+    assert_eq!(
+        from_bytes::<Values>(&[0, 0, 0, 3, 0, 0, 0, 1, 0, 0, 0, 2, 0, 0, 0, 3])
+            .unwrap_err(),
+        too_long
     );
 }
 
