@@ -10,8 +10,8 @@ use std::cell::Cell;
 
 use serde::{Deserialize, Serialize};
 use truenas_xdr::{
-    Bounded, Error, VarOpaque, VarOpaqueRef, from_bytes, serialized_size,
-    to_bytes,
+    Bounded, Error, VarOpaque, VarOpaqueCow, VarOpaqueRef, from_bytes,
+    serialized_size, to_bytes,
 };
 
 /// This catches a bound that changes the bytes, and a bound that refuses a
@@ -243,4 +243,24 @@ fn a_bounded_borrow_points_into_the_input() {
     let wire = [0, 0, 0, 2, b'a', b'b', 0, 0];
     let text: Bounded<&str, 8> = from_bytes(&wire).unwrap();
     assert!(borrows_from(text.0.as_bytes(), &wire));
+}
+
+/// This catches the Cow form being left out of the types a bound accepts,
+/// and a bound that does not reach it in one direction or the other.
+#[test]
+fn a_bound_holds_a_cow_opaque() {
+    type Handle<'a> = Bounded<VarOpaqueCow<'a>, 3>;
+
+    let wire = [0, 0, 0, 3, 1, 2, 3, 0];
+    let handle: Handle<'_> = from_bytes(&wire).unwrap();
+    assert!(borrows_from(&handle.0.0, &wire));
+    assert_eq!(to_bytes(&handle).unwrap(), wire);
+
+    let too_long = Error::TooLong { len: 4, max: 3 };
+    assert_eq!(
+        from_bytes::<Handle<'_>>(&[0, 0, 0, 4, 1, 2, 3, 4]).unwrap_err(),
+        too_long
+    );
+    let built: Handle<'_> = Bounded(VarOpaqueCow::from(vec![0; 4]));
+    assert_eq!(to_bytes(&built).unwrap_err(), too_long);
 }

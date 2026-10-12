@@ -474,6 +474,9 @@ path to Ok-or-Err over a hostile corpus.
 Strings and opaque data decode as borrows of the input. A wire format has to
 round-trip through itself, which `&[u8]` does not — serde encodes it as a
 sequence and decodes it as opaque — so `VarOpaqueRef` exists for that.
+`VarOpaqueCow` is the same opaque held as a `Cow`, for a type that is decoded
+from a buffer in one place and built in another. Its decode always borrows,
+and `into_owned` is the one way to keep the bytes past the input.
 
 A declared upper bound is `Bounded`, which wraps a variable-length type and
 holds its length to the bound in both directions. The decoder checks the

@@ -7,10 +7,12 @@
 //! borrow by address: the decoded slice must point *into* the caller's buffer,
 //! not at a copy of it.
 
+use std::borrow::Cow;
+
 use serde::{Deserialize, Serialize};
 use truenas_xdr::{
-    Strictness, VarOpaque, VarOpaqueRef, from_bytes, from_bytes_with,
-    from_prefix, to_bytes,
+    Strictness, VarOpaque, VarOpaqueCow, VarOpaqueRef, from_bytes,
+    from_bytes_with, from_prefix, to_bytes,
 };
 
 /// Whether `part` points into `whole` rather than at separate storage.
@@ -166,4 +168,75 @@ fn invalid_utf8_still_borrows_as_opaque() {
     let decoded: &[u8] = from_bytes(&wire).unwrap();
     assert_eq!(decoded, &payload[..]);
     assert!(borrows_from(decoded, &wire));
+}
+
+/// This catches the Cow form writing bytes that differ from the owned form,
+/// in either of its two states. Left to serde, a `Cow<[u8]>` is a sequence
+/// and would write four bytes for each byte.
+#[test]
+fn a_cow_opaque_encodes_like_the_owned_opaque() {
+    let wire = [0, 0, 0, 3, 1, 2, 3, 0];
+    assert_eq!(to_bytes(&VarOpaque(vec![1, 2, 3])).unwrap(), wire);
+    assert_eq!(
+        to_bytes(&VarOpaqueCow::from(&[1u8, 2, 3][..])).unwrap(),
+        wire
+    );
+    assert_eq!(
+        to_bytes(&VarOpaqueCow::from(vec![1u8, 2, 3])).unwrap(),
+        wire
+    );
+    assert_eq!(to_bytes(&VarOpaqueCow::default()).unwrap(), [0, 0, 0, 0]);
+}
+
+/// This catches a decode that copies the bytes when it could have lent them.
+#[test]
+fn a_cow_opaque_decodes_as_a_borrow_of_the_input() {
+    let wire = [0, 0, 0, 3, 1, 2, 3, 0];
+    let decoded: VarOpaqueCow<'_> = from_bytes(&wire).unwrap();
+    assert!(matches!(decoded.0, Cow::Borrowed(_)));
+    assert!(borrows_from(&decoded.0, &wire), "copied, not borrowed");
+    assert_eq!(decoded.as_ref(), [1, 2, 3]);
+}
+
+/// This catches `into_owned` handing back a value that still points at the
+/// input. The value is used here after the input is gone.
+#[test]
+fn an_owned_cow_opaque_outlives_the_input() {
+    let kept: VarOpaqueCow<'static> = {
+        let wire = vec![0, 0, 0, 3, 1, 2, 3, 0];
+        let decoded: VarOpaqueCow<'_> = from_bytes(&wire).unwrap();
+        let kept = decoded.into_owned();
+        assert!(!borrows_from(&kept.0, &wire), "still points at the input");
+        kept
+    };
+    assert!(matches!(kept.0, Cow::Owned(_)));
+    assert_eq!(kept.as_ref(), [1, 2, 3]);
+}
+
+#[derive(Serialize, Deserialize, PartialEq, Debug)]
+struct Reply<'a> {
+    status: u32,
+    #[serde(borrow)]
+    owner: VarOpaqueCow<'a>,
+}
+
+/// This catches the Cow form failing inside a derived struct, which is where
+/// it is used. One side builds the value owned and the other reads it
+/// borrowed, and the two must compare equal.
+#[test]
+fn a_struct_built_owned_reads_back_borrowed() {
+    let built = Reply {
+        status: 7,
+        owner: VarOpaqueCow::from(b"server".to_vec()),
+    };
+    let wire = to_bytes(&built).unwrap();
+    assert_eq!(
+        wire,
+        [
+            0, 0, 0, 7, 0, 0, 0, 6, b's', b'e', b'r', b'v', b'e', b'r', 0, 0
+        ]
+    );
+    let read: Reply<'_> = from_bytes(&wire).unwrap();
+    assert_eq!(read, built);
+    assert!(borrows_from(&read.owner.0, &wire));
 }

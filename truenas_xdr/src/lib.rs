@@ -31,7 +31,8 @@
 //!
 //! - Variable opaque (`opaque<>`) is [`VarOpaque`], or [`VarOpaqueRef`] to
 //!   borrow. A bare `Vec<u8>` or `&[u8]` is a serde sequence, so it would
-//!   encode one 4-byte unit per byte.
+//!   encode one 4-byte unit per byte. [`VarOpaqueCow`] is the form that
+//!   borrows when it is decoded and may own its bytes when it is built.
 //! - Fixed opaque (`opaque[N]`) is [`FixedOpaque`], which has no length prefix.
 //! - Enums and unions whose discriminants are not their declaration order need
 //!   [`XdrEnum`] or [`XdrUnion`]; a stock `#[derive(Serialize)]` enum encodes
@@ -101,7 +102,9 @@ mod wrappers;
 pub use de::Deserializer;
 pub use error::{Error, Result};
 pub use strict::Strictness;
-pub use wrappers::{Bounded, Counted, FixedOpaque, VarOpaque, VarOpaqueRef};
+pub use wrappers::{
+    Bounded, Counted, FixedOpaque, VarOpaque, VarOpaqueCow, VarOpaqueRef,
+};
 
 #[cfg(feature = "derive")]
 pub use truenas_xdr_derive::{XdrEnum, XdrUnion};
