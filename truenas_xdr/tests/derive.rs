@@ -9,7 +9,8 @@
 
 use serde::{Deserialize, Serialize};
 use truenas_xdr::{
-    Error, XdrEnum, XdrUnion, from_bytes, serialized_size, to_bytes,
+    Error, VarOpaqueRef, XdrEnum, XdrUnion, from_bytes, serialized_size,
+    to_bytes,
 };
 
 #[derive(XdrEnum, PartialEq, Debug, Clone, Copy)]
@@ -179,4 +180,248 @@ fn derived_types_nest_inside_ordinary_structures() {
         ]
     );
     assert_eq!(from_bytes::<Holder>(&bytes).unwrap(), value);
+}
+
+#[derive(XdrUnion, PartialEq, Debug)]
+#[repr(i32)]
+enum Named<'a> {
+    Anonymous = 0,
+    Name(&'a str) = 1,
+    Token { id: u32, bytes: VarOpaqueRef<'a> } = 2,
+}
+
+/// This catches a lifetime changing the bytes. A borrowed arm must encode
+/// exactly as an owned arm of the same XDR type does.
+#[test]
+fn a_union_with_a_lifetime_encodes_its_arms_unchanged() {
+    let cases: [(Named<'_>, &[u8]); 3] = [
+        (Named::Anonymous, &[0, 0, 0, 0]),
+        (
+            Named::Name("ab"),
+            &[0, 0, 0, 1, 0, 0, 0, 2, b'a', b'b', 0, 0],
+        ),
+        (
+            Named::Token {
+                id: 7,
+                bytes: VarOpaqueRef(&[1, 2, 3]),
+            },
+            &[0, 0, 0, 2, 0, 0, 0, 7, 0, 0, 0, 3, 1, 2, 3, 0],
+        ),
+    ];
+    for (value, expected) in cases {
+        let bytes = to_bytes(&value).unwrap();
+        assert_eq!(bytes, expected, "{value:?}");
+        assert_eq!(from_bytes::<Named<'_>>(&bytes).unwrap(), value);
+        assert_eq!(serialized_size(&value).unwrap(), bytes.len());
+    }
+}
+
+/// Whether `part` points into `whole` and not at separate storage.
+fn borrows_from(part: &[u8], whole: &[u8]) -> bool {
+    let start = whole.as_ptr() as usize;
+    let at = part.as_ptr() as usize;
+    at >= start && at + part.len() <= start + whole.len()
+}
+
+/// This catches a derived union copying a string or opaque arm out of the
+/// input when the type asked to borrow it.
+#[test]
+fn a_borrowed_union_arm_points_into_the_input() {
+    let wire = [0, 0, 0, 1, 0, 0, 0, 2, b'a', b'b', 0, 0];
+    match from_bytes::<Named<'_>>(&wire).unwrap() {
+        Named::Name(name) => assert!(borrows_from(name.as_bytes(), &wire)),
+        other => panic!("expected a name, got {other:?}"),
+    }
+
+    let wire = [0, 0, 0, 2, 0, 0, 0, 7, 0, 0, 0, 3, 1, 2, 3, 0];
+    match from_bytes::<Named<'_>>(&wire).unwrap() {
+        Named::Token { bytes, .. } => assert!(borrows_from(bytes.0, &wire)),
+        other => panic!("expected a token, got {other:?}"),
+    }
+}
+
+#[derive(XdrUnion, PartialEq, Debug)]
+#[repr(i32)]
+enum TwoSources<'a, 'b> {
+    Left(&'a str) = 1,
+    Right(VarOpaqueRef<'b>) = 2,
+}
+
+/// This catches the generated impl bounding the input by the first lifetime
+/// alone, which does not compile for a union that names two.
+#[test]
+fn a_union_may_borrow_under_two_lifetimes() {
+    let cases: [(TwoSources<'_, '_>, &[u8]); 2] = [
+        (
+            TwoSources::Left("a"),
+            &[0, 0, 0, 1, 0, 0, 0, 1, b'a', 0, 0, 0],
+        ),
+        (
+            TwoSources::Right(VarOpaqueRef(&[9])),
+            &[0, 0, 0, 2, 0, 0, 0, 1, 9, 0, 0, 0],
+        ),
+    ];
+    for (value, expected) in cases {
+        assert_eq!(to_bytes(&value).unwrap(), expected, "{value:?}");
+        assert_eq!(from_bytes::<TwoSources<'_, '_>>(expected).unwrap(), value);
+    }
+}
+
+#[derive(XdrUnion, PartialEq, Debug)]
+#[repr(i32)]
+enum Status {
+    Ok(u32) = 0,
+    Denied {
+        holder: u32,
+    } = 5,
+    #[xdr(default)]
+    Other(i32),
+}
+
+/// This catches the default arm stealing a discriminant that has an arm of
+/// its own, and a matched discriminant being lost or rewritten on the way
+/// back out.
+#[test]
+fn a_default_arm_takes_every_discriminant_without_an_arm() {
+    let cases: [(Status, &[u8]); 4] = [
+        (Status::Ok(7), &[0, 0, 0, 0, 0, 0, 0, 7]),
+        (Status::Denied { holder: 2 }, &[0, 0, 0, 5, 0, 0, 0, 2]),
+        (Status::Other(3), &[0, 0, 0, 3]),
+        (Status::Other(-2), &[0xff, 0xff, 0xff, 0xfe]),
+    ];
+    for (value, expected) in cases {
+        let bytes = to_bytes(&value).unwrap();
+        assert_eq!(bytes, expected, "{value:?}");
+        assert_eq!(from_bytes::<Status>(&bytes).unwrap(), value);
+        assert_eq!(serialized_size(&value).unwrap(), bytes.len());
+    }
+}
+
+#[derive(XdrUnion, PartialEq, Debug)]
+#[repr(i32)]
+enum Offload {
+    Done(u32) = 0,
+    #[xdr(default)]
+    Failed {
+        status: i32,
+        copied: u64,
+    },
+}
+
+/// This catches a default arm that drops its body, or reads the body before
+/// the discriminant.
+#[test]
+fn a_default_arm_may_carry_a_body() {
+    let value = Offload::Failed {
+        status: 9,
+        copied: 1,
+    };
+    let expected = [0, 0, 0, 9, 0, 0, 0, 0, 0, 0, 0, 1];
+    assert_eq!(to_bytes(&value).unwrap(), expected);
+    assert_eq!(from_bytes::<Offload>(&expected).unwrap(), value);
+    assert_eq!(serialized_size(&value).unwrap(), expected.len());
+    assert_eq!(
+        from_bytes::<Offload>(&[0, 0, 0, 0, 0, 0, 0, 4]).unwrap(),
+        Offload::Done(4)
+    );
+    // The discriminant arrived and the eight bytes of the body did not.
+    assert_eq!(
+        from_bytes::<Offload>(&[0, 0, 0, 9]).unwrap_err(),
+        Error::Eof { need: 8 }
+    );
+}
+
+#[derive(XdrUnion, PartialEq, Debug)]
+#[repr(i32)]
+enum Outcome {
+    Fine(u32) = 0,
+    #[xdr(default)]
+    Failed(Gapped),
+}
+
+/// This catches a default arm that accepts a value its discriminant type
+/// does not define. §4.15 requires a legal value of the discriminant.
+#[test]
+fn a_default_arm_may_type_its_discriminant_as_an_enum() {
+    let cases: [(Outcome, &[u8]); 3] = [
+        (Outcome::Fine(1), &[0, 0, 0, 0, 0, 0, 0, 1]),
+        (Outcome::Failed(Gapped::Four), &[0, 0, 0, 4]),
+        (Outcome::Failed(Gapped::Negative), &[0xff, 0xff, 0xff, 0xfd]),
+    ];
+    for (value, expected) in cases {
+        assert_eq!(to_bytes(&value).unwrap(), expected, "{value:?}");
+        assert_eq!(from_bytes::<Outcome>(expected).unwrap(), value);
+    }
+    match from_bytes::<Outcome>(&[0, 0, 0, 9]).unwrap_err() {
+        Error::Message(msg) => assert!(msg.contains("Gapped"), "{msg}"),
+        other => panic!("expected a message, got {other:?}"),
+    }
+}
+
+/// This catches an encoding that would decode as a different arm. The bytes
+/// for `Other(0)` are the discriminant of `Ok` with its body missing.
+#[test]
+fn a_default_arm_cannot_encode_a_discriminant_that_has_an_arm() {
+    for value in [Status::Other(0), Status::Other(5)] {
+        match to_bytes(&value).unwrap_err() {
+            Error::Message(msg) => {
+                assert!(msg.contains("Status"), "{msg}");
+                assert!(msg.contains("arm of its own"), "{msg}");
+            }
+            other => panic!("expected a message, got {other:?}"),
+        }
+        assert!(serialized_size(&value).is_err());
+    }
+    assert!(to_bytes(&Outcome::Failed(Gapped::Zero)).is_err());
+}
+
+#[derive(XdrUnion, PartialEq, Debug)]
+#[repr(i32)]
+enum WideDiscriminant {
+    A = 0,
+    #[xdr(default)]
+    Other(u64),
+}
+
+#[derive(XdrUnion, PartialEq, Debug)]
+#[repr(i32)]
+enum NoDiscriminant {
+    A = 0,
+    #[xdr(default)]
+    Other(()),
+}
+
+/// This catches a default arm writing a discriminant of the wrong width,
+/// which would shift every byte after it.
+#[test]
+fn a_default_discriminant_must_encode_to_one_unit() {
+    assert!(to_bytes(&WideDiscriminant::Other(7)).is_err());
+    assert!(to_bytes(&NoDiscriminant::Other(())).is_err());
+    assert_eq!(to_bytes(&WideDiscriminant::A).unwrap(), [0, 0, 0, 0]);
+}
+
+#[derive(XdrUnion, PartialEq, Debug)]
+#[repr(i32)]
+enum Reply<'a> {
+    Name(&'a str) = 0,
+    #[xdr(default)]
+    Refused(i32, VarOpaqueRef<'a>),
+}
+
+/// This catches the default arm and a lifetime failing to compose, since a
+/// result union needs both.
+#[test]
+fn a_default_arm_may_borrow_its_body() {
+    let wire = [0, 0, 0, 13, 0, 0, 0, 2, 7, 8, 0, 0];
+    let decoded = from_bytes::<Reply<'_>>(&wire).unwrap();
+    assert_eq!(decoded, Reply::Refused(13, VarOpaqueRef(&[7, 8])));
+    match &decoded {
+        Reply::Refused(_, why) => assert!(borrows_from(why.0, &wire)),
+        other => panic!("expected a refusal, got {other:?}"),
+    }
+    assert_eq!(to_bytes(&decoded).unwrap(), wire);
+    assert_eq!(
+        to_bytes(&Reply::Name("a")).unwrap(),
+        [0, 0, 0, 0, 0, 0, 0, 1, b'a', 0, 0, 0]
+    );
 }

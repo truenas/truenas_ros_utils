@@ -475,6 +475,12 @@ Strings and opaque data decode as borrows of the input. A wire format has to
 round-trip through itself, which `&[u8]` does not — serde encodes it as a
 sequence and decodes it as opaque — so `VarOpaqueRef` exists for that.
 
+A derived union may borrow from the input and may declare the default arm of
+§4.15. The default arm keeps the discriminant it matched as its first field,
+so a value decoded through it encodes back to the same bytes. Encoding
+refuses a default arm whose discriminant has an arm of its own, because the
+bytes would decode as that other arm.
+
 The codec knows about RFC 4506 and nothing above it. No framing, no envelopes,
 no transport or protocol vocabulary belongs in this crate.
 

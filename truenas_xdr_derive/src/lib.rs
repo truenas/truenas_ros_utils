@@ -16,12 +16,25 @@
 //! Discriminants must be integer literals, explicit (`= 4`) or implicit
 //! (`prev + 1`); a const-expression discriminant or a generic type is a
 //! compile error.
+//!
+//! A union may borrow from the input. [`XdrUnion`] accepts lifetime
+//! parameters, so an arm can hold a `&'a str` or a `VarOpaqueRef<'a>`. Type
+//! and const parameters are still refused.
+//!
+//! A union may declare the default arm of RFC 4506 §4.15 by marking its last
+//! variant `#[xdr(default)]`. That variant's first field holds the
+//! discriminant, which is an `i32` or an [`XdrEnum`] type, and any further
+//! fields are the arm's body. A value decoded through the default arm encodes
+//! back to the same bytes. Encoding fails when the discriminant has an arm of
+//! its own, because those bytes would decode as that other arm.
 #![forbid(unsafe_code)]
 
 use proc_macro::TokenStream;
+use proc_macro2::{Span, TokenStream as TokenStream2};
 use quote::{format_ident, quote};
 use syn::{
-    Data, DataEnum, DeriveInput, Expr, ExprLit, ExprUnary, Fields, Lit, UnOp,
+    Data, DataEnum, DeriveInput, Expr, ExprLit, ExprUnary, Fields,
+    GenericParam, Ident, Lifetime, LifetimeParam, Lit, UnOp, Variant,
     parse_macro_input,
 };
 
@@ -35,7 +48,11 @@ pub fn derive_xdr_enum(input: TokenStream) -> TokenStream {
 
 /// Derive `Serialize`/`Deserialize` for a discriminated union, encoding it as
 /// an `i32` discriminant followed by the active arm.
-#[proc_macro_derive(XdrUnion)]
+///
+/// The last variant may be marked `#[xdr(default)]` to declare the default
+/// arm. Its first field holds the discriminant and any further fields are the
+/// arm's body.
+#[proc_macro_derive(XdrUnion, attributes(xdr))]
 pub fn derive_xdr_union(input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as DeriveInput);
     expand_union(input).unwrap_or_else(|e| e.to_compile_error().into())
@@ -94,6 +111,145 @@ fn reject_generics(input: &DeriveInput) -> syn::Result<()> {
             "XdrEnum/XdrUnion does not support generic types",
         ))
     }
+}
+
+/// The lifetimes a union borrows for. A union may borrow from the input, so
+/// lifetime parameters pass. The wire layout is fixed per concrete type, so
+/// type and const parameters are refused. `'de` is refused because the
+/// generated impl gives that name to the input.
+fn union_lifetimes(input: &DeriveInput) -> syn::Result<Vec<Lifetime>> {
+    let mut out = Vec::new();
+    for param in &input.generics.params {
+        match param {
+            GenericParam::Lifetime(l) if l.lifetime.ident == "de" => {
+                return Err(syn::Error::new_spanned(
+                    l,
+                    "XdrUnion names the input `'de`, rename this lifetime",
+                ));
+            }
+            GenericParam::Lifetime(l) => out.push(l.lifetime.clone()),
+            other => {
+                return Err(syn::Error::new_spanned(
+                    other,
+                    "XdrUnion supports lifetime parameters only",
+                ));
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Whether a variant is marked `#[xdr(default)]`. Any other `xdr` argument is
+/// refused, so a misspelling cannot pass as an ordinary arm.
+fn is_default_arm(v: &Variant) -> syn::Result<bool> {
+    let mut found = false;
+    for attr in v.attrs.iter().filter(|a| a.path().is_ident("xdr")) {
+        attr.parse_nested_meta(|meta| {
+            if meta.path.is_ident("default") {
+                found = true;
+                Ok(())
+            } else {
+                Err(meta.error("unknown xdr argument, expected `default`"))
+            }
+        })?;
+    }
+    Ok(found)
+}
+
+/// Whether the union ends in a default arm. XDR writes the default arm last,
+/// and an earlier one would shift the implicit discriminants of the arms
+/// after it, so any other position is refused. The arm takes its discriminant
+/// from the wire, so it needs a field to hold one and cannot declare its own.
+fn has_default_arm(data: &DataEnum) -> syn::Result<bool> {
+    let mut found = false;
+    for (i, v) in data.variants.iter().enumerate() {
+        if !is_default_arm(v)? {
+            continue;
+        }
+        let refusal = if i + 1 != data.variants.len() {
+            "the default arm must be the last variant"
+        } else if v.discriminant.is_some() {
+            "the default arm takes its discriminant from its first field \
+             and cannot declare one"
+        } else if v.fields.is_empty() {
+            "the default arm needs a first field to hold the discriminant"
+        } else {
+            found = true;
+            continue;
+        };
+        return Err(syn::Error::new_spanned(v, refusal));
+    }
+    Ok(found)
+}
+
+/// The encode arm and the decode arm for a union's default arm, with the
+/// number of elements the arm reads. `owned` lists the discriminants that
+/// have an arm of their own.
+fn default_arm(
+    name: &Ident,
+    v: &Variant,
+    owned: &[i32],
+) -> (TokenStream2, TokenStream2, usize) {
+    let ident = &v.ident;
+    let n = v.fields.len();
+    let binds: Vec<_> = (0..n).map(|i| format_ident!("__f{}", i)).collect();
+    let (first, rest) = (&binds[0], &binds[1..]);
+    // The same tokens bind the fields when encoding and build the value when
+    // decoding.
+    let shape = match &v.fields {
+        Fields::Named(fields) => {
+            let fnames = fields.named.iter().map(|f| &f.ident);
+            quote! { #name::#ident { #( #fnames: #binds ),* } }
+        }
+        _ => quote! { #name::#ident( #(#binds),* ) },
+    };
+    let ser = quote! {
+        #shape => {
+            let __disc: i32 = ::truenas_xdr::__private::discriminant(#first)
+                .map_err(<S::Error as ::serde::ser::Error>::custom)?;
+            const __OWNED: &[i32] = &[ #(#owned),* ];
+            if __OWNED.contains(&__disc) {
+                return ::core::result::Result::Err(
+                    <S::Error as ::serde::ser::Error>::custom(
+                        ::std::format!(
+                            "{} discriminant {} has an arm of its own",
+                            ::core::stringify!(#name),
+                            __disc,
+                        ),
+                    ),
+                );
+            }
+            let mut tup = serializer.serialize_tuple(#n)?;
+            ::serde::ser::SerializeTuple::serialize_element(
+                &mut tup, &__disc,
+            )?;
+            #(
+                ::serde::ser::SerializeTuple::serialize_element(
+                    &mut tup, #rest,
+                )?;
+            )*
+            ::serde::ser::SerializeTuple::end(tup)
+        }
+    };
+    let de = quote! {
+        other => {
+            let #first = ::serde::Deserialize::deserialize(
+                <i32 as ::serde::de::IntoDeserializer<'de, A::Error>>
+                    ::into_deserializer(other),
+            )?;
+            #(
+                let #rest =
+                    ::serde::de::SeqAccess::next_element(&mut seq)?
+                        .ok_or_else(|| {
+                            <A::Error as ::serde::de::Error>::custom(
+                                "missing XDR union field",
+                            )
+                        })?;
+            )*
+            ::core::result::Result::Ok(#shape)
+        }
+    };
+    (ser, de, n)
 }
 
 fn enum_data<'a>(
@@ -162,19 +318,48 @@ fn expand_enum(input: DeriveInput) -> syn::Result<TokenStream> {
 }
 
 fn expand_union(input: DeriveInput) -> syn::Result<TokenStream> {
-    reject_generics(&input)?;
+    let lifetimes = union_lifetimes(&input)?;
+    let (impl_generics, ty_generics, where_clause) =
+        input.generics.split_for_impl();
+    // `'de` outlives every lifetime the union borrows for, so a borrowed arm
+    // can point into the input.
+    let mut de_generics = input.generics.clone();
+    let mut de = LifetimeParam::new(Lifetime::new("'de", Span::call_site()));
+    de.bounds.extend(lifetimes.iter().cloned());
+    de_generics.params.insert(0, GenericParam::Lifetime(de));
+    let (de_impl_generics, _, _) = de_generics.split_for_impl();
     let name = &input.ident;
     let data = enum_data(&input, "XdrUnion")?;
     let discs = discriminants(data)?;
+    let explicit = data.variants.len() - usize::from(has_default_arm(data)?);
 
     let mut ser_arms = Vec::new();
     let mut de_arms = Vec::new();
     // The deserializer is told the widest arm's element count; the visitor
     // reads only what the decoded discriminant calls for.
     let mut max_elems = 1usize;
+    // What a discriminant with no arm of its own decodes to.
+    let mut fallback = quote! {
+        other => ::core::result::Result::Err(
+            <A::Error as ::serde::de::Error>::custom(
+                ::std::format!(
+                    "unknown {} discriminant {}",
+                    ::core::stringify!(#name),
+                    other,
+                ),
+            ),
+        ),
+    };
 
-    for (v, &disc) in data.variants.iter().zip(&discs) {
+    for (i, (v, &disc)) in data.variants.iter().zip(&discs).enumerate() {
         let ident = &v.ident;
+        if i == explicit {
+            let (ser, de, elems) = default_arm(name, v, &discs[..explicit]);
+            ser_arms.push(ser);
+            fallback = de;
+            max_elems = max_elems.max(elems);
+            continue;
+        }
         match &v.fields {
             Fields::Unit => {
                 ser_arms.push(quote! {
@@ -269,7 +454,9 @@ fn expand_union(input: DeriveInput) -> syn::Result<TokenStream> {
     }
 
     Ok(quote! {
-        impl ::serde::Serialize for #name {
+        impl #impl_generics ::serde::Serialize
+            for #name #ty_generics #where_clause
+        {
             fn serialize<S: ::serde::Serializer>(
                 &self,
                 serializer: S,
@@ -277,13 +464,19 @@ fn expand_union(input: DeriveInput) -> syn::Result<TokenStream> {
                 match self { #( #ser_arms )* }
             }
         }
-        impl<'de> ::serde::Deserialize<'de> for #name {
+        impl #de_impl_generics ::serde::Deserialize<'de>
+            for #name #ty_generics #where_clause
+        {
             fn deserialize<D: ::serde::Deserializer<'de>>(
                 deserializer: D,
             ) -> ::core::result::Result<Self, D::Error> {
-                struct __Visitor;
-                impl<'de> ::serde::de::Visitor<'de> for __Visitor {
-                    type Value = #name;
+                struct __Visitor #impl_generics (
+                    ::core::marker::PhantomData<( #( &#lifetimes (), )* )>,
+                ) #where_clause;
+                impl #de_impl_generics ::serde::de::Visitor<'de>
+                    for __Visitor #ty_generics #where_clause
+                {
+                    type Value = #name #ty_generics;
                     fn expecting(
                         &self,
                         f: &mut ::core::fmt::Formatter,
@@ -296,7 +489,10 @@ fn expand_union(input: DeriveInput) -> syn::Result<TokenStream> {
                     fn visit_seq<A: ::serde::de::SeqAccess<'de>>(
                         self,
                         mut seq: A,
-                    ) -> ::core::result::Result<#name, A::Error> {
+                    ) -> ::core::result::Result<
+                        #name #ty_generics,
+                        A::Error,
+                    > {
                         let tag: i32 =
                             ::serde::de::SeqAccess::next_element(&mut seq)?
                                 .ok_or_else(|| {
@@ -306,20 +502,14 @@ fn expand_union(input: DeriveInput) -> syn::Result<TokenStream> {
                                 })?;
                         match tag {
                             #( #de_arms )*
-                            other => ::core::result::Result::Err(
-                                <A::Error as ::serde::de::Error>::custom(
-                                    ::std::format!(
-                                        "unknown {} discriminant {}",
-                                        ::core::stringify!(#name),
-                                        other,
-                                    ),
-                                ),
-                            ),
+                            #fallback
                         }
                     }
                 }
                 ::serde::Deserializer::deserialize_tuple(
-                    deserializer, #max_elems, __Visitor,
+                    deserializer,
+                    #max_elems,
+                    __Visitor(::core::marker::PhantomData),
                 )
             }
         }
@@ -386,6 +576,50 @@ mod tests {
         assert!(reject_generics(&input("enum E { A }")).is_ok());
         assert!(reject_generics(&input("enum E<T> { A }")).is_err());
         assert!(reject_generics(&input("struct S<'a> { x: &'a u8 }")).is_err());
+    }
+
+    /// This catches a type or const parameter being accepted, which has no
+    /// fixed layout, and a `'de` that would collide with the generated impl.
+    #[test]
+    fn a_union_takes_lifetimes_and_no_other_parameter() {
+        let two =
+            union_lifetimes(&input("enum E<'a, 'b> { A(&'a str, &'b str) }"));
+        assert_eq!(two.unwrap().len(), 2);
+        assert!(union_lifetimes(&input("enum E { A }")).unwrap().is_empty());
+        assert!(union_lifetimes(&input("enum E<T> { A(T) }")).is_err());
+        assert!(
+            union_lifetimes(&input("enum E<const N: usize> { A }")).is_err()
+        );
+        assert!(
+            union_lifetimes(&input("enum E<'de> { A(&'de str) }")).is_err()
+        );
+    }
+
+    fn union_refusal(src: &str) -> String {
+        expand_union(input(src)).err().unwrap().to_string()
+    }
+
+    /// Each of these would otherwise compile into a union whose default arm
+    /// sits where XDR does not put it, or cannot hold what it matched.
+    #[test]
+    fn a_misplaced_or_malformed_default_arm_is_refused() {
+        let early = "enum E { #[xdr(default)] Other(i32), A = 1 }";
+        assert!(union_refusal(early).contains("last variant"));
+        let twice = "enum E { A = 1, #[xdr(default)] X(i32), \
+                     #[xdr(default)] Y(i32) }";
+        assert!(union_refusal(twice).contains("last variant"));
+        let empty = "enum E { A = 1, #[xdr(default)] Other }";
+        assert!(union_refusal(empty).contains("needs a first field"));
+        let numbered = "enum E { A = 1, #[xdr(default)] Other(i32) = 9 }";
+        assert!(union_refusal(numbered).contains("cannot declare one"));
+    }
+
+    /// A misspelled argument must not turn the default arm into an ordinary
+    /// one that takes the next implicit discriminant.
+    #[test]
+    fn an_unknown_xdr_argument_is_refused() {
+        let typo = "enum E { A = 1, #[xdr(defualt)] Other(i32) }";
+        assert!(union_refusal(typo).contains("unknown xdr argument"));
     }
 
     #[test]
