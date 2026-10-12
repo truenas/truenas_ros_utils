@@ -5,6 +5,7 @@
 use serde::de::{self, Visitor};
 use serde::ser::SerializeTupleStruct;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use std::borrow::Cow;
 use std::fmt;
 use std::marker::PhantomData;
 
@@ -155,6 +156,85 @@ impl<'de: 'a, 'a> Deserialize<'de> for VarOpaqueRef<'a> {
     }
 }
 
+/// Variable-length opaque that either borrows its bytes or owns them, for a
+/// type that is decoded from a buffer in one place and built in another.
+///
+/// It encodes exactly as [`VarOpaque`] does. Decoding always borrows from the
+/// input, as [`VarOpaqueRef`] does, and [`into_owned`](Self::into_owned)
+/// copies the bytes out when the value has to outlive that input.
+///
+/// A bare `Cow<[u8]>` will not do, for the reason a bare `Vec<u8>` will not.
+/// Serde treats it as a sequence and writes four bytes for each byte.
+///
+/// ```
+/// # use std::borrow::Cow;
+/// # use truenas_xdr::{from_bytes, to_bytes, VarOpaqueCow};
+/// let built = VarOpaqueCow::from(vec![1, 2, 3]);
+/// let wire = to_bytes(&built)?;
+/// assert_eq!(wire, [0, 0, 0, 3, 1, 2, 3, 0]);
+///
+/// let decoded: VarOpaqueCow<'_> = from_bytes(&wire)?;
+/// assert!(matches!(decoded.0, Cow::Borrowed(_)));
+/// assert_eq!(decoded, built);
+/// # Ok::<(), truenas_xdr::Error>(())
+/// ```
+#[derive(Clone, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct VarOpaqueCow<'a>(
+    /// The bytes, unpadded.
+    pub Cow<'a, [u8]>,
+);
+
+impl VarOpaqueCow<'_> {
+    /// The same bytes in storage of their own, free of the input's lifetime.
+    /// A value that already owns its bytes keeps them and copies nothing.
+    pub fn into_owned(self) -> VarOpaqueCow<'static> {
+        VarOpaqueCow(Cow::Owned(self.0.into_owned()))
+    }
+}
+
+impl<'a> From<&'a [u8]> for VarOpaqueCow<'a> {
+    fn from(bytes: &'a [u8]) -> VarOpaqueCow<'a> {
+        VarOpaqueCow(Cow::Borrowed(bytes))
+    }
+}
+
+impl From<Vec<u8>> for VarOpaqueCow<'_> {
+    fn from(bytes: Vec<u8>) -> Self {
+        VarOpaqueCow(Cow::Owned(bytes))
+    }
+}
+
+impl AsRef<[u8]> for VarOpaqueCow<'_> {
+    fn as_ref(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+impl Serialize for VarOpaqueCow<'_> {
+    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_bytes(&self.0)
+    }
+}
+
+impl<'de: 'a, 'a> Deserialize<'de> for VarOpaqueCow<'a> {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        struct V<'a>(PhantomData<&'a ()>);
+        impl<'de: 'a, 'a> Visitor<'de> for V<'a> {
+            type Value = VarOpaqueCow<'a>;
+            fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                f.write_str("variable-length opaque bytes to borrow")
+            }
+            fn visit_borrowed_bytes<E: de::Error>(
+                self,
+                v: &'de [u8],
+            ) -> Result<VarOpaqueCow<'a>, E> {
+                Ok(VarOpaqueCow(Cow::Borrowed(v)))
+            }
+        }
+        d.deserialize_bytes(V(PhantomData))
+    }
+}
+
 /// Fixed-length opaque, RFC 4506 §4.9 (`opaque[N]`): exactly `N` bytes plus
 /// padding, with no length prefix.
 ///
@@ -286,6 +366,7 @@ mod sealed {
 impl<T: sealed::Sealed> Counted for T {}
 impl sealed::Sealed for VarOpaque {}
 impl sealed::Sealed for VarOpaqueRef<'_> {}
+impl sealed::Sealed for VarOpaqueCow<'_> {}
 impl sealed::Sealed for String {}
 impl sealed::Sealed for &str {}
 impl<T> sealed::Sealed for Vec<T> {}
@@ -363,6 +444,19 @@ mod tests {
         // The borrowed form promotes to the owned one by copying its bytes.
         assert_eq!(VarOpaque::from(opaque).0, vec![1, 2, 3]);
         assert_eq!(VarOpaqueRef::default().0, &[] as &[u8]);
+    }
+
+    #[test]
+    fn var_opaque_cow_is_built_borrowed_or_owned() {
+        let data = [1u8, 2, 3];
+        let borrowed = VarOpaqueCow::from(&data[..]);
+        assert!(matches!(borrowed.0, Cow::Borrowed(_)));
+        let owned = VarOpaqueCow::from(vec![1u8, 2, 3]);
+        assert!(matches!(owned.0, Cow::Owned(_)));
+        // The two states hold the same bytes, so they compare equal.
+        assert_eq!(borrowed, owned);
+        assert_eq!(borrowed.as_ref(), &[1, 2, 3]);
+        assert_eq!(VarOpaqueCow::default().as_ref(), &[] as &[u8]);
     }
 
     #[test]
