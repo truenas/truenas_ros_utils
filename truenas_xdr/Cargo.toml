@@ -57,6 +57,11 @@ required-features = ["derive"]
 name = "zero_copy"
 path = "tests/zero_copy.rs"
 
+# A declared upper bound holds in both directions and reaches one length.
+[[test]]
+name = "bounded"
+path = "tests/bounded.rs"
+
 # A hostile deeply-nested stream is bounded, not a stack overflow.
 [[test]]
 name = "recursion"

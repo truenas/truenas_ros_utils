@@ -23,6 +23,9 @@ pub struct Deserializer<'de> {
     /// Set by `deserialize_newtype_struct(SENTINEL_FIXED, ..)`, so the next
     /// `deserialize_tuple(N, ..)` reads `N` raw bytes rather than a tuple.
     fixed_pending: bool,
+    /// Set by `deserialize_tuple_struct(SENTINEL_BOUNDED, max, ..)`. The next
+    /// length read is held to this bound and clears it.
+    bound_pending: Option<usize>,
     /// Nesting reached so far; compared against `max_depth` at each compound.
     depth: usize,
     max_depth: usize,
@@ -45,6 +48,7 @@ impl<'de> Deserializer<'de> {
             pos: 0,
             mode,
             fixed_pending: false,
+            bound_pending: None,
             depth: 0,
             max_depth: Self::DEFAULT_MAX_DEPTH,
         }
@@ -118,9 +122,20 @@ impl<'de> Deserializer<'de> {
         Ok(())
     }
 
+    /// Hold a length just read to the pending bound, if there is one. The
+    /// bound belongs to this length and to no later one, so it is taken
+    /// whether or not the length passes.
+    fn check_bound(&mut self, len: usize) -> Result<()> {
+        match self.bound_pending.take() {
+            Some(max) if len > max => Err(Error::TooLong { len, max }),
+            _ => Ok(()),
+        }
+    }
+
     /// A variable opaque or string body: `u32` length, bytes, padding.
     fn read_opaque(&mut self) -> Result<&'de [u8]> {
         let len = self.read_u32()? as usize;
+        self.check_bound(len)?;
         let data = self.take(len)?;
         self.read_pad(len)?;
         Ok(data)
@@ -281,6 +296,7 @@ impl<'de> serde::Deserializer<'de> for &mut Deserializer<'de> {
 
     fn deserialize_seq<V: Visitor<'de>>(self, v: V) -> Result<V::Value> {
         let count = self.read_u32()? as usize;
+        self.check_bound(count)?;
         // An array element is at least one 4-byte unit (§3), so a count
         // beyond a quarter of the remaining input cannot be met. Refusing
         // it here bounds the element loop by the input even for a target
@@ -319,13 +335,20 @@ impl<'de> serde::Deserializer<'de> for &mut Deserializer<'de> {
 
     fn deserialize_tuple_struct<V: Visitor<'de>>(
         self,
-        _name: &'static str,
+        name: &'static str,
         len: usize,
         v: V,
     ) -> Result<V::Value> {
         self.descend()?;
-        let reader = self.seq(len);
-        let out = v.visit_seq(reader);
+        let out = if name == crate::SENTINEL_BOUNDED {
+            // Under the sentinel, `len` is a bound and not a field count.
+            // The value behind it is read as a newtype would be.
+            self.bound_pending = Some(len);
+            v.visit_newtype_struct(&mut *self)
+        } else {
+            let reader = self.seq(len);
+            v.visit_seq(reader)
+        };
         self.ascend();
         out
     }

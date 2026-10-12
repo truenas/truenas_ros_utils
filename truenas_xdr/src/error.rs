@@ -56,6 +56,16 @@ pub enum Error {
         /// The depth bound that was exceeded.
         limit: usize,
     },
+    /// A variable-length value was longer than the bound its type declares.
+    /// RFC 4506 §4.10, §4.11 and §4.13 make a length over the bound an
+    /// error. The bound comes from [`Bounded`](crate::Bounded).
+    TooLong {
+        /// The length found. It counts bytes for opaque data and strings
+        /// and elements for an array.
+        len: usize,
+        /// The bound the length was held to.
+        max: usize,
+    },
     /// A construct XDR cannot represent: a map, a sequence of unknown length,
     /// a length beyond the 32-bit prefix, or a request for self-describing
     /// decoding.
@@ -84,6 +94,9 @@ impl fmt::Display for Error {
             }
             Error::RecursionLimit { limit } => {
                 write!(f, "input nests deeper than the limit of {limit}")
+            }
+            Error::TooLong { len, max } => {
+                write!(f, "length {len} is over the bound of {max}")
             }
             Error::Unsupported(what) => {
                 write!(f, "XDR does not support {what}")
@@ -136,6 +149,10 @@ mod tests {
             (
                 Error::RecursionLimit { limit: 128 },
                 "deeper than the limit of 128",
+            ),
+            (
+                Error::TooLong { len: 9, max: 8 },
+                "9 is over the bound of 8",
             ),
             (Error::Unsupported("map"), "does not support map"),
             (Error::Io("disk gone".into()), "disk gone"),
