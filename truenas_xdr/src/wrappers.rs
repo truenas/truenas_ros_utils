@@ -2,14 +2,14 @@
 // SPDX-License-Identifier: MIT
 //! Wrapper types for the XDR shapes a stock serde call would encode wrongly.
 
-use serde::de::{self, Visitor};
-use serde::ser::SerializeTupleStruct;
+use serde::de::{self, SeqAccess, Visitor};
+use serde::ser::{SerializeSeq, SerializeTupleStruct};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::borrow::Cow;
 use std::fmt;
 use std::marker::PhantomData;
 
-use crate::{SENTINEL_BOUNDED, SENTINEL_FIXED};
+use crate::{SENTINEL_ARRAY_REF, SENTINEL_BOUNDED, SENTINEL_FIXED};
 
 /// Variable-length opaque, RFC 4506 §4.10 (`opaque<>`): a `u32` length, the
 /// bytes, then zero padding to a 4-byte boundary.
@@ -353,8 +353,8 @@ pub struct Bounded<T, const MAX: usize>(
 /// A type whose encoding begins with a length, which is the length a
 /// [`Bounded`] bound applies to.
 ///
-/// It is implemented for variable opaque data, strings, and `Vec`, and it is
-/// sealed. A bound waits for the next length the codec handles, so a type
+/// It is implemented for variable opaque data, strings, `Vec` and
+/// [`VarArrayRef`], and it is sealed. A bound waits for the next length the codec handles, so a type
 /// that began with anything else would leave the bound waiting for a field
 /// it does not belong to.
 pub trait Counted: sealed::Sealed {}
@@ -370,6 +370,7 @@ impl sealed::Sealed for VarOpaqueCow<'_> {}
 impl sealed::Sealed for String {}
 impl sealed::Sealed for &str {}
 impl<T> sealed::Sealed for Vec<T> {}
+impl<T> sealed::Sealed for VarArrayRef<'_, T> {}
 
 impl<T: Serialize + Counted, const MAX: usize> Serialize for Bounded<T, MAX> {
     fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
@@ -413,6 +414,298 @@ impl<'de, T: Deserialize<'de> + Counted, const MAX: usize> Visitor<'de>
         T::deserialize(d).map(Bounded)
     }
 }
+
+/// Variable-length array borrowed from the input, RFC 4506 §4.13
+/// (`T name<>`). It keeps the count and leaves the elements as the bytes
+/// they arrived in.
+///
+/// Decoding reads every element once, to find where the array ends, and
+/// stores none of them. An array of any length therefore costs no
+/// allocation of its own. [`iter`](Self::iter) decodes the elements again,
+/// one at a time, when they are wanted.
+///
+/// It encodes as a `Vec<T>` of the same elements does, and a value that was
+/// decoded encodes back to the bytes it came from. Two arrays are equal when
+/// their counts and their bytes are.
+///
+/// ```
+/// # use truenas_xdr::{from_bytes, to_bytes, VarArrayRef};
+/// let wire = to_bytes(&vec![7u32, 8])?;
+/// assert_eq!(wire, [0, 0, 0, 2, 0, 0, 0, 7, 0, 0, 0, 8]);
+///
+/// let array: VarArrayRef<'_, u32> = from_bytes(&wire)?;
+/// assert_eq!(array.len(), 2);
+/// let elements = array.iter().collect::<Result<Vec<u32>, _>>()?;
+/// assert_eq!(elements, [7, 8]);
+/// // The elements are the caller's bytes and not a copy of them.
+/// assert!(std::ptr::eq(array.encoded().as_ptr(), wire[4..].as_ptr()));
+/// assert_eq!(to_bytes(&array)?, wire);
+/// # Ok::<(), truenas_xdr::Error>(())
+/// ```
+pub struct VarArrayRef<'a, T> {
+    len: usize,
+    encoded: &'a [u8],
+    element: PhantomData<fn() -> T>,
+}
+
+impl<'a, T: Deserialize<'a>> VarArrayRef<'a, T> {
+    /// An array of `len` elements that `encoded` holds, one after another
+    /// and with no count in front.
+    ///
+    /// Every element is decoded once to check that `encoded` holds exactly
+    /// `len` of them. Fewer is [`Error::Eof`](crate::Error::Eof) and bytes
+    /// left over are [`Error::TrailingBytes`](crate::Error::TrailingBytes).
+    pub fn from_encoded(len: usize, encoded: &'a [u8]) -> crate::Result<Self> {
+        // An element is at least one unit, so a count past what the bytes
+        // can hold is refused before the loop that would walk it.
+        let units = encoded.len() / crate::BYTES_PER_XDR_UNIT;
+        if len > units {
+            let need = (len - units).saturating_mul(crate::BYTES_PER_XDR_UNIT);
+            return Err(crate::Error::Eof { need });
+        }
+        let mut de =
+            crate::Deserializer::new(encoded, crate::Strictness::Strict);
+        for _ in 0..len {
+            T::deserialize(&mut de)?;
+        }
+        match de.remaining().len() {
+            0 => Ok(VarArrayRef {
+                len,
+                encoded,
+                element: PhantomData,
+            }),
+            rest => Err(crate::Error::TrailingBytes { rest }),
+        }
+    }
+
+    /// The elements in order, each decoded when it is reached.
+    ///
+    /// The bytes were decoded once already, so an element is not expected
+    /// to fail here. An error ends the iteration.
+    pub fn iter(&self) -> VarArrayIter<'a, T> {
+        VarArrayIter {
+            rest: self.encoded,
+            left: self.len,
+            element: PhantomData,
+        }
+    }
+}
+
+impl<'a, T> VarArrayRef<'a, T> {
+    /// The number of elements.
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    /// Whether the array has no elements.
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// The elements as they are encoded, with no count in front.
+    pub fn encoded(&self) -> &'a [u8] {
+        self.encoded
+    }
+}
+
+// The impls below are written out because a derive would ask the same of
+// `T`, and the array holds no `T`.
+
+impl<T> Clone for VarArrayRef<'_, T> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<T> Copy for VarArrayRef<'_, T> {}
+
+impl<T> Default for VarArrayRef<'_, T> {
+    fn default() -> Self {
+        VarArrayRef {
+            len: 0,
+            encoded: &[],
+            element: PhantomData,
+        }
+    }
+}
+
+impl<T> PartialEq for VarArrayRef<'_, T> {
+    fn eq(&self, other: &Self) -> bool {
+        self.len == other.len && self.encoded == other.encoded
+    }
+}
+
+impl<T> Eq for VarArrayRef<'_, T> {}
+
+impl<T> std::hash::Hash for VarArrayRef<'_, T> {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.len.hash(state);
+        self.encoded.hash(state);
+    }
+}
+
+impl<T> fmt::Debug for VarArrayRef<'_, T> {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        f.debug_struct("VarArrayRef")
+            .field("len", &self.len)
+            .field("encoded", &self.encoded)
+            .finish()
+    }
+}
+
+impl<T> Serialize for VarArrayRef<'_, T> {
+    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        // The count goes out as any array's count does, so a bound reaches
+        // it. The elements follow as one run of bytes that are already XDR.
+        let mut array = s.serialize_seq(Some(self.len))?;
+        array.serialize_element(&Encoded(self.encoded))?;
+        array.end()
+    }
+}
+
+impl<'de: 'a, 'a, T: Deserialize<'de>> Deserialize<'de> for VarArrayRef<'a, T> {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        // The sentinel name has the codec mark where the array starts. The
+        // two fields are then the array and the span it turned out to cover.
+        d.deserialize_tuple_struct(
+            SENTINEL_ARRAY_REF,
+            2,
+            ArrayRefVisitor(PhantomData),
+        )
+    }
+}
+
+struct ArrayRefVisitor<'a, T>(PhantomData<VarArrayRef<'a, T>>);
+
+impl<'de: 'a, 'a, T: Deserialize<'de>> Visitor<'de> for ArrayRefVisitor<'a, T> {
+    type Value = VarArrayRef<'a, T>;
+
+    fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        f.write_str("a variable-length array to borrow")
+    }
+
+    fn visit_seq<A: SeqAccess<'de>>(
+        self,
+        mut fields: A,
+    ) -> Result<Self::Value, A::Error> {
+        let Some(ElementCount(len, _)) =
+            fields.next_element::<ElementCount<T>>()?
+        else {
+            return Err(de::Error::invalid_length(0, &self));
+        };
+        let Some(Span(span)) = fields.next_element::<Span<'de>>()? else {
+            return Err(de::Error::invalid_length(1, &self));
+        };
+        // The span starts at the count, which is one unit.
+        let encoded = span
+            .get(crate::BYTES_PER_XDR_UNIT..)
+            .ok_or_else(|| de::Error::invalid_length(span.len(), &self))?;
+        Ok(VarArrayRef {
+            len,
+            encoded,
+            element: PhantomData,
+        })
+    }
+}
+
+/// An array read for its count alone. Every element is decoded and dropped.
+struct ElementCount<T>(usize, PhantomData<fn() -> T>);
+
+impl<'de, T: Deserialize<'de>> Deserialize<'de> for ElementCount<T> {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        struct V<T>(PhantomData<fn() -> T>);
+        impl<'de, T: Deserialize<'de>> Visitor<'de> for V<T> {
+            type Value = ElementCount<T>;
+            fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                f.write_str("a variable-length array")
+            }
+            fn visit_seq<A: SeqAccess<'de>>(
+                self,
+                mut elements: A,
+            ) -> Result<ElementCount<T>, A::Error> {
+                let mut len = 0;
+                while elements.next_element::<T>()?.is_some() {
+                    len += 1;
+                }
+                Ok(ElementCount(len, PhantomData))
+            }
+        }
+        d.deserialize_seq(V(PhantomData))
+    }
+}
+
+/// The input the codec has read since it marked the start of an array.
+struct Span<'a>(&'a [u8]);
+
+impl<'de: 'a, 'a> Deserialize<'de> for Span<'a> {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        struct V<'a>(PhantomData<&'a ()>);
+        impl<'de: 'a, 'a> Visitor<'de> for V<'a> {
+            type Value = Span<'a>;
+            fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                f.write_str("the span of a borrowed array")
+            }
+            fn visit_borrowed_bytes<E: de::Error>(
+                self,
+                v: &'de [u8],
+            ) -> Result<Span<'a>, E> {
+                Ok(Span(v))
+            }
+        }
+        d.deserialize_newtype_struct(SENTINEL_ARRAY_REF, V(PhantomData))
+    }
+}
+
+/// Bytes that are already XDR, written as they are with no length in front.
+struct Encoded<'a>(&'a [u8]);
+
+impl Serialize for Encoded<'_> {
+    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_newtype_struct(SENTINEL_FIXED, &RawBytes(self.0))
+    }
+}
+
+/// The elements of a [`VarArrayRef`], decoded one at a time.
+pub struct VarArrayIter<'a, T> {
+    rest: &'a [u8],
+    left: usize,
+    element: PhantomData<fn() -> T>,
+}
+
+impl<T> fmt::Debug for VarArrayIter<'_, T> {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        f.debug_struct("VarArrayIter")
+            .field("left", &self.left)
+            .field("rest", &self.rest)
+            .finish()
+    }
+}
+
+impl<'a, T: Deserialize<'a>> Iterator for VarArrayIter<'a, T> {
+    type Item = crate::Result<T>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.left = self.left.checked_sub(1)?;
+        // The array was read whole when it was decoded, under whatever
+        // strictness and depth held then. Neither is held again here, so
+        // that what decoded once decodes now.
+        let mut de =
+            crate::Deserializer::new(self.rest, crate::Strictness::Lenient)
+                .with_max_depth(usize::MAX);
+        let element = T::deserialize(&mut de);
+        match element {
+            Ok(_) => self.rest = de.remaining(),
+            Err(_) => self.left = 0,
+        }
+        Some(element)
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        (self.left, Some(self.left))
+    }
+}
+
+impl<'a, T: Deserialize<'a>> ExactSizeIterator for VarArrayIter<'a, T> {}
 
 /// A byte slice that serializes through `serialize_bytes`.
 struct RawBytes<'a>(&'a [u8]);

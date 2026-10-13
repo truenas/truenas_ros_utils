@@ -62,6 +62,11 @@ path = "tests/zero_copy.rs"
 name = "bounded"
 path = "tests/bounded.rs"
 
+# A variable array is borrowed whole and its elements are found again.
+[[test]]
+name = "array_ref"
+path = "tests/array_ref.rs"
+
 # A hostile deeply-nested stream is bounded, not a stack overflow.
 [[test]]
 name = "recursion"

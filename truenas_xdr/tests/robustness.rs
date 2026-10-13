@@ -14,8 +14,8 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 
 use serde::Deserialize;
 use truenas_xdr::{
-    Bounded, FixedOpaque, Strictness, VarOpaque, VarOpaqueCow, VarOpaqueRef,
-    from_bytes_with,
+    Bounded, FixedOpaque, Strictness, VarArrayRef, VarOpaque, VarOpaqueCow,
+    VarOpaqueRef, from_bytes_with, from_prefix_with, to_bytes,
 };
 
 #[derive(Deserialize)]
@@ -164,6 +164,10 @@ fn no_target_type_panics_on_hostile_input() {
     total += probe::<Bounded<VarOpaqueRef, 3>>(&inputs);
     total += probe::<Bounded<Vec<u32>, 2>>(&inputs);
     total += probe::<Bounded<Vec<Bounded<VarOpaque, 2>>, 2>>(&inputs);
+    total += probe::<VarArrayRef<u32>>(&inputs);
+    total += probe::<VarArrayRef<VarOpaqueRef>>(&inputs);
+    total += probe::<VarArrayRef<VarArrayRef<&str>>>(&inputs);
+    total += probe::<Bounded<VarArrayRef<bool>, 2>>(&inputs);
     total += probe::<(i32, String)>(&inputs);
     total += probe::<[i32; 3]>(&inputs);
     total += probe::<Option<u32>>(&inputs);
@@ -173,4 +177,36 @@ fn no_target_type_panics_on_hostile_input() {
 
     // A guard on the guard: the sweep must actually have run.
     assert!(total > 10_000, "sweep too small: {total}");
+}
+
+/// A borrowed array stores no element, so its elements are decoded a second
+/// time when they are read. Whatever array comes out of a hostile input must
+/// then hand back as many elements as it counted, each without an error, and
+/// must encode to the bytes it was read from.
+#[test]
+fn an_array_that_decodes_from_hostile_input_can_be_read_and_written_back() {
+    let inputs = corpus();
+    let mut arrays = 0u64;
+    for input in &inputs {
+        for mode in [Strictness::Lenient, Strictness::Strict] {
+            type Nested<'a> =
+                VarArrayRef<'a, VarArrayRef<'a, VarOpaqueRef<'a>>>;
+            let Ok((array, rest)) = from_prefix_with::<Nested<'_>>(input, mode)
+            else {
+                continue;
+            };
+            let mut read = 0;
+            for inner in array.iter() {
+                let inner = inner.expect("an element that decoded once");
+                assert!(inner.iter().all(|opaque| opaque.is_ok()));
+                read += 1;
+            }
+            assert_eq!(read, array.len());
+            let taken = &input[..input.len() - rest.len()];
+            assert_eq!(to_bytes(&array).unwrap(), taken);
+            arrays += 1;
+        }
+    }
+    // A guard on the guard. Some inputs must have decoded.
+    assert!(arrays > 10, "only {arrays} arrays decoded");
 }
