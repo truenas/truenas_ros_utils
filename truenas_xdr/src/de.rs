@@ -26,6 +26,10 @@ pub struct Deserializer<'de> {
     /// Set by `deserialize_tuple_struct(SENTINEL_BOUNDED, max, ..)`. The next
     /// length read is held to this bound and clears it.
     bound_pending: Option<usize>,
+    /// Set by `deserialize_tuple_struct(SENTINEL_ARRAY_REF, ..)` to where a
+    /// borrowed array starts. `deserialize_newtype_struct` under the same
+    /// name hands back the input from there to the current position.
+    span_start: Option<usize>,
     /// Nesting reached so far; compared against `max_depth` at each compound.
     depth: usize,
     max_depth: usize,
@@ -49,6 +53,7 @@ impl<'de> Deserializer<'de> {
             mode,
             fixed_pending: false,
             bound_pending: None,
+            span_start: None,
             depth: 0,
             max_depth: Self::DEFAULT_MAX_DEPTH,
         }
@@ -285,6 +290,13 @@ impl<'de> serde::Deserializer<'de> for &mut Deserializer<'de> {
         name: &'static str,
         v: V,
     ) -> Result<V::Value> {
+        if name == crate::SENTINEL_ARRAY_REF {
+            // The span is a leaf of raw input, so it does not descend.
+            let start = self.span_start.ok_or(Error::Unsupported(
+                "the span of an array that was not marked",
+            ))?;
+            return v.visit_borrowed_bytes(&self.input[start..self.pos]);
+        }
         if name == crate::SENTINEL_FIXED {
             self.fixed_pending = true;
         }
@@ -345,6 +357,15 @@ impl<'de> serde::Deserializer<'de> for &mut Deserializer<'de> {
             // The value behind it is read as a newtype would be.
             self.bound_pending = Some(len);
             v.visit_newtype_struct(&mut *self)
+        } else if name == crate::SENTINEL_ARRAY_REF {
+            // The fields are the array and then the span it covered. An
+            // array inside an element marks a start of its own, so the
+            // outer start is put back once this one is done.
+            let outer = self.span_start.replace(self.pos);
+            let reader = self.seq(len);
+            let out = v.visit_seq(reader);
+            self.span_start = outer;
+            out
         } else {
             let reader = self.seq(len);
             v.visit_seq(reader)

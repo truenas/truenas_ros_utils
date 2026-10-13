@@ -38,6 +38,9 @@
 //!   [`XdrEnum`] or [`XdrUnion`]; a stock `#[derive(Serialize)]` enum encodes
 //!   the declaration index.
 //!
+//! A variable array (`T name<>`) is a `Vec<T>`, or [`VarArrayRef`] to keep the
+//! elements as the bytes they arrived in and decode them one at a time.
+//!
 //! A declared upper bound (`opaque<N>`, `string<N>`, `T<N>`) is [`Bounded`]
 //! around the variable-length type. A length over the bound is
 //! [`Error::TooLong`] when decoding and when encoding.
@@ -83,6 +86,9 @@
 //! A union derived with [`XdrUnion`] borrows the same way. It declares a
 //! lifetime and needs no attribute on its arms.
 //!
+//! [`VarArrayRef`] borrows a whole array. Decoding it reads each element
+//! once, to find where the array ends, and stores none of them.
+//!
 //! # Decoding
 //!
 //! [`from_bytes`] requires the input to be consumed exactly; [`from_prefix`]
@@ -103,7 +109,8 @@ pub use de::Deserializer;
 pub use error::{Error, Result};
 pub use strict::Strictness;
 pub use wrappers::{
-    Bounded, Counted, FixedOpaque, VarOpaque, VarOpaqueCow, VarOpaqueRef,
+    Bounded, Counted, FixedOpaque, VarArrayIter, VarArrayRef, VarOpaque,
+    VarOpaqueCow, VarOpaqueRef,
 };
 
 #[cfg(feature = "derive")]
@@ -146,6 +153,11 @@ pub(crate) const SENTINEL_FIXED: &str = "\u{0}truenas-xdr-fixed-opaque";
 /// Tuple-struct name by which [`Bounded`] hands the codec its bound, in place
 /// of a field count. Not a stable part of the API.
 pub(crate) const SENTINEL_BOUNDED: &str = "\u{0}truenas-xdr-bounded";
+
+/// Name by which [`VarArrayRef`] has the codec mark where an array starts, as
+/// a tuple struct, and hand back the input read since then, as a newtype. Not
+/// a stable part of the API.
+pub(crate) const SENTINEL_ARRAY_REF: &str = "\u{0}truenas-xdr-array-ref";
 
 /// Zero padding needed to bring `len` up to a 4-byte boundary, `0..=3`.
 pub(crate) const fn pad4(len: usize) -> usize {

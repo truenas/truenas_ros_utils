@@ -6,7 +6,7 @@
 //! repeating a four-byte "present" discriminant.
 
 use serde::Deserialize;
-use truenas_xdr::{Deserializer, Error, Strictness, from_bytes};
+use truenas_xdr::{Deserializer, Error, Strictness, VarArrayRef, from_bytes};
 
 #[derive(Deserialize, PartialEq, Debug)]
 struct Node {
@@ -72,4 +72,63 @@ fn the_depth_bound_is_configurable() {
         Node::deserialize(&mut de).unwrap_err(),
         Error::RecursionLimit { .. }
     ));
+}
+
+/// A tree whose children stay in the input. RFC 4506 §4.13 lets an array
+/// hold values of its own type, so the same four bytes repeated nest it as
+/// deep as an attacker likes.
+#[derive(Deserialize, PartialEq, Debug)]
+struct Tree<'a> {
+    #[serde(borrow)]
+    children: VarArrayRef<'a, Tree<'a>>,
+}
+
+/// How many levels of single children lie under `tree`, found by reading
+/// each array as it is reached.
+fn depth_of(tree: &Tree<'_>) -> usize {
+    let mut levels = 0;
+    let mut children = tree.children;
+    while let Some(child) = children.iter().next() {
+        children = child.unwrap().children;
+        levels += 1;
+    }
+    levels
+}
+
+#[test]
+fn a_hostile_deep_array_is_an_error_not_a_crash() {
+    // `nested` is as many counts of one as there are levels, then a count
+    // of zero, which is a tree of single children that deep.
+    let err = from_bytes::<Tree<'_>>(&nested(1_000_000)).unwrap_err();
+    assert!(
+        matches!(err, Error::RecursionLimit { .. }),
+        "expected RecursionLimit, got {err:?}"
+    );
+}
+
+#[test]
+fn a_borrowed_array_within_the_limit_is_read_to_its_last_level() {
+    // Each level is the struct, the array and its elements, so thirty
+    // levels stay well under the bound.
+    let levels = 30;
+    assert!(3 * levels + 3 < Deserializer::DEFAULT_MAX_DEPTH);
+    let wire = nested(levels);
+    let tree = from_bytes::<Tree<'_>>(&wire).unwrap();
+    assert_eq!(depth_of(&tree), levels);
+}
+
+#[test]
+fn an_array_decoded_under_a_raised_bound_is_still_read() {
+    // The elements are decoded again when they are read. That second
+    // decode must not hold them to a lower bound than the first did.
+    let wire = nested(300);
+    assert!(matches!(
+        from_bytes::<Tree<'_>>(&wire).unwrap_err(),
+        Error::RecursionLimit { .. }
+    ));
+    let mut de =
+        Deserializer::new(&wire, Strictness::default()).with_max_depth(4096);
+    let tree = Tree::deserialize(&mut de).unwrap();
+    assert!(de.remaining().is_empty());
+    assert_eq!(depth_of(&tree), 300);
 }

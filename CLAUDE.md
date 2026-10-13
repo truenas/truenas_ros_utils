@@ -478,6 +478,12 @@ sequence and decodes it as opaque — so `VarOpaqueRef` exists for that.
 from a buffer in one place and built in another. Its decode always borrows,
 and `into_owned` is the one way to keep the bytes past the input.
 
+`VarArrayRef` is a variable array that stays in the input. It keeps the count
+and the bytes of the elements, and decodes an element when it is asked for
+one. Decoding the array reads every element once to find where the array
+ends, so an array that decodes is one whose elements decode. It encodes back
+to the bytes it was read from.
+
 A declared upper bound is `Bounded`, which wraps a variable-length type and
 holds its length to the bound in both directions. The decoder checks the
 declared length before it reads what that length covers, so a hostile length
