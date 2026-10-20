@@ -4,15 +4,15 @@
 //!
 //! These take LMDB's storage as given and cover this crate's own decisions:
 //! copying before a transaction ends, guard drop order, transaction slot
-//! accounting, error classification, scan bounds, iterator state, and handle
-//! lifetimes.
+//! accounting, error classification, scan bounds, iterator state, handle
+//! lifetimes, and what an explicit transaction commits, discards and sees.
 //!
 //! Needs only a writable temp directory and the linked `liblmdb`.
 
 use std::ops::ControlFlow;
 use std::sync::Arc;
 
-use truenas_mdb::{Db, Env, EnvFlags, EnvOptions, Error, Iter, MdbCode};
+use truenas_mdb::{Db, Env, EnvFlags, EnvOptions, Error, Iter, MdbCode, Stat};
 
 const SMALL: EnvOptions = EnvOptions {
     map_size: 1 << 20,
@@ -974,4 +974,426 @@ fn databases_opened_concurrently_on_one_environment_are_consistent() {
         h.join().unwrap();
     }
     assert_eq!(Db::open(&env, "state").unwrap().len().unwrap(), 200);
+}
+
+// --- explicit transactions -----------------------------------------------
+
+/// Two databases written in one transaction are seen together or not at all.
+#[test]
+fn a_write_transaction_commits_every_database_together() {
+    let (_dir, env, names) = scratch();
+    let records = Db::create(&env, "records").unwrap();
+
+    // A closure error discards both puts.
+    let err = env
+        .write(|txn| {
+            txn.put(&names, "report.pdf", "7")?;
+            txn.put(&records, "7", "a record")?;
+            Err::<(), _>(Error::Os(libc::EINTR))
+        })
+        .unwrap_err();
+    assert_eq!(err, Error::Os(libc::EINTR));
+    assert_eq!(names.get("report.pdf").unwrap(), None);
+    assert_eq!(records.get("7").unwrap(), None);
+
+    // Ok commits both, and the closure's value comes back.
+    let n = env
+        .write(|txn| {
+            txn.put(&names, "report.pdf", "7")?;
+            txn.put(&records, "7", "a record")?;
+            Ok(2)
+        })
+        .unwrap();
+    assert_eq!(n, 2);
+    assert_eq!(names.get("report.pdf").unwrap().as_deref(), Some(&b"7"[..]));
+    assert_eq!(records.get("7").unwrap().as_deref(), Some(&b"a record"[..]));
+}
+
+/// Unwinding out of the closure discards the transaction and frees the
+/// thread's slot.
+#[test]
+fn a_panic_inside_a_write_transaction_discards_it() {
+    let (_dir, env, db) = scratch();
+    let caught = std::panic::catch_unwind({
+        let env = env.clone();
+        let db = db.clone();
+        move || {
+            env.write(|txn| -> Result<(), Error> {
+                txn.put(&db, "k", "v")?;
+                panic!("from the closure")
+            })
+        }
+    });
+    assert!(caught.is_err(), "the panic propagated");
+    assert_eq!(db.get("k").unwrap(), None, "the put was discarded");
+    db.put("after", "panic").unwrap();
+}
+
+/// A write transaction reads its own uncommitted writes, and `del` and
+/// `put_if_absent` report what they found.
+#[test]
+fn a_write_transaction_sees_its_own_writes() {
+    let (_dir, env, db) = scratch();
+    env.write(|txn| {
+        assert_eq!(txn.get(&db, "k")?, None);
+        txn.put(&db, "k", "1")?;
+        assert_eq!(txn.get(&db, "k")?, Some(&b"1"[..]));
+        assert!(txn.contains_key(&db, "k")?);
+        assert!(!txn.put_if_absent(&db, "k", "2")?);
+        assert!(txn.put_if_absent(&db, "j", "2")?);
+        assert_eq!(txn.stat(&db)?.entries, 2);
+        assert!(txn.del(&db, "k")?);
+        assert!(!txn.del(&db, "k")?);
+        assert_eq!(txn.get(&db, "k")?, None);
+        txn.clear(&db)?;
+        assert_eq!(txn.stat(&db)?.entries, 0);
+        txn.put(&db, "k", "3")
+    })
+    .unwrap();
+    assert_eq!(db.get("k").unwrap().as_deref(), Some(&b"3"[..]));
+    assert_eq!(db.len().unwrap(), 1);
+}
+
+/// `put_append` takes keys in order and refuses one that would not be last,
+/// storing nothing for it.
+#[test]
+fn put_append_requires_sorted_keys() {
+    let (_dir, env, db) = scratch();
+    env.write(|txn| {
+        txn.put_append(&db, "a", "1")?;
+        txn.put_append(&db, "b", "2")?;
+        txn.put_append(&db, "c", "3")?;
+        assert_eq!(
+            txn.put_append(&db, "b", "again").unwrap_err(),
+            Error::Mdb(MdbCode::KeyExist)
+        );
+        // Equal to the last key is not after it either.
+        assert_eq!(
+            txn.put_append(&db, "c", "again").unwrap_err(),
+            Error::Mdb(MdbCode::KeyExist)
+        );
+        Ok(())
+    })
+    .unwrap();
+    assert_eq!(
+        scanned_keys(&db),
+        [b"a", b"b", b"c"].map(Vec::from),
+        "the refused puts stored nothing"
+    );
+    assert_eq!(db.get("b").unwrap().as_deref(), Some(&b"2"[..]));
+}
+
+/// A read transaction is one snapshot: a write committed while it is open is
+/// invisible inside it and visible after.
+#[test]
+fn a_read_transaction_is_a_snapshot() {
+    let (_dir, env, db) = ordered();
+    env.read(|txn| {
+        assert!(txn.contains_key(&db, "aa")?);
+        // On another thread, since this one's slot is taken.
+        let writer = db.clone();
+        std::thread::spawn(move || {
+            writer.put("zz", "after").unwrap();
+            writer.del("aa").unwrap();
+        })
+        .join()
+        .unwrap();
+        assert!(txn.contains_key(&db, "aa")?, "the snapshot holds");
+        assert!(!txn.contains_key(&db, "zz")?);
+        assert_eq!(txn.stat(&db)?.entries, 6);
+        Ok(())
+    })
+    .unwrap();
+    assert!(!db.contains_key("aa").unwrap());
+    assert!(db.contains_key("zz").unwrap());
+}
+
+/// The shape the transaction exists for: a cursor over one database and
+/// lookups in another, inside one snapshot, nothing copied.
+#[test]
+fn a_cursor_and_a_lookup_share_one_transaction() {
+    let (_dir, env, names) = scratch();
+    let records = Db::create(&env, "records").unwrap();
+    env.write(|txn| {
+        txn.put(&names, "a.txt", "1")?;
+        txn.put(&names, "b.txt", "2")?;
+        txn.put(&names, "c.txt", "3")?;
+        txn.put(&records, "1", "A")?;
+        txn.put(&records, "3", "C")
+    })
+    .unwrap();
+
+    let joined = env
+        .read(|txn| {
+            let mut cursor = txn.cursor(&names)?;
+            let mut joined = Vec::new();
+            while let Some((name, id)) = cursor.next()? {
+                let record = txn.get(&records, id)?;
+                joined.push((name, record));
+            }
+            drop(cursor);
+            // The pairs outlive the cursor: they are the transaction's.
+            Ok(joined
+                .into_iter()
+                .map(|(n, r)| (n.to_vec(), r.map(<[u8]>::to_vec)))
+                .collect::<Vec<_>>())
+        })
+        .unwrap();
+    assert_eq!(
+        joined,
+        vec![
+            (b"a.txt".to_vec(), Some(b"A".to_vec())),
+            (b"b.txt".to_vec(), None),
+            (b"c.txt".to_vec(), Some(b"C".to_vec())),
+        ]
+    );
+}
+
+/// Every cursor movement, against hand-written expectations.
+#[test]
+fn a_cursor_moves_as_lmdb_orders() {
+    let (_dir, env, db) = ordered();
+    let key = |p: Option<(&[u8], &[u8])>| p.map(|(k, _)| k.to_vec());
+    env.read(|txn| {
+        let mut c = txn.cursor(&db)?;
+        assert_eq!(key(c.first()?), Some(b"aa".to_vec()));
+        assert_eq!(key(c.next()?), Some(b"ab".to_vec()));
+        assert_eq!(key(c.current()?), Some(b"ab".to_vec()));
+        assert_eq!(key(c.prev()?), Some(b"aa".to_vec()));
+        assert_eq!(key(c.prev()?), None, "before the first is nothing");
+        assert_eq!(key(c.last()?), Some(b"ca".to_vec()));
+        assert_eq!(key(c.next()?), None, "after the last is nothing");
+        assert_eq!(key(c.prev()?), Some(b"bb".to_vec()));
+        // seek is "at or after".
+        assert_eq!(key(c.seek("b")?), Some(b"ba".to_vec()));
+        assert_eq!(key(c.seek("bb")?), Some(b"bb".to_vec()));
+        assert_eq!(key(c.seek("bc")?), Some(b"ca".to_vec()));
+        assert_eq!(key(c.seek("d")?), None);
+        assert_eq!(key(c.seek("")?), Some(b"aa".to_vec()));
+        // seek_exact is exact.
+        assert_eq!(key(c.seek_exact("ab")?), Some(b"ab".to_vec()));
+        assert_eq!(key(c.seek_exact("abc")?), None);
+        assert_eq!(key(c.seek_exact("")?), None);
+        // next and prev on an unpositioned cursor are first and last.
+        let mut fresh = txn.cursor(&db)?;
+        assert_eq!(key(fresh.next()?), Some(b"aa".to_vec()));
+        let mut fresh = txn.cursor(&db)?;
+        assert_eq!(key(fresh.prev()?), Some(b"ca".to_vec()));
+        // current on an unpositioned cursor is an error, not a pair.
+        let fresh = txn.cursor(&db)?;
+        assert_eq!(fresh.current().unwrap_err(), Error::Os(libc::EINVAL));
+        Ok(())
+    })
+    .unwrap();
+
+    // An empty database has nothing to land on.
+    let empty = Db::create(&env, "empty").unwrap();
+    env.read(|txn| {
+        let mut c = txn.cursor(&empty)?;
+        assert_eq!(c.first()?, None);
+        assert_eq!(c.last()?, None);
+        assert_eq!(c.seek("a")?, None);
+        Ok(())
+    })
+    .unwrap();
+}
+
+/// Inside a transaction's closure the thread's slot is taken: the `Db`
+/// methods on that environment are refused, another environment's are not,
+/// and the slot is free again afterwards.
+#[test]
+fn db_operations_are_refused_inside_a_transaction() {
+    let (_dir, env, db) = scratch();
+    let (_other_dir, other_env) = scratch_env(SMALL);
+    let other = Db::create(&other_env, "other").unwrap();
+    let deadlock = Error::Os(libc::EDEADLK);
+
+    env.read(|txn| {
+        assert_eq!(db.get("k").unwrap_err(), deadlock);
+        assert_eq!(db.put("k", "v").unwrap_err(), deadlock);
+        assert_eq!(env.read(|_| Ok(())).unwrap_err(), deadlock);
+        assert_eq!(env.write(|_| Ok(())).unwrap_err(), deadlock);
+        other.put("k", "v").unwrap();
+        assert_eq!(txn.get(&db, "k")?, None);
+        Ok(())
+    })
+    .unwrap();
+    env.write(|txn| {
+        assert_eq!(db.get("k").unwrap_err(), deadlock);
+        txn.put(&db, "k", "v")
+    })
+    .unwrap();
+    assert_eq!(db.get("k").unwrap().as_deref(), Some(&b"v"[..]));
+}
+
+/// A `Db` from another environment names nothing in this one and is refused
+/// before LMDB sees it.
+#[test]
+fn a_database_of_another_environment_is_refused() {
+    let (_dir, env, _db) = scratch();
+    let (_other_dir, other_env) = scratch_env(SMALL);
+    let other = Db::create(&other_env, "other").unwrap();
+    let invalid = Error::Os(libc::EINVAL);
+    env.read(|txn| {
+        assert_eq!(txn.get(&other, "k").unwrap_err(), invalid);
+        assert_eq!(txn.cursor(&other).err(), Some(invalid));
+        assert_eq!(txn.stat(&other).unwrap_err(), invalid);
+        Ok(())
+    })
+    .unwrap();
+    env.write(|txn| {
+        assert_eq!(txn.put(&other, "k", "v").unwrap_err(), invalid);
+        assert_eq!(txn.del(&other, "k").unwrap_err(), invalid);
+        assert_eq!(txn.clear(&other).unwrap_err(), invalid);
+        Ok(())
+    })
+    .unwrap();
+}
+
+/// Statistics as LMDB lays pages out: one leaf for a few small entries, and
+/// `OVPAGES(size, psize) = (PAGEHDRSZ - 1 + size) / psize + 1` overflow pages
+/// for a value too large to share a leaf (`mdb.c`), with `PAGEHDRSZ` 16.
+#[test]
+fn stat_reports_pages_and_entries() {
+    let (_dir, env, db) = scratch();
+
+    let empty = db.stat().unwrap();
+    let page_size = empty.page_size;
+    assert!(
+        page_size.is_power_of_two() && page_size >= 4096,
+        "{page_size}"
+    );
+    assert_eq!(
+        (
+            empty.depth,
+            empty.branch_pages,
+            empty.leaf_pages,
+            empty.overflow_pages,
+            empty.entries
+        ),
+        (0, 0, 0, 0, 0)
+    );
+
+    db.put("a", "1").unwrap();
+    db.put("b", "2").unwrap();
+    db.put("c", "3").unwrap();
+    let small = db.stat().unwrap();
+    assert_eq!(small.depth, 1);
+    assert_eq!(small.leaf_pages, 1);
+    assert_eq!(small.branch_pages, 0);
+    assert_eq!(small.overflow_pages, 0);
+    assert_eq!(small.entries, 3);
+
+    let size = 10_000usize;
+    db.put("big", vec![0x5a; size]).unwrap();
+    let big = db.stat().unwrap();
+    let expected = (16 - 1 + size) / page_size as usize + 1;
+    assert_eq!(big.overflow_pages, expected as u64);
+    assert_eq!(big.entries, 4);
+
+    // The same numbers inside a transaction.
+    env.read(|txn| {
+        assert_eq!(txn.stat(&db)?, big);
+        Ok(())
+    })
+    .unwrap();
+}
+
+/// What `info` reports: the configured map, LMDB's default reader table, a
+/// transaction id that counts commits, and the pages a write adds.
+#[test]
+fn info_reports_the_environment() {
+    let (_dir, env, db) = scratch();
+    let before = env.info().unwrap();
+    assert_eq!(before.map_size, SMALL.map_size);
+    assert_eq!(
+        before.max_readers, 126,
+        "LMDB's default when 0 is configured"
+    );
+    assert!(before.readers <= before.max_readers);
+
+    db.put("k", vec![0x5a; 20_000]).unwrap();
+    let after = env.info().unwrap();
+    assert_eq!(after.last_txn_id, before.last_txn_id + 1);
+    assert!(after.last_page > before.last_page, "the value took pages");
+    assert!(after.readers >= 1, "this thread has read");
+
+    let (_other_dir, other) = scratch_env(EnvOptions {
+        max_readers: 7,
+        ..SMALL
+    });
+    assert_eq!(other.info().unwrap().max_readers, 7);
+}
+
+/// With no dead process holding a slot there is nothing to release.
+#[test]
+fn reader_check_finds_nothing_to_release() {
+    let (_dir, env, db) = scratch();
+    db.put("k", "v").unwrap();
+    db.get("k").unwrap();
+    assert_eq!(env.reader_check().unwrap(), 0);
+}
+
+/// A read-only environment serves reads and refuses every write with
+/// `EACCES`, `Db::create` of an absent database and `sync` included.
+#[test]
+fn a_read_only_environment_refuses_writes() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("env");
+    {
+        let env = Env::open_with(&path, &SMALL).unwrap();
+        let db = Db::create(&env, "state").unwrap();
+        db.put("k", "v").unwrap();
+    } // the last handle closes the environment, so the next open is fresh
+
+    let env = Env::open_with(
+        &path,
+        &EnvOptions {
+            flags: EnvFlags::RDONLY,
+            ..SMALL
+        },
+    )
+    .unwrap();
+    let denied = Error::Os(libc::EACCES);
+    let db = Db::open(&env, "state").unwrap();
+    assert_eq!(db.get("k").unwrap().as_deref(), Some(&b"v"[..]));
+    assert_eq!(scanned_keys(&db), [b"k".to_vec()]);
+    env.read(|txn| {
+        assert_eq!(txn.get(&db, "k")?, Some(&b"v"[..]));
+        Ok(())
+    })
+    .unwrap();
+
+    assert_eq!(db.put("k", "w").unwrap_err(), denied);
+    assert_eq!(db.del("k").unwrap_err(), denied);
+    assert_eq!(env.write(|_| Ok(())).unwrap_err(), denied);
+    assert_eq!(Db::create(&env, "absent").unwrap_err(), denied);
+    assert_eq!(env.sync(true).unwrap_err(), denied);
+    assert_eq!(db.get("k").unwrap().as_deref(), Some(&b"v"[..]));
+}
+
+/// A read-only open of a data file that does not exist fails rather than
+/// creating one.
+#[test]
+fn a_read_only_open_needs_an_existing_data_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let err = Env::open_with(
+        dir.path().join("absent"),
+        &EnvOptions {
+            flags: EnvFlags::RDONLY,
+            ..SMALL
+        },
+    )
+    .unwrap_err();
+    assert_eq!(err, Error::Os(libc::ENOENT));
+}
+
+/// The statistics and environment information are plain data; that the
+/// transaction types are not `Send` is pinned by their `compile_fail`
+/// doctests.
+#[test]
+fn statistics_are_plain_data() {
+    fn assert_send_sync<T: Send + Sync + Copy>() {}
+    assert_send_sync::<Stat>();
+    assert_send_sync::<truenas_mdb::EnvInfo>();
 }

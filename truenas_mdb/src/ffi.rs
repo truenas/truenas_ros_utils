@@ -46,6 +46,30 @@ pub struct MDB_stat {
     pub ms_entries: usize,
 }
 
+/// Information about an environment (`mdb_env_info`).
+#[repr(C)]
+pub struct MDB_envinfo {
+    pub me_mapaddr: *mut c_void,
+    pub me_mapsize: usize,
+    pub me_last_pgno: usize,
+    pub me_last_txnid: usize,
+    pub me_maxreaders: c_uint,
+    pub me_numreaders: c_uint,
+}
+
+impl Default for MDB_envinfo {
+    fn default() -> MDB_envinfo {
+        MDB_envinfo {
+            me_mapaddr: std::ptr::null_mut(),
+            me_mapsize: 0,
+            me_last_pgno: 0,
+            me_last_txnid: 0,
+            me_maxreaders: 0,
+            me_numreaders: 0,
+        }
+    }
+}
+
 // --- mdb_env_open flags --------------------------------------------------
 
 /// No fsync after commit.
@@ -54,21 +78,21 @@ pub const MDB_NOSYNC: c_uint = 0x10000;
 pub const MDB_NOMETASYNC: c_uint = 0x40000;
 /// No readahead.
 pub const MDB_NORDAHEAD: c_uint = 0x800000;
+/// Open the environment read-only. The same value serves `mdb_txn_begin`.
+pub const MDB_RDONLY: c_uint = 0x20000;
 
 // --- mdb_dbi_open flags --------------------------------------------------
 
 /// Create the named database if absent.
 pub const MDB_CREATE: c_uint = 0x40000;
 
-// --- mdb_txn_begin flags -------------------------------------------------
-
-/// Read-only transaction.
-pub const MDB_RDONLY: c_uint = 0x20000;
-
 // --- mdb_put flags -------------------------------------------------------
 
 /// Fail with `MDB_KEYEXIST` instead of overwriting.
 pub const MDB_NOOVERWRITE: c_uint = 0x10;
+/// Append the pair at the end; fail with `MDB_KEYEXIST` if the key does not
+/// sort after every key present.
+pub const MDB_APPEND: c_uint = 0x20000;
 
 // --- return codes --------------------------------------------------------
 // LMDB's own codes occupy a contiguous block. Anything else non-zero is a
@@ -100,8 +124,16 @@ pub const MDB_BAD_DBI: c_int = -30780;
 
 /// Position at the first pair.
 pub const MDB_FIRST: c_uint = 0;
+/// Return the pair at the current position.
+pub const MDB_GET_CURRENT: c_uint = 4;
+/// Position at the last pair.
+pub const MDB_LAST: c_uint = 6;
 /// Position at the next pair.
 pub const MDB_NEXT: c_uint = 8;
+/// Position at the previous pair.
+pub const MDB_PREV: c_uint = 12;
+/// Position at the key supplied, returning the pair.
+pub const MDB_SET_KEY: c_uint = 16;
 /// Position at the first key greater than or equal to the one supplied.
 pub const MDB_SET_RANGE: c_uint = 17;
 
@@ -130,6 +162,8 @@ unsafe extern "C" {
         mode: mdb_mode_t,
     ) -> c_int;
     pub fn mdb_env_sync(env: *mut MDB_env, force: c_int) -> c_int;
+    pub fn mdb_env_info(env: *mut MDB_env, stat: *mut MDB_envinfo) -> c_int;
+    pub fn mdb_reader_check(env: *mut MDB_env, dead: *mut c_int) -> c_int;
     pub fn mdb_env_close(env: *mut MDB_env);
 
     pub fn mdb_txn_begin(

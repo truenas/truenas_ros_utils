@@ -324,6 +324,14 @@ transaction per thread per environment. [`src/txn.rs`](truenas_mdb/src/txn.rs)
 enforces that with `EDEADLK` rather than leaving a second transaction to
 deadlock on the writer mutex or fail with `MDB_BAD_RSLOT`.
 
+Every `Db` operation is a transaction of its own. Work that must be one
+transaction, across operations or databases, goes through `Env::read` and
+`Env::write` ([`src/transaction.rs`](truenas_mdb/src/transaction.rs)): a
+snapshot with cursors and borrowed values that live as long as it, or a write
+that commits whole when the closure returns `Ok` and is discarded otherwise.
+Inside either, the `Db` methods on that environment are the second
+transaction the rule refuses; the transaction's own methods take their place.
+
 One environment per path per process, reference counted through the pool in
 [`src/env.rs`](truenas_mdb/src/env.rs).
 
@@ -333,8 +341,9 @@ environment this process controls may be opened.
 
 Values are stored byte for byte. No header, envelope, or encoding is added, so
 another reader of the database sees what was written. `EnvFlags` exposes
-durability and readahead only; `MDB_WRITEMAP`, `MDB_MAPASYNC`, `MDB_NOSUBDIR`,
-and `MDB_NOLOCK` stay out, each omission documented where the type is defined.
+durability, readahead and read-only access only; `MDB_WRITEMAP`,
+`MDB_MAPASYNC`, `MDB_NOSUBDIR`, and `MDB_NOLOCK` stay out, each omission
+documented where the type is defined.
 
 Interoperability is held to account against `python3-lmdb` over one shared
 environment ([`tests/python_interop.rs`](truenas_mdb/tests/python_interop.rs)).

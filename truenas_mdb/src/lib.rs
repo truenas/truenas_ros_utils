@@ -27,30 +27,19 @@
 //! # Ok::<(), truenas_mdb::Error>(())
 //! ```
 //!
-//! # One transaction per call
+//! # Transactions
 //!
-//! Every operation begins and finishes its own transaction, so there is no
-//! transaction type to thread through an API and nothing to commit by hand.
-//! Operations cannot be grouped: two [`Db::put`]s are two transactions, and
-//! there is no way to write two databases atomically. [`Db::put_if_absent`] is
-//! atomic because the check and the write share one transaction.
+//! Every operation on a [`Db`] begins and finishes its own transaction, so a
+//! single read or write has nothing to commit by hand. Two [`Db::put`]s are
+//! two transactions; [`Db::put_if_absent`] is atomic because its check and
+//! write share one.
 //!
-//! Reads have two forms. [`Db::get`] and [`Db::iter`] allocate, because their
-//! transaction ends before the data reaches the caller. [`Db::with_value`] and
-//! [`Db::scan`] pass borrowed slices to a callback that runs inside the
-//! transaction, and copy nothing.
-//!
-//! # One transaction per thread
-//!
-//! LMDB allows a thread only one transaction on an environment at a time.
-//! Two of this crate's APIs hold one open across caller code — the closures
-//! given to [`Db::scan`] and [`Db::with_value`], and a live [`Iter`] — and
-//! while either is in flight, any further operation on that environment from
-//! the same thread returns `EDEADLK` rather than attempting a second
-//! transaction, which LMDB cannot serve: a read needs the thread's reader slot
-//! and a write needs the writer mutex, both already held.
-//!
-//! So this reads and writes back in two steps rather than one:
+//! Work that spans operations or databases runs in an explicit transaction.
+//! [`Env::read`] hands a closure a [`ReadTxn`]: one snapshot of every
+//! database in the environment, with [`Cursor`]s and borrowed values that
+//! live as long as it. [`Env::write`] hands a closure a [`WriteTxn`]: its
+//! puts and deletes, on any databases, commit together when the closure
+//! returns `Ok` and are discarded when it returns `Err` or unwinds.
 //!
 //! ```
 //! # use truenas_mdb::{Db, Env};
@@ -59,12 +48,37 @@
 //! # let src = Db::create(&env, "src")?;
 //! # let dst = Db::create(&env, "dst")?;
 //! # src.put("k", "v")?;
-//! let batch = src.iter()?.collect::<Result<Vec<_>, _>>()?; // iterator dropped
-//! for (key, value) in batch {
-//!     dst.put(key, value)?;
-//! }
+//! env.write(|txn| {
+//!     let mut cursor = txn.cursor(&src)?;
+//!     let mut pairs = Vec::new();
+//!     while let Some((key, value)) = cursor.next()? {
+//!         pairs.push((key.to_vec(), value.to_vec()));
+//!     }
+//!     drop(cursor);
+//!     for (key, value) in pairs {
+//!         txn.put(&dst, key, value)?;
+//!     }
+//!     Ok(())
+//! })?;
+//! assert_eq!(dst.get("k")?.as_deref(), Some(&b"v"[..]));
 //! # Ok::<(), truenas_mdb::Error>(())
 //! ```
+//!
+//! Reads have two forms. [`Db::get`] and [`Db::iter`] allocate, because their
+//! transaction ends before the data reaches the caller. [`Db::with_value`],
+//! [`Db::scan`] and the methods of a [`ReadTxn`] pass borrowed slices that
+//! live inside the transaction, and copy nothing.
+//!
+//! # One transaction per thread
+//!
+//! LMDB allows a thread only one transaction on an environment at a time.
+//! The APIs that hold one open across caller code — the closures given to
+//! [`Env::read`], [`Env::write`], [`Db::scan`] and [`Db::with_value`], and a
+//! live [`Iter`] — make it the thread's only one: while it is in flight, any
+//! [`Db`] operation on that environment from the same thread returns
+//! `EDEADLK` rather than attempting a second transaction, which LMDB cannot
+//! serve. Inside [`Env::read`] and [`Env::write`] the transaction's own
+//! methods take the place of the `Db` ones.
 //!
 //! Other threads and other environments are never blocked by this: the limit
 //! is per thread per environment, and [`Env`] and [`Db`] are `Send + Sync`.
@@ -109,12 +123,14 @@ mod env;
 mod error;
 mod ffi;
 mod iter;
+mod transaction;
 mod txn;
 
 pub use db::Db;
-pub use env::{Env, EnvFlags, EnvOptions};
+pub use env::{Env, EnvFlags, EnvInfo, EnvOptions};
 pub use error::{Error, MdbCode, Result};
 pub use iter::Iter;
+pub use transaction::{Cursor, Pair, ReadTxn, Stat, WriteTxn};
 
 /// The `(major, minor, patch)` version of the `liblmdb` this process linked.
 ///
