@@ -29,29 +29,29 @@ fn required() -> bool {
     std::env::var_os("TRUENAS_NSS_REQUIRE_NAMESPACE").is_some_and(|v| v == "1")
 }
 
-/// `mount(2)`, with `None` passed as null.
+/// `mount(2)`, with `None` data passed as null. The source and the type
+/// are always strings, since memcheck reads the type as one even where the
+/// kernel ignores it.
 fn mount(
-    source: Option<&str>,
+    source: &str,
     target: &str,
-    fstype: Option<&str>,
+    fstype: &str,
     flags: libc::c_ulong,
     data: Option<&str>,
 ) -> Result<(), String> {
     let c = |s: &str| CString::new(s).expect("no NUL in a mount argument");
-    let (source, fstype, data) = (source.map(c), fstype.map(c), data.map(c));
-    let path = c(target);
-    let ptr = |s: &Option<CString>| {
-        s.as_ref().map_or(std::ptr::null(), |s| s.as_ptr())
-    };
+    let (source, path, fstype) = (c(source), c(target), c(fstype));
+    let data = data.map(c);
+    let data = data.as_ref().map_or(std::ptr::null(), |s| s.as_ptr());
     // SAFETY: each pointer is null or a NUL-terminated string owned above,
     // which outlives the call.
     let done = unsafe {
         libc::mount(
-            ptr(&source),
+            source.as_ptr(),
             path.as_ptr(),
-            ptr(&fstype),
+            fstype.as_ptr(),
             flags,
-            ptr(&data).cast(),
+            data.cast(),
         )
     };
     match done {
@@ -87,8 +87,9 @@ fn enter() -> Result<tempfile::TempDir, String> {
         write("/proc/self/uid_map", format!("0 {uid} 1"))?;
         write("/proc/self/gid_map", format!("0 {gid} 1"))?;
     }
-    // Nothing mounted here may reach the host's namespace.
-    mount(None, "/", None, libc::MS_REC | libc::MS_PRIVATE, None)?;
+    // Nothing mounted here may reach the host's namespace. A change of
+    // propagation ignores the source and the type.
+    mount("none", "/", "none", libc::MS_REC | libc::MS_PRIVATE, None)?;
     let dir = tempfile::tempdir().map_err(|e| format!("tempdir ({e})"))?;
     let (upper, work) = (dir.path().join("upper"), dir.path().join("work"));
     for layer in [&upper, &work] {
@@ -111,10 +112,10 @@ fn enter() -> Result<tempfile::TempDir, String> {
         upper.display(),
         work.display()
     );
-    mount(Some("overlay"), "/etc", Some("overlay"), 0, Some(&layers))?;
+    mount("overlay", "/etc", "overlay", 0, Some(&layers))?;
     // A running nscd would answer from the host's netgroups.
     if Path::new("/run/nscd").is_dir() {
-        mount(Some("tmpfs"), "/run/nscd", Some("tmpfs"), 0, None)?;
+        mount("tmpfs", "/run/nscd", "tmpfs", 0, None)?;
     }
     Ok(dir)
 }
