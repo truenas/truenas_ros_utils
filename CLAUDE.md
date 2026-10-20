@@ -418,12 +418,29 @@ structure glibc does not install. glibc documents `innetgr` as unsafe across
 threads over the process's netgroup state, so every call holds one lock. Its
 `false` covers an unknown netgroup, a triple the netgroup does not hold and a
 lookup that failed, which `innetgr` does not tell apart.
-[`tests/netgroup.rs`](truenas_nss/tests/netgroup.rs) runs without the test
-harness. Before its first NSS call it enters a mount namespace of its own,
-after a user namespace when it is not root, and lays an overlay on `/etc`
-whose upper layer holds its own `netgroup` and `nsswitch.conf`, so the host's
-`/etc` is never written. It skips where a namespace cannot be made, and
-`TRUENAS_NSS_REQUIRE_NAMESPACE=1` makes that a failure.
+
+`getnameinfo` gives the name of an address through glibc's frontend and the
+`hosts` line of `nsswitch.conf`, and `confirmed_name` keeps that name only
+when a forward lookup through `getaddrinfo` gives the address back, so the
+owner of an address's reverse DNS cannot claim a name alone. An address
+mapped from IPv4 into IPv6 is read as IPv4. glibc documents both calls as
+safe across threads, so no lock is held. A missing name or address is
+`None`, and any other `EAI_*` code is `Error::Lookup` with the code kept raw
+and the errno of `EAI_SYSTEM`, so `EAI_AGAIN`, which `is_temporary` reports,
+stays apart from an address that has no name.
+
+[`tests/netgroup.rs`](truenas_nss/tests/netgroup.rs) and
+[`tests/hosts.rs`](truenas_nss/tests/hosts.rs) run without the test harness,
+since a user namespace needs a process of one thread. Before its first NSS
+call each enters a mount namespace of its own, after a user namespace when it
+is not root, and lays an overlay on `/etc` whose upper layer holds its own
+files, through [`tests/common`](truenas_nss/tests/common/mod.rs), so the
+host's `/etc` is never written. A running nscd is hidden, since it would
+answer from the host's files. The hosts suite puts `files` alone on the
+`hosts` line, so no DNS is asked, and `multi off` in `host.conf`, so a name
+on two lines resolves forward to its first address alone. Each skips where a
+namespace cannot be made, and `TRUENAS_NSS_REQUIRE_NAMESPACE=1` makes that a
+failure.
 
 ## `truenas_pam`
 

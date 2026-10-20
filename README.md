@@ -15,7 +15,7 @@ other; depend on the one you need.
 | [`truenas_krb5`](truenas_krb5/) | Bindings to the system MIT Kerberos (`libkrb5`): principals, key tables (including fully in-memory ones), credential caches, and initial-credential acquisition |
 | [`truenas_ktls`](truenas_ktls/) | Kernel TLS for accepted sockets: the system libssl runs the handshake, the kernel carries the connection from then on |
 | [`truenas_mdb`](truenas_mdb/) | Bindings to the system LMDB (`liblmdb`): a pooled environment and a byte-oriented key/value store |
-| [`truenas_nss`](truenas_nss/) | Direct passwd, group, and group-membership lookups against the system NSS service modules (`libnss_files`, `libnss_sss`, `libnss_winbind`), bypassing `nsswitch.conf`, and netgroup membership through glibc's `innetgr` |
+| [`truenas_nss`](truenas_nss/) | Direct passwd, group, and group-membership lookups against the system NSS service modules (`libnss_files`, `libnss_sss`, `libnss_winbind`), bypassing `nsswitch.conf`, and netgroup membership and the names of addresses through glibc's `innetgr` and `getnameinfo` |
 | [`truenas_pam`](truenas_pam/) | A PAM client over the system `libpam`: transactions, and a login sequence driven one round at a time |
 | [`truenas_xdr`](truenas_xdr/) | A serde codec for XDR (RFC 4506) |
 | [`truenas_xdr_derive`](truenas_xdr_derive/) | `XdrEnum` and `XdrUnion` derive macros, used through `truenas_xdr`'s `derive` feature |
@@ -75,9 +75,9 @@ the host is touched; they skip when no C compiler is present, and
 `TRUENAS_NSS_REQUIRE_CC=1`, which CI sets, makes that a failure instead. Its
 smoke tests drive the system's own `files` module and skip when it cannot be
 loaded; `TRUENAS_NSS_REQUIRE_SYSTEM=1`, which CI sets, makes that a failure
-instead. Its netgroup suite reads a netgroup file of its own through an
-overlay on `/etc` in a mount namespace of its own, so the host's `/etc` is
-never written. It skips where a namespace cannot be made, and
+instead. Its netgroup and hosts suites read files of their own through an
+overlay on `/etc` in a mount namespace of their own, so the host's `/etc` is
+never written. They skip where a namespace cannot be made, and
 `TRUENAS_NSS_REQUIRE_NAMESPACE=1`, which CI sets, makes that a failure
 instead.
 

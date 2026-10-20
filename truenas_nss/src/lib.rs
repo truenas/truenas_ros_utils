@@ -71,6 +71,14 @@
 //! `nsswitch.conf`, since the netgroup service functions of a module take a
 //! structure glibc does not install. Calls are serialized.
 //!
+//! # Host names
+//!
+//! [`getnameinfo`] gives the name of an address, and [`confirmed_name`] keeps
+//! it only when a forward lookup of the name gives the address back. Both go
+//! through glibc's frontend and the `hosts` line of `nsswitch.conf` too. A
+//! missing name is `None`, and a lookup that failed is [`Error::Lookup`],
+//! which [`Error::is_temporary`] says may pass.
+//!
 //! # Requirements
 //!
 //! Nothing at build time. At run time, glibc 2.34 or later and whichever
@@ -81,12 +89,14 @@
 mod error;
 mod ffi;
 mod grp;
+mod hosts;
 mod netgr;
 mod pwd;
 mod service;
 
 pub use error::{Error, NssStatus, Result};
 pub use grp::{Group, GroupIter, getgrgid, getgrnam, getgrouplist};
+pub use hosts::{confirmed_name, getnameinfo};
 pub use netgr::innetgr;
 pub use pwd::{Passwd, PasswdIter, getpwnam, getpwuid};
 pub use service::{EntScope, Service, Source};
