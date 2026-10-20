@@ -6,9 +6,11 @@
 //! five-value `nss_status` block, and an errno through its out-parameter.
 //! [`Error::Call`] carries both, because classification needs both — an
 //! errno outranks any status, and a status without an errno is a failure in
-//! its own right. The remaining variants are this crate's own: a module that
-//! could not be loaded or lacks a symbol, an enumeration slot already in
-//! use, and arguments or results that cannot cross the C boundary.
+//! its own right. [`Error::Lookup`] carries the `EAI_*` code of a host name
+//! lookup through glibc. The remaining variants are this crate's own: a
+//! module that could not be loaded or lacks a symbol, an enumeration slot
+//! already in use, and arguments or results that cannot cross the C
+//! boundary.
 
 use crate::ffi;
 use std::{error, fmt, io};
@@ -130,6 +132,35 @@ pub enum Error {
     /// A successful call left an entry's name null. The name is the
     /// entry's identity; without one there is nothing to return.
     NullName,
+    /// A host name lookup through glibc failed with something other than a
+    /// missing name. `code` is the raw `EAI_*` value, kept raw so that one
+    /// outside the known set is not lost.
+    Lookup {
+        /// The call, `"getnameinfo"` or `"getaddrinfo"`.
+        op: &'static str,
+        /// The raw `EAI_*` return value.
+        code: i32,
+        /// The errno that came with `EAI_SYSTEM`, or `0`.
+        errno: i32,
+    },
+}
+
+/// The upstream symbol of an `EAI_*` value, when it is one glibc defines.
+fn eai_name(code: i32) -> Option<&'static str> {
+    Some(match code {
+        libc::EAI_BADFLAGS => "EAI_BADFLAGS",
+        libc::EAI_NONAME => "EAI_NONAME",
+        libc::EAI_AGAIN => "EAI_AGAIN",
+        libc::EAI_FAIL => "EAI_FAIL",
+        libc::EAI_NODATA => "EAI_NODATA",
+        libc::EAI_FAMILY => "EAI_FAMILY",
+        libc::EAI_SOCKTYPE => "EAI_SOCKTYPE",
+        libc::EAI_SERVICE => "EAI_SERVICE",
+        libc::EAI_MEMORY => "EAI_MEMORY",
+        libc::EAI_SYSTEM => "EAI_SYSTEM",
+        libc::EAI_OVERFLOW => "EAI_OVERFLOW",
+        _ => return None,
+    })
 }
 
 impl Error {
@@ -151,13 +182,30 @@ impl Error {
         }
     }
 
-    /// The errno a [`Call`](Error::Call) carried, or `None` when there was
-    /// none.
+    /// The errno a [`Call`](Error::Call) or a [`Lookup`](Error::Lookup)
+    /// carried, or `None` when there was none.
     pub fn errno(&self) -> Option<i32> {
         match self {
-            Error::Call { errno, .. } if *errno != 0 => Some(*errno),
+            Error::Call { errno, .. } | Error::Lookup { errno, .. }
+                if *errno != 0 =>
+            {
+                Some(*errno)
+            }
             _ => None,
         }
+    }
+
+    /// Whether a host name lookup could not be made at this time, which is
+    /// `EAI_AGAIN`, so that trying again later may answer it.
+    ///
+    /// ```
+    /// # use truenas_nss::Error;
+    /// let again = Error::Lookup { op: "getnameinfo", code: -3, errno: 0 };
+    /// assert!(again.is_temporary());
+    /// assert!(!Error::NulByte.is_temporary());
+    /// ```
+    pub fn is_temporary(&self) -> bool {
+        matches!(self, Error::Lookup { code, .. } if *code == libc::EAI_AGAIN)
     }
 
     /// Whether this is the condition the fan-out lookups skip: a service
@@ -216,6 +264,17 @@ impl fmt::Display for Error {
             Error::NullName => {
                 f.write_str("NSS module returned an entry with no name")
             }
+            Error::Lookup { op, code, errno } => {
+                match eai_name(*code) {
+                    Some(name) => write!(f, "{op} failed with {name}")?,
+                    None => write!(f, "{op} failed with EAI code {code}")?,
+                }
+                if *errno != 0 {
+                    let cause = io::Error::from_raw_os_error(*errno);
+                    write!(f, " ({cause})")?;
+                }
+                Ok(())
+            }
         }
     }
 }
@@ -227,7 +286,9 @@ impl From<Error> for io::Error {
         match err {
             // Only an errno-carrying call failure maps onto an OS error; the
             // rest keep their own message rather than inventing an errno.
-            Error::Call { errno, .. } if errno != 0 => {
+            Error::Call { errno, .. } | Error::Lookup { errno, .. }
+                if errno != 0 =>
+            {
                 io::Error::from_raw_os_error(errno)
             }
             Error::Busy { .. } => {
@@ -458,5 +519,63 @@ mod tests {
         assert!(!Error::NulByte.to_string().is_empty());
         assert!(!Error::NotUtf8.to_string().is_empty());
         assert!(!Error::NullName.to_string().is_empty());
+
+        let msg = Error::Lookup {
+            op: "getnameinfo",
+            code: libc::EAI_AGAIN,
+            errno: 0,
+        }
+        .to_string();
+        assert!(msg.contains("getnameinfo"), "{msg}");
+        assert!(msg.contains("EAI_AGAIN"), "{msg}");
+        let msg = Error::Lookup {
+            op: "getaddrinfo",
+            code: -99,
+            errno: 0,
+        }
+        .to_string();
+        assert!(msg.contains("-99"), "{msg}");
+    }
+
+    /// Only `EAI_AGAIN` is worth trying again. A lookup that failed for
+    /// good, and every other error, is not.
+    #[test]
+    fn only_eai_again_is_temporary() {
+        let lookup = |code| Error::Lookup {
+            op: "getnameinfo",
+            code,
+            errno: 0,
+        };
+        assert!(lookup(libc::EAI_AGAIN).is_temporary());
+        for code in [libc::EAI_FAIL, libc::EAI_MEMORY, libc::EAI_SYSTEM] {
+            assert!(!lookup(code).is_temporary(), "{code}");
+        }
+        let tryagain = Error::Call {
+            module: "SSS",
+            op: "getpwnam_r",
+            status: NssStatus::TryAgain.raw(),
+            errno: libc::EAGAIN,
+        };
+        assert!(!tryagain.is_temporary());
+    }
+
+    /// The errno of `EAI_SYSTEM` is reported and becomes the OS error, and
+    /// a lookup without one reports none.
+    #[test]
+    fn a_lookup_keeps_the_errno_of_eai_system() {
+        let system = Error::Lookup {
+            op: "getaddrinfo",
+            code: libc::EAI_SYSTEM,
+            errno: libc::EMFILE,
+        };
+        assert_eq!(system.errno(), Some(libc::EMFILE));
+        assert_eq!(io::Error::from(system).raw_os_error(), Some(libc::EMFILE));
+        let again = Error::Lookup {
+            op: "getaddrinfo",
+            code: libc::EAI_AGAIN,
+            errno: 0,
+        };
+        assert_eq!(again.errno(), None);
+        assert_eq!(io::Error::from(again).raw_os_error(), None);
     }
 }

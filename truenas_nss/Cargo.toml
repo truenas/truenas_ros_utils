@@ -3,7 +3,8 @@
 # `truenas_nss` — direct lookups against the system NSS service modules:
 # passwd and group entries from `libnss_files`, `libnss_sss`, and
 # `libnss_winbind`, per module or fanned out, bypassing `nsswitch.conf`.
-# Netgroup membership goes through glibc's `innetgr(3)` and `nsswitch.conf`.
+# Netgroup membership and the names of addresses go through glibc's
+# `innetgr(3)`, `getnameinfo(3)` and `getaddrinfo(3)` and `nsswitch.conf`.
 #
 # Nothing is linked at build time: the modules are loaded with `dlopen(3)` on
 # first use, and `dlopen` itself lives in `libc.so.6` on glibc 2.34 and later.
@@ -12,7 +13,7 @@
 [package]
 name = "truenas_nss"
 version = "0.1.0"
-description = "Direct passwd and group lookups against the system NSS service modules, and netgroup membership"
+description = "Direct passwd and group lookups against the system NSS service modules, netgroup membership and the names of addresses"
 categories = ["os::unix-apis", "api-bindings"]
 keywords = ["nss", "passwd", "group", "winbind", "truenas"]
 edition.workspace = true
@@ -64,4 +65,12 @@ path = "tests/system.rs"
 [[test]]
 name = "netgroup"
 path = "tests/netgroup.rs"
+harness = false
+
+# getnameinfo and confirmed_name against a hosts file of the suite's own,
+# through the same overlay as the netgroup suite, with files alone on the
+# hosts line, so no DNS is asked. Same gate as the netgroup suite.
+[[test]]
+name = "hosts"
+path = "tests/hosts.rs"
 harness = false
