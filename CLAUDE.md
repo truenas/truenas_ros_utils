@@ -412,6 +412,19 @@ the registry's bare-soname lookups. [`tests/fanout.rs`](truenas_nss/tests/fanout
 re-executes itself with `LD_LIBRARY_PATH` pointing at fixtures named as the
 three modules, so a child process drives the real registry end to end.
 
+`innetgr` is the one call that goes through glibc's frontend and
+`nsswitch.conf`, since the netgroup service functions of a module take a
+structure glibc does not install. glibc documents `innetgr` as unsafe across
+threads over the process's netgroup state, so every call holds one lock. Its
+`false` covers an unknown netgroup, a triple the netgroup does not hold and a
+lookup that failed, which `innetgr` does not tell apart.
+[`tests/netgroup.rs`](truenas_nss/tests/netgroup.rs) runs without the test
+harness. Before its first NSS call it enters a mount namespace of its own,
+after a user namespace when it is not root, and lays an overlay on `/etc`
+whose upper layer holds its own `netgroup` and `nsswitch.conf`, so the host's
+`/etc` is never written. It skips where a namespace cannot be made, and
+`TRUENAS_NSS_REQUIRE_NAMESPACE=1` makes that a failure.
+
 ## `truenas_pam`
 
 Links the system `libpam`. A PAM transaction is only meaningful against the
@@ -517,6 +530,7 @@ cargo fmt --all --check
 cargo clippy --workspace --all-targets -- -D warnings
 TRUENAS_MDB_REQUIRE_PYTHON=1 TRUENAS_PAM_REQUIRE_MODULES=1 \
     TRUENAS_NSS_REQUIRE_CC=1 TRUENAS_NSS_REQUIRE_SYSTEM=1 \
+    TRUENAS_NSS_REQUIRE_NAMESPACE=1 \
     TRUENAS_KTLS_REQUIRE_SYSTEM=1 \
     TRUENAS_KRB5_REQUIRE_KDC=1 TRUENAS_GSSAPI_REQUIRE_KDC=1 \
     TRUENAS_CHRONY_REQUIRE_CHRONYD=1 TRUENAS_CHRONY_REQUIRE_ROOT=1 \
@@ -531,6 +545,7 @@ CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER="valgrind --error-exitcode=99 \
     --trace-children-skip=*/cc,*/python3*,*/krb5kdc,*/kadmin.local,*/kdb5_util,*/kinit" \
     TRUENAS_MDB_REQUIRE_PYTHON=1 TRUENAS_PAM_REQUIRE_MODULES=1 \
     TRUENAS_NSS_REQUIRE_CC=1 TRUENAS_NSS_REQUIRE_SYSTEM=1 \
+    TRUENAS_NSS_REQUIRE_NAMESPACE=1 \
     TRUENAS_KTLS_REQUIRE_SYSTEM=1 \
     TRUENAS_KRB5_REQUIRE_KDC=1 TRUENAS_GSSAPI_REQUIRE_KDC=1 \
     cargo test --workspace --exclude truenas_chrony

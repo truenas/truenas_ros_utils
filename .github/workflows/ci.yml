@@ -67,6 +67,15 @@ jobs:
           target
         key: cargo-${{ runner.os }}-stable-${{ hashFiles('**/Cargo.lock', '**/Cargo.toml') }}
 
+    # The netgroup suite of truenas_nss makes a user namespace of its own,
+    # which AppArmor refuses to an unprivileged process on the runner unless
+    # this is lifted.
+    - name: Allow unprivileged user namespaces
+      run: |
+        if [ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+        fi
+
     - name: rustfmt
       run: cargo fmt --all --check
 
@@ -98,6 +107,7 @@ jobs:
         TRUENAS_PAM_REQUIRE_MODULES: "1"
         TRUENAS_NSS_REQUIRE_CC: "1"
         TRUENAS_NSS_REQUIRE_SYSTEM: "1"
+        TRUENAS_NSS_REQUIRE_NAMESPACE: "1"
         TRUENAS_KRB5_REQUIRE_KDC: "1"
         TRUENAS_GSSAPI_REQUIRE_KDC: "1"
 
@@ -131,6 +141,7 @@ jobs:
         TRUENAS_PAM_REQUIRE_MODULES: "1"
         TRUENAS_NSS_REQUIRE_CC: "1"
         TRUENAS_NSS_REQUIRE_SYSTEM: "1"
+        TRUENAS_NSS_REQUIRE_NAMESPACE: "1"
         TRUENAS_KRB5_REQUIRE_KDC: "1"
         TRUENAS_GSSAPI_REQUIRE_KDC: "1"
 
@@ -184,6 +195,7 @@ jobs:
         TRUENAS_PAM_REQUIRE_MODULES: "1"
         TRUENAS_NSS_REQUIRE_CC: "1"
         TRUENAS_NSS_REQUIRE_SYSTEM: "1"
+        TRUENAS_NSS_REQUIRE_NAMESPACE: "1"
         TRUENAS_KRB5_REQUIRE_KDC: "1"
         TRUENAS_GSSAPI_REQUIRE_KDC: "1"
 

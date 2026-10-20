@@ -64,6 +64,13 @@
 //! password field: the real hash lives in the shadow database, and the
 //! placeholder the passwd and group databases carry invites misuse.
 //!
+//! # Netgroups
+//!
+//! [`innetgr`] asks whether a netgroup holds a host, user and domain. It is
+//! the one call of this crate that goes through glibc's frontend and
+//! `nsswitch.conf`, since the netgroup service functions of a module take a
+//! structure glibc does not install. Calls are serialized.
+//!
 //! # Requirements
 //!
 //! Nothing at build time. At run time, glibc 2.34 or later and whichever
@@ -74,10 +81,12 @@
 mod error;
 mod ffi;
 mod grp;
+mod netgr;
 mod pwd;
 mod service;
 
 pub use error::{Error, NssStatus, Result};
 pub use grp::{Group, GroupIter, getgrgid, getgrnam, getgrouplist};
+pub use netgr::innetgr;
 pub use pwd::{Passwd, PasswdIter, getpwnam, getpwuid};
 pub use service::{EntScope, Service, Source};
