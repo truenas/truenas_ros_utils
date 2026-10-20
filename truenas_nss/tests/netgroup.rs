@@ -97,7 +97,10 @@ fn enter() -> Result<tempfile::TempDir, String> {
     // The files are laid in the upper layer before the mount, since a
     // file the host's root owns cannot be copied up for writing from a user
     // namespace.
-    let files = [("netgroup", NETGROUP), ("nsswitch.conf", "netgroup: files\n")];
+    let files = [
+        ("netgroup", NETGROUP),
+        ("nsswitch.conf", "netgroup: files\n"),
+    ];
     for (name, contents) in files {
         let path = upper.join(name);
         fs::write(&path, contents)

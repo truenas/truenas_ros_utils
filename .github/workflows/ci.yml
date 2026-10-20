@@ -184,6 +184,13 @@ jobs:
           target
         key: cargo-${{ runner.os }}-msrv-${{ hashFiles('**/Cargo.lock', '**/Cargo.toml') }}
 
+    # As in the check job, for the netgroup suite of truenas_nss.
+    - name: Allow unprivileged user namespaces
+      run: |
+        if [ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+        fi
+
     - name: build
       run: cargo build --workspace --all-targets --locked
 
