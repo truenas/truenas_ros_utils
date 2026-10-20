@@ -28,6 +28,7 @@
 
 use crate::error::{Result, check};
 use crate::ffi::*;
+use crate::transaction::{ReadTxn, WriteTxn};
 use std::collections::HashMap;
 use std::ffi::CString;
 use std::fs::DirBuilder;
@@ -41,12 +42,13 @@ bitflags::bitflags! {
     /// Environment flags for [`Env::open_with`], fixed for the environment's
     /// lifetime by whichever process opens it first.
     ///
-    /// Only durability and readahead are exposed. `MDB_WRITEMAP` and
-    /// `MDB_MAPASYNC` are omitted because `lmdb.h` forbids mixing processes
-    /// with and without them on one environment; `MDB_NOSUBDIR` because the
-    /// directory layout is fixed; `MDB_NOLOCK` because it hands locking to the
-    /// caller; and `MDB_NOTLS` because LMDB's per-thread reader slots are what
-    /// make [`crate::txn`]'s one-transaction-per-thread rule enforceable.
+    /// Durability, readahead and read-only access are exposed. `MDB_WRITEMAP`
+    /// and `MDB_MAPASYNC` are omitted because `lmdb.h` forbids mixing
+    /// processes with and without them on one environment; `MDB_NOSUBDIR`
+    /// because the directory layout is fixed; `MDB_NOLOCK` because it hands
+    /// locking to the caller; and `MDB_NOTLS` because LMDB's per-thread
+    /// reader slots are what make [`crate::txn`]'s one-transaction-per-thread
+    /// rule enforceable.
     #[derive(Copy, Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
     #[repr(transparent)]
     pub struct EnvFlags: u32 {
@@ -58,7 +60,32 @@ bitflags::bitflags! {
         const NOMETASYNC = MDB_NOMETASYNC;
         /// No readahead. Useful when the database exceeds RAM.
         const NORDAHEAD = MDB_NORDAHEAD;
+        /// Open read-only. The data file must already exist. Every write
+        /// transaction, [`Db::create`](crate::Db::create) of an absent
+        /// database and [`Env::sync`] fail with `EACCES`; reads are
+        /// unaffected. The lock file is still created and written, so the
+        /// directory must be writable.
+        const RDONLY = MDB_RDONLY;
     }
+}
+
+/// What [`Env::info`] reports.
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
+#[non_exhaustive]
+pub struct EnvInfo {
+    /// The size of the memory map, in bytes.
+    pub map_size: usize,
+    /// The number of the last page in use, so the data file holds
+    /// `last_page + 1` pages of [`Stat::page_size`](crate::Stat::page_size).
+    pub last_page: usize,
+    /// The id of the last committed transaction.
+    pub last_txn_id: usize,
+    /// Reader lock-table slots in the environment.
+    pub max_readers: u32,
+    /// Reader slots in use. A slot stays with the thread that took it until
+    /// that thread exits, so this is the number of threads that have read,
+    /// not of reads in flight.
+    pub readers: u32,
 }
 
 /// Options for [`Env::open_with`].
@@ -301,6 +328,107 @@ impl Env {
     pub fn sync(&self, force: bool) -> Result<()> {
         // SAFETY: a live `Env` keeps the environment open.
         check(unsafe { mdb_env_sync(self.env, force as std::os::raw::c_int) })
+    }
+
+    /// Run `f` in one read transaction: a snapshot of every database in the
+    /// environment, consistent across the reads `f` makes, and the only
+    /// transaction this thread holds on the environment while `f` runs.
+    ///
+    /// The slices a [`ReadTxn`] hands out borrow the mmap and live as long as
+    /// the transaction, so `f` can read one database while a [`Cursor`]
+    /// walks another. The transaction ends when `f` returns, whatever it
+    /// returns.
+    ///
+    /// ```
+    /// # use truenas_mdb::{Db, Env};
+    /// # let dir = tempfile::tempdir().unwrap();
+    /// # let env = Env::open(dir.path().join("env"))?;
+    /// # let names = Db::create(&env, "names")?;
+    /// # let records = Db::create(&env, "records")?;
+    /// # names.put("report.pdf", "7")?;
+    /// # records.put("7", "a record")?;
+    /// let found = env.read(|txn| {
+    ///     let mut cursor = txn.cursor(&names)?;
+    ///     let mut found = Vec::new();
+    ///     while let Some((name, id)) = cursor.next()? {
+    ///         if let Some(record) = txn.get(&records, id)? {
+    ///             found.push((name.to_vec(), record.len()));
+    ///         }
+    ///     }
+    ///     Ok(found)
+    /// })?;
+    /// assert_eq!(found, vec![(b"report.pdf".to_vec(), 8)]);
+    /// # Ok::<(), truenas_mdb::Error>(())
+    /// ```
+    ///
+    /// [`Cursor`]: crate::Cursor
+    pub fn read<R>(
+        &self,
+        f: impl FnOnce(&ReadTxn<'_>) -> Result<R>,
+    ) -> Result<R> {
+        let txn = ReadTxn::begin(self)?;
+        f(&txn)
+    }
+
+    /// Run `f` in one write transaction, committed when `f` returns `Ok` and
+    /// discarded when it returns `Err` or unwinds.
+    ///
+    /// Every put and delete `f` makes, on any number of databases, becomes
+    /// visible to readers at once or not at all. The writer lock is held for
+    /// the whole of `f`, so other writers wait; readers never do.
+    ///
+    /// ```
+    /// # use truenas_mdb::{Db, Env};
+    /// # let dir = tempfile::tempdir().unwrap();
+    /// # let env = Env::open(dir.path().join("env"))?;
+    /// # let names = Db::create(&env, "names")?;
+    /// # let records = Db::create(&env, "records")?;
+    /// env.write(|txn| {
+    ///     txn.put(&records, "7", "a record")?;
+    ///     txn.put(&names, "report.pdf", "7")
+    /// })?;
+    /// assert_eq!(names.get("report.pdf")?.as_deref(), Some(&b"7"[..]));
+    /// # Ok::<(), truenas_mdb::Error>(())
+    /// ```
+    pub fn write<R>(
+        &self,
+        f: impl FnOnce(&mut WriteTxn<'_>) -> Result<R>,
+    ) -> Result<R> {
+        let mut txn = WriteTxn::begin(self)?;
+        let value = f(&mut txn)?;
+        txn.commit()?;
+        Ok(value)
+    }
+
+    /// The environment's map size, last page, last transaction id and reader
+    /// slots.
+    pub fn info(&self) -> Result<EnvInfo> {
+        let mut info = MDB_envinfo::default();
+        // SAFETY: a live `Env` keeps the environment open; `info` is an
+        // out-param LMDB fills.
+        check(unsafe { mdb_env_info(self.env, &mut info) })?;
+        Ok(EnvInfo {
+            map_size: info.me_mapsize,
+            last_page: info.me_last_pgno,
+            last_txn_id: info.me_last_txnid,
+            max_readers: info.me_maxreaders,
+            readers: info.me_numreaders,
+        })
+    }
+
+    /// Release the reader slots of processes that no longer exist, and
+    /// report how many were released.
+    ///
+    /// A reader slot held by a dead process pins every page its transaction
+    /// could see, so the data file grows until the slot is cleared. A
+    /// writer runs this before a batch; LMDB itself runs it only when the
+    /// reader table is full.
+    pub fn reader_check(&self) -> Result<u32> {
+        let mut dead: std::os::raw::c_int = 0;
+        // SAFETY: a live `Env` keeps the environment open; `dead` is an
+        // out-param LMDB fills.
+        check(unsafe { mdb_reader_check(self.env, &mut dead) })?;
+        Ok(dead.max(0) as u32)
     }
 
     /// The environment's directory, canonicalized.

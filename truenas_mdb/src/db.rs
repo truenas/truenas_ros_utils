@@ -16,6 +16,7 @@ use crate::env::Env;
 use crate::error::{Error, MdbCode, Result, check};
 use crate::ffi::*;
 use crate::iter::Iter;
+use crate::transaction::Stat;
 use crate::txn::{CursorGuard, TxnGuard, empty_val, val_of};
 use std::ffi::CString;
 use std::ops::ControlFlow;
@@ -24,10 +25,12 @@ use std::ptr;
 /// One database in an [`Env`]: a named one, or the environment's main
 /// database.
 ///
-/// Every operation runs in its own transaction, begun and finished inside the
-/// call. Nothing has to be committed by hand; the cost is that operations
-/// cannot be grouped, so two [`put`](Db::put)s are two transactions and a
-/// reader can observe the first without the second.
+/// Every operation here runs in its own transaction, begun and finished
+/// inside the call, so nothing has to be committed by hand; two
+/// [`put`](Db::put)s are two transactions and a reader can observe the first
+/// without the second. Work that must be one transaction, across operations
+/// or databases, goes through [`Env::read`] and [`Env::write`], whose
+/// transactions take a `Db` as the database to act on.
 ///
 /// `Db` is `Send + Sync` and cheap to clone (it shares the environment). LMDB
 /// serializes writers itself: a write blocks while another thread's write to
@@ -81,6 +84,10 @@ impl Db {
     /// The database's name, or `None` for the main database.
     pub fn name(&self) -> Option<&str> {
         self.name.as_deref()
+    }
+
+    pub(crate) fn dbi(&self) -> MDB_dbi {
+        self.dbi
     }
 
     /// The value stored under `key`, or `None` if absent.
@@ -214,6 +221,13 @@ impl Db {
     /// exists.
     pub fn is_empty(&self) -> Result<bool> {
         Ok(self.len()? == 0)
+    }
+
+    /// The database's B-tree statistics: page size, depth, pages by kind,
+    /// and entries, counted as [`len`](Db::len) counts.
+    pub fn stat(&self) -> Result<Stat> {
+        let txn = TxnGuard::begin(&self.env, true)?;
+        Stat::read(&txn, self.dbi)
     }
 
     /// Visit every entry in key order, calling `f(key, value)`.
