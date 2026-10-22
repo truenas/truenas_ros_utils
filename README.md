@@ -2,7 +2,8 @@
 
 Crates that accompany [`truenas_ros`](https://github.com/truenas/truenas_ros)
 but cannot live in it, because that crate depends only on `libc` and
-`bitflags` and links no C library.
+`bitflags` and links no C library, or because code that does not take
+`truenas_ros` must be able to use them.
 
 A virtual workspace with no umbrella crate. The members are unrelated to each
 other; depend on the one you need.
@@ -17,6 +18,7 @@ other; depend on the one you need.
 | [`truenas_mdb`](truenas_mdb/) | Bindings to the system LMDB (`liblmdb`): a pooled environment and a byte-oriented key/value store |
 | [`truenas_nss`](truenas_nss/) | Direct passwd, group, and group-membership lookups against the system NSS service modules (`libnss_files`, `libnss_sss`, `libnss_winbind`), bypassing `nsswitch.conf`, and netgroup membership and the names of addresses through glibc's `innetgr` and `getnameinfo` |
 | [`truenas_pam`](truenas_pam/) | A PAM client over the system `libpam`: transactions, and a login sequence driven one round at a time |
+| [`truenas_siphash`](truenas_siphash/) | SipHash-2-4, a keyed hash for short inputs, under a key that never prints itself |
 | [`truenas_xdr`](truenas_xdr/) | A serde codec for XDR (RFC 4506) |
 | [`truenas_xdr_derive`](truenas_xdr_derive/) | `XdrEnum` and `XdrUnion` derive macros, used through `truenas_xdr`'s `derive` feature |
 
@@ -34,6 +36,7 @@ other; depend on the one you need.
   at run time (glibc 2.34 or newer; `libnss_files.so.2` ships in `libc6`)
 - Nothing extra to build `truenas_jsonrpc` or `truenas_xdr`; neither links a
   C library and neither needs anything at run time
+- Nothing extra to build or run `truenas_siphash`, which has no dependencies
 - Nothing extra to build `truenas_chrony`; at run time it needs chronyd
   4.6.1 or later and root or the chrony user, and, where AppArmor mediates
   sends to pathname sockets, chronyd allowed to write

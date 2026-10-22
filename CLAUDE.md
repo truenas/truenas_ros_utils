@@ -480,6 +480,28 @@ timeout bounds the round trip and teardown still waits for the module.
 The crate knows PAM and nothing above it. Which service to run, what a prompt
 means, and what to make of a refusal are policy and belong to the consumer.
 
+## `truenas_siphash`
+
+SipHash-2-4 as section 2 of the SipHash paper by Aumasson and Bernstein, in
+its version of 2012-07-27, defines it
+(<http://cr.yp.to/siphash/siphash-20120727.pdf>). The unit tests in
+[`src/lib.rs`](truenas_siphash/src/lib.rs) reproduce every state of its
+Appendix A, [`tests/vectors.rs`](truenas_siphash/tests/vectors.rs) holds the
+64 vectors of the authors' reference implementation byte for byte, and
+[`tests/against_std.rs`](truenas_siphash/tests/against_std.rs) checks
+lengths up to 300 bytes against std's `SipHasher`. Any change to the
+function is checked against the paper first.
+
+`Key` keeps the state section 2 starts from, so a key is read once. It never
+prints its bytes, and it is not zeroed when dropped. A result used as a MAC
+is compared as one `u64`, never as a slice of bytes, since a comparison of
+slices may stop at the first byte that differs. Written out as bytes, a
+result goes least significant byte first, as the reference vectors are.
+
+The crate knows SipHash-2-4 and nothing above it. Other round counts, the
+output of 128 bits and input given in pieces wait for a caller that needs
+them.
+
 ## `truenas_xdr`
 
 Conforms to RFC 4506 (STD 67).
