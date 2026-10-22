@@ -1,0 +1,40 @@
+# SPDX-FileCopyrightText: 2026 iXsystems, Inc, DBA TrueNAS
+# SPDX-License-Identifier: MIT
+# `truenas_siphash` is SipHash-2-4, a keyed hash for short inputs.
+#
+# It has no dependencies and no unsafe code, so code that must link no C
+# library and do no I/O can take it.
+[package]
+name = "truenas_siphash"
+version = "0.1.0"
+description = "SipHash-2-4, a keyed hash for short inputs"
+categories = ["cryptography", "algorithms"]
+keywords = ["siphash", "mac", "prf"]
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+# The worked example of the paper's Appendix A, through the public API.
+[[test]]
+name = "paper"
+path = "tests/paper.rs"
+
+# The 64 vectors of the reference implementation, byte for byte.
+[[test]]
+name = "vectors"
+path = "tests/vectors.rs"
+
+# What a key shows of itself and how two keys compare.
+[[test]]
+name = "key"
+path = "tests/key.rs"
+
+# Agreement with std's SipHasher at lengths the vectors do not reach.
+[[test]]
+name = "against_std"
+path = "tests/against_std.rs"

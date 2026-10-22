@@ -339,6 +339,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "truenas_siphash"
+version = "0.1.0"
+
+[[package]]
 name = "truenas_xdr"
 version = "0.1.0"
 dependencies = [
