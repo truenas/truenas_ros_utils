@@ -12,15 +12,23 @@
 //! key table, step the accept loop, read the authenticated name, and map
 //! it to a local account.
 //!
+//! Once each exchange completes, the established context and the
+//! initiator sign, check, seal and open messages for each other, so the
+//! per message calls are held to the library's own initiator side.
+//!
 //! Skips when the MIT KDC tools are not installed; TRUENAS_GSSAPI_REQUIRE_KDC=1
 //! (as CI sets on hosts that carry them) makes that a failure instead.
 #![allow(unsafe_code)]
 
 use std::io::Write;
+use std::os::raw::c_int;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
-use truenas_gssapi::{Acceptor, AcceptorCred, Name, Oid, Step};
+use truenas_gssapi::{
+    Acceptor, AcceptorCred, Context, ContextFlags, Name, Oid, OwningAcceptor,
+    RoutineError, Step,
+};
 
 const CHILD: &str = "TRUENAS_GSSAPI_KDC_CHILD";
 const REQUIRE: &str = "TRUENAS_GSSAPI_REQUIRE_KDC";
@@ -81,8 +89,45 @@ fn child() {
     // mutual auth. MIT settles optimistic SPNEGO in one acceptor leg, so
     // these do not exercise the acceptor's continue path — the dedicated
     // multi-leg case below does.
-    run_exchange(&kt, Initiator::new(&Oid::krb5()));
-    run_exchange(&kt, Initiator::new(&Oid::spnego()));
+    let mut krb5 = run_exchange(&kt, Initiator::new(&Oid::krb5()));
+    messages_both_ways(&mut krb5);
+    krb5.initiator.release();
+    let mut spnego = run_exchange(&kt, Initiator::new(&Oid::spnego()));
+    messages_both_ways(&mut spnego);
+    spnego.initiator.release();
+
+    // An acceptor that owns its credential completes on another thread,
+    // and the context it gives comes back and serves the same initiator.
+    // This catches an owning acceptor that cannot move, or one that loses
+    // the identity or the context on the way back.
+    let mut initiator = Initiator::new(&Oid::krb5());
+    let first = initiator.start();
+    let keytab = format!("FILE:{kt}");
+    let (context, owed) = std::thread::spawn(move || {
+        let cred = AcceptorCred::from_keytab(&keytab, None).expect("acquire");
+        let mut acceptor = OwningAcceptor::new(cred);
+        assert!(!acceptor.is_established());
+        let Step::Complete { token } = acceptor.step(&first).expect("accept")
+        else {
+            panic!("Kerberos asked for a second leg");
+        };
+        assert!(acceptor.is_established());
+        assert!(acceptor.source_name().is_some());
+        (acceptor.into_context().expect("established"), token)
+    })
+    .join()
+    .expect("the accepting thread");
+    assert!(initiator.step(&owed).is_empty());
+    assert!(initiator.is_complete());
+    let display = context.source_name().unwrap().display().unwrap();
+    assert!(display.contains("user@EXAMPLE.TEST"), "{display}");
+    let mut owning = Exchange {
+        context,
+        initiator,
+        legs: 0,
+    };
+    messages_both_ways(&mut owning);
+    owning.initiator.release();
 
     // A SPNEGO negotiation advertising two mechanisms with krb5 not first,
     // driven through the same loop. Its purpose is the acceptor's
@@ -96,7 +141,10 @@ fn child() {
     // IAKERB is 1.3.6.1.5.2.5; krb5 is 1.2.840.113554.1.2.2.
     const IAKERB: &[u8] = &[0x2b, 0x06, 0x01, 0x05, 0x02, 0x05];
     const KRB5: &[u8] = &[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x12, 0x01, 0x02, 0x02];
-    let _legs = run_exchange(&kt, Initiator::with_neg_mechs(&[IAKERB, KRB5]));
+    let mut multi =
+        run_exchange(&kt, Initiator::with_neg_mechs(&[IAKERB, KRB5]));
+    assert!(multi.legs <= 1, "{} acceptor legs", multi.legs);
+    multi.initiator.release();
 
     // A key table without the acceptor's key cannot complete: acquiring
     // for a principal it lacks fails up front.
@@ -109,13 +157,24 @@ fn child() {
     );
 }
 
+/// A completed exchange, with both sides still live.
+struct Exchange {
+    context: Context,
+    initiator: Initiator,
+    legs: usize,
+}
+
 /// Drive an initiator/acceptor handshake to completion on both sides.
-/// Returns the number of acceptor continue-legs seen. Verifies the acceptor
-/// authenticates and maps the initiator, AND that the initiator reaches
-/// mutual-auth completion by consuming the acceptor's final token.
-fn run_exchange(keytab: &str, mut initiator: Initiator) -> usize {
+/// Returns the established context, the initiator and the number of
+/// acceptor continue-legs seen. Verifies the acceptor authenticates and
+/// maps the initiator, AND that the initiator reaches mutual-auth
+/// completion by consuming the acceptor's final token.
+fn run_exchange(keytab: &str, mut initiator: Initiator) -> Exchange {
     let cred = AcceptorCred::from_keytab(&format!("FILE:{keytab}"), None)
         .expect("acquire acceptor cred");
+    // A context cannot be taken before the exchange completes.
+    let early = Acceptor::new(&cred).into_context().unwrap_err();
+    assert_eq!(early.routine(), Some(RoutineError::NO_CONTEXT));
     let mut acceptor = Acceptor::new(&cred);
 
     let mut token = initiator.start();
@@ -169,8 +228,162 @@ fn run_exchange(keytab: &str, mut initiator: Initiator) -> usize {
     let local = who.localname(Some(&Oid::krb5())).expect("localname");
     assert_eq!(local, "user");
 
-    initiator.release();
-    acceptor_continues
+    // The context keeps the identity, the mechanism and the flags once
+    // the acceptor and its credential are gone.
+    let context = acceptor.into_context().expect("established");
+    drop(cred);
+    let display = context.source_name().unwrap().display().unwrap();
+    assert!(display.contains("user@EXAMPLE.TEST"), "{display}");
+    assert_eq!(context.mechanism(), Some(&Oid::krb5()));
+    assert!(
+        context.flags().contains(
+            ContextFlags::MUTUAL | ContextFlags::INTEG | ContextFlags::CONF
+        ),
+        "{:?}",
+        context.flags()
+    );
+    Exchange {
+        context,
+        initiator,
+        legs: acceptor_continues,
+    }
+}
+
+/// Sign, check, seal and open messages in both directions over a completed
+/// exchange. Catches a checksum or a token the other side does not take,
+/// a plaintext left in a sealed token, a damaged checksum let through, or
+/// a lifetime the ticket does not bound.
+fn messages_both_ways(exchange: &mut Exchange) {
+    let context = &mut exchange.context;
+    let initiator = &mut exchange.initiator;
+
+    // The ticket's life bounds the context's. The realm issues at most a
+    // day, the KDC's default, and the library allows its default clock
+    // skew of five minutes past the ticket's end.
+    let left = context.lifetime().unwrap().expect("a ticket runs out");
+    assert!(
+        left > Duration::ZERO
+            && left <= Duration::from_secs(24 * 3600 + 5 * 60),
+        "{left:?}"
+    );
+
+    let message = b"an RPC header through its credential";
+    let mic = context.get_mic(message).unwrap();
+    assert!(!mic.is_empty());
+    assert_eq!(initiator.verify_mic(message, &mic), 0, "our MIC refused");
+    let theirs = initiator.get_mic(message);
+    assert_eq!(context.verify_mic(message, &theirs).unwrap(), 0);
+    let err = context.verify_mic(b"other bytes", &theirs).unwrap_err();
+    assert_eq!(err.routine(), Some(RoutineError::BAD_SIG), "{err}");
+    let mut damaged = theirs.clone();
+    *damaged.last_mut().unwrap() ^= 1;
+    let err = context.verify_mic(message, &damaged).unwrap_err();
+    assert_eq!(err.routine(), Some(RoutineError::BAD_SIG), "{err}");
+
+    // Sealed with confidentiality, the message is not in the token, and
+    // each side opens the other's token to it.
+    let (token, sealed) = context.wrap(true, message).unwrap();
+    assert!(sealed);
+    assert!(!token.windows(message.len()).any(|w| w == message));
+    let (opened, confidential) = initiator.unwrap(&token);
+    assert_eq!(opened, message);
+    assert!(confidential);
+    let theirs = initiator.wrap(true, message);
+    let opened = context.unwrap(&theirs).unwrap();
+    assert_eq!(opened.message, message);
+    assert!(opened.confidential);
+    assert_eq!(opened.qop, 0);
+
+    // Sealed without confidentiality, the token carries the message in
+    // the clear and says so when opened.
+    let (token, sealed) = context.wrap(false, message).unwrap();
+    assert!(!sealed);
+    assert!(token.windows(message.len()).any(|w| w == message));
+    let (opened, confidential) = initiator.unwrap(&token);
+    assert_eq!(opened, message);
+    assert!(!confidential);
+    let opened = context.unwrap(&initiator.wrap(false, message)).unwrap();
+    assert_eq!(opened.message, message);
+    assert!(!opened.confidential);
+
+    // A token that is not one, or one changed in transit, is refused.
+    let err = context.unwrap(b"this is not a wrap token").unwrap_err();
+    assert!(
+        matches!(
+            err.routine(),
+            Some(RoutineError::DEFECTIVE_TOKEN | RoutineError::BAD_SIG)
+        ),
+        "{err}"
+    );
+    let mut damaged = initiator.wrap(true, message);
+    *damaged.last_mut().unwrap() ^= 1;
+    let err = context.unwrap(&damaged).unwrap_err();
+    assert_eq!(err.routine(), Some(RoutineError::BAD_SIG), "{err}");
+
+    // A checksum appended in place is as long as the one given back, and
+    // the initiator takes it.
+    let so_far = b"a reply so far";
+    let mut reply = so_far.to_vec();
+    context.get_mic_into(message, &mut reply).unwrap();
+    let appended = &reply[so_far.len()..];
+    assert_eq!(appended.len(), context.get_mic(message).unwrap().len());
+    assert_eq!(initiator.verify_mic(message, appended), 0, "MIC refused");
+
+    // A checksum of bytes already in the buffer is appended behind them,
+    // and the initiator takes it over those bytes.
+    let mut reply = so_far.to_vec();
+    reply.extend_from_slice(message);
+    let signed = so_far.len()..reply.len();
+    context.get_mic_within(&mut reply, signed.clone()).unwrap();
+    let (body, appended) = reply.split_at(signed.end);
+    assert_eq!(
+        initiator.verify_mic(&body[signed], appended),
+        0,
+        "MIC refused"
+    );
+
+    // A message sealed where it stands, with and without confidentiality,
+    // is as long as the token given back for it, and the initiator opens
+    // it, and a token the initiator sealed opens where it stands.
+    for confidential in [true, false] {
+        let lengths =
+            context.wrap_lengths(confidential, message.len()).unwrap();
+        let whole = context.wrap(confidential, message).unwrap().0.len();
+        assert_eq!(lengths.token_len(message.len()), whole, "{lengths:?}");
+        let mut token = vec![0; whole];
+        token[lengths.header..lengths.header + message.len()]
+            .copy_from_slice(message);
+        let sealed = context
+            .wrap_in_place(confidential, lengths, &mut token)
+            .unwrap();
+        assert_eq!(sealed, confidential);
+        assert_eq!(
+            token.windows(message.len()).any(|w| w == message),
+            !confidential
+        );
+        let (opened, sealed) = initiator.unwrap(&token);
+        assert_eq!(opened, message);
+        assert_eq!(sealed, confidential);
+
+        let mut theirs = initiator.wrap(confidential, message);
+        let opened = context.unwrap_in_place(&mut theirs).unwrap();
+        assert_eq!(&theirs[opened.message.clone()], message);
+        assert_eq!(opened.confidential, confidential);
+        assert_eq!(opened.qop, 0);
+    }
+
+    // A token shorter than its lengths is refused before the library sees
+    // it, and a token damaged in transit is refused in place as well.
+    let lengths = context.wrap_lengths(true, 4).unwrap();
+    let mut short = vec![0; lengths.token_len(0) - 1];
+    let err = context
+        .wrap_in_place(true, lengths, &mut short)
+        .unwrap_err();
+    assert_eq!(err.routine(), None, "{err}");
+    let mut damaged = initiator.wrap(true, message);
+    *damaged.last_mut().unwrap() ^= 1;
+    let err = context.unwrap_in_place(&mut damaged).unwrap_err();
+    assert_eq!(err.routine(), Some(RoutineError::BAD_SIG), "{err}");
 }
 
 // --- a minimal initiator, local to this test --------------------------------
@@ -273,7 +486,65 @@ mod gss {
             cred: *mut cred,
             mech_set: *mut oid_set,
         ) -> OM_uint32;
+        pub fn gss_get_mic(
+            minor: *mut OM_uint32,
+            context: *mut ctx,
+            qop_req: OM_uint32,
+            message: *mut buffer,
+            token: *mut buffer,
+        ) -> OM_uint32;
+        pub fn gss_verify_mic(
+            minor: *mut OM_uint32,
+            context: *mut ctx,
+            message: *mut buffer,
+            token: *mut buffer,
+            qop_state: *mut OM_uint32,
+        ) -> OM_uint32;
+        pub fn gss_wrap(
+            minor: *mut OM_uint32,
+            context: *mut ctx,
+            conf_req: c_int,
+            qop_req: OM_uint32,
+            input: *mut buffer,
+            conf_state: *mut c_int,
+            output: *mut buffer,
+        ) -> OM_uint32;
+        pub fn gss_unwrap(
+            minor: *mut OM_uint32,
+            context: *mut ctx,
+            input: *mut buffer,
+            output: *mut buffer,
+            conf_state: *mut c_int,
+            qop_state: *mut OM_uint32,
+        ) -> OM_uint32;
     }
+}
+
+/// A descriptor borrowing `bytes` for one call.
+fn borrowed(bytes: &[u8]) -> gss::buffer {
+    gss::buffer {
+        length: bytes.len(),
+        value: bytes.as_ptr().cast_mut().cast(),
+    }
+}
+
+/// Copy a buffer the library filled and release it.
+fn take(mut out: gss::buffer) -> Vec<u8> {
+    let bytes = if out.value.is_null() {
+        Vec::new()
+    } else {
+        // SAFETY: filled by the library call with `length` bytes.
+        unsafe {
+            std::slice::from_raw_parts(out.value.cast::<u8>(), out.length)
+        }
+        .to_vec()
+    };
+    // SAFETY: releasing the output the library allocated, once.
+    unsafe {
+        let mut minor = 0;
+        gss::gss_release_buffer(&mut minor, &mut out);
+    }
+    bytes
 }
 
 struct Initiator {
@@ -432,6 +703,96 @@ impl Initiator {
             gss::gss_release_buffer(&mut m, &mut out);
         }
         token
+    }
+
+    /// The initiator's checksum of `message`.
+    fn get_mic(&self, message: &[u8]) -> Vec<u8> {
+        let mut input = borrowed(message);
+        let mut out = gss::buffer {
+            length: 0,
+            value: std::ptr::null_mut(),
+        };
+        let mut minor = 0;
+        // SAFETY: established context, an input borrowing `message`, and
+        // an output released by `take`.
+        let major = unsafe {
+            gss::gss_get_mic(&mut minor, self.context, 0, &mut input, &mut out)
+        };
+        assert_eq!(major, 0, "initiator get_mic failed: {major:#x}/{minor}");
+        take(out)
+    }
+
+    /// The major status of checking `mic` against `message`.
+    fn verify_mic(&self, message: &[u8], mic: &[u8]) -> u32 {
+        let mut input = borrowed(message);
+        let mut token = borrowed(mic);
+        let mut qop = 0;
+        // SAFETY: established context and two inputs borrowed for the
+        // call.
+        unsafe {
+            let mut minor = 0;
+            gss::gss_verify_mic(
+                &mut minor,
+                self.context,
+                &mut input,
+                &mut token,
+                &mut qop,
+            )
+        }
+    }
+
+    /// The initiator's token sealing `message`.
+    fn wrap(&self, confidential: bool, message: &[u8]) -> Vec<u8> {
+        let mut input = borrowed(message);
+        let mut out = gss::buffer {
+            length: 0,
+            value: std::ptr::null_mut(),
+        };
+        let mut sealed = 0;
+        let mut minor = 0;
+        // SAFETY: established context, an input borrowing `message`, an
+        // out-parameter, and an output released by `take`.
+        let major = unsafe {
+            gss::gss_wrap(
+                &mut minor,
+                self.context,
+                c_int::from(confidential),
+                0,
+                &mut input,
+                &mut sealed,
+                &mut out,
+            )
+        };
+        assert_eq!(major, 0, "initiator wrap failed: {major:#x}/{minor}");
+        assert_eq!(sealed != 0, confidential);
+        take(out)
+    }
+
+    /// The message in a token the acceptor sealed, and whether it was
+    /// encrypted.
+    fn unwrap(&self, token: &[u8]) -> (Vec<u8>, bool) {
+        let mut input = borrowed(token);
+        let mut out = gss::buffer {
+            length: 0,
+            value: std::ptr::null_mut(),
+        };
+        let mut sealed = 0;
+        let mut qop = 0;
+        let mut minor = 0;
+        // SAFETY: established context, an input borrowing `token`, two
+        // out-parameters, and an output released by `take`.
+        let major = unsafe {
+            gss::gss_unwrap(
+                &mut minor,
+                self.context,
+                &mut input,
+                &mut out,
+                &mut sealed,
+                &mut qop,
+            )
+        };
+        assert_eq!(major, 0, "initiator unwrap failed: {major:#x}/{minor}");
+        (take(out), sealed != 0)
     }
 
     fn release(&mut self) {

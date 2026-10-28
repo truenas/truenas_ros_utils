@@ -1,11 +1,13 @@
 // SPDX-FileCopyrightText: 2026 iXsystems, Inc, DBA TrueNAS
 // SPDX-License-Identifier: MIT
-//! [`Acceptor`]: the accept-side security context and its step loop.
+//! [`Acceptor`] and [`OwningAcceptor`], the accept-side security context
+//! and its step loop, over a credential borrowed or owned.
 #![allow(unsafe_code)]
 
 use crate::buf::{OwnedBuffer, borrowed};
+use crate::context::Context;
 use crate::cred::AcceptorCred;
-use crate::error::Result;
+use crate::error::{Error, Result, RoutineError};
 use crate::ffi;
 use crate::name::Name;
 use crate::oid::Oid;
@@ -58,14 +60,9 @@ pub enum Step {
     },
 }
 
-/// An accept-side security context, stepped one token at a time.
-///
-/// Kerberos completes in a single step; SPNEGO may take an extra leg to
-/// settle the mechanism. Either way the loop is the same: feed the
-/// initiator's token, send back any token the step yields, and stop when
-/// the step completes.
-pub struct Acceptor<'cred> {
-    cred: &'cred AcceptorCred,
+/// The accept side of one exchange, apart from the credential it accepts
+/// with.
+struct State {
     context: ffi::gss_ctx_id_t,
     established: bool,
     source: Option<Name>,
@@ -73,12 +70,9 @@ pub struct Acceptor<'cred> {
     flags: ContextFlags,
 }
 
-impl<'cred> Acceptor<'cred> {
-    /// Start an acceptor against a credential (see
-    /// [`AcceptorCred::acquire`]).
-    pub fn new(cred: &'cred AcceptorCred) -> Acceptor<'cred> {
-        Acceptor {
-            cred,
+impl State {
+    fn new() -> State {
+        State {
             context: std::ptr::null_mut(),
             established: false,
             source: None,
@@ -87,15 +81,8 @@ impl<'cred> Acceptor<'cred> {
         }
     }
 
-    /// Feed one initiator token.
-    ///
-    /// On failure this returns `Err` and drops any error token the mechanism
-    /// produced: a `Negotiate` endpoint answers a rejected exchange with an
-    /// HTTP status, not a further token, so the token is not relayed.
-    ///
-    /// Calling again after [`Step::Complete`] is a usage error the library
-    /// reports, not a panic here.
-    pub fn step(&mut self, token: &[u8]) -> Result<Step> {
+    /// Feed one initiator token, accepting with `cred`.
+    fn step(&mut self, cred: ffi::gss_cred_id_t, token: &[u8]) -> Result<Step> {
         let mut input = borrowed(token);
         let mut out = OwnedBuffer::empty();
         let mut src: ffi::gss_name_t = std::ptr::null_mut();
@@ -112,7 +99,7 @@ impl<'cred> Acceptor<'cred> {
             ffi::gss_accept_sec_context(
                 &mut minor,
                 &mut self.context,
-                self.cred.raw(),
+                cred,
                 &mut input,
                 std::ptr::null_mut(),
                 &mut src,
@@ -153,32 +140,32 @@ impl<'cred> Acceptor<'cred> {
         }
     }
 
-    /// Whether the context is established.
-    pub fn is_established(&self) -> bool {
-        self.established
-    }
-
-    /// The authenticated initiator, once established — `None` mid-handshake,
-    /// so a caller cannot read an identity the exchange has not yet proven.
-    /// This is the name to map to a local account with
-    /// [`Name::localname`](crate::Name::localname).
-    pub fn source_name(&self) -> Option<&Name> {
+    fn source_name(&self) -> Option<&Name> {
         self.established.then_some(self.source.as_ref()).flatten()
     }
 
-    /// The mechanism that settled the context (Kerberos, once SPNEGO has
-    /// negotiated it).
-    pub fn mechanism(&self) -> Option<&Oid> {
-        self.mech.as_ref()
-    }
-
-    /// The flags the established context reports.
-    pub fn flags(&self) -> ContextFlags {
-        self.flags
+    /// The established context on its own, leaving nothing here to delete.
+    fn take_context(&mut self) -> Result<Context> {
+        if !self.established {
+            return Err(Error::synthetic(
+                (RoutineError::NO_CONTEXT as u32)
+                    << ffi::GSS_C_ROUTINE_ERROR_OFFSET,
+                "the context is not established".to_string(),
+            ));
+        }
+        // The handle moves to the context, so the drop of this state finds
+        // nothing to delete.
+        let raw = std::mem::replace(&mut self.context, std::ptr::null_mut());
+        Ok(Context::new(
+            raw,
+            self.source.take(),
+            self.mech.take(),
+            self.flags,
+        ))
     }
 }
 
-impl Drop for Acceptor<'_> {
+impl Drop for State {
     fn drop(&mut self) {
         if self.context.is_null() {
             return;
@@ -196,11 +183,155 @@ impl Drop for Acceptor<'_> {
     }
 }
 
+/// An accept-side security context, stepped one token at a time.
+///
+/// Kerberos completes in a single step, and SPNEGO may take an extra leg
+/// to settle the mechanism. Either way the loop is the same. Feed the
+/// initiator's token, send back any token the step yields, and stop when
+/// the step completes.
+///
+/// It borrows its credential, so it stays on the thread that holds it.
+/// [`OwningAcceptor`] is the same loop over a credential of its own.
+pub struct Acceptor<'cred> {
+    cred: &'cred AcceptorCred,
+    state: State,
+}
+
+impl<'cred> Acceptor<'cred> {
+    /// Start an acceptor against a credential (see
+    /// [`AcceptorCred::acquire`]).
+    pub fn new(cred: &'cred AcceptorCred) -> Acceptor<'cred> {
+        Acceptor {
+            cred,
+            state: State::new(),
+        }
+    }
+
+    /// Feed one initiator token.
+    ///
+    /// On failure this returns `Err` and drops any error token the mechanism
+    /// produced, since a `Negotiate` endpoint answers a rejected exchange
+    /// with an HTTP status, not a further token, so the token is not relayed.
+    ///
+    /// Calling again after [`Step::Complete`] is a usage error the library
+    /// reports, not a panic here.
+    pub fn step(&mut self, token: &[u8]) -> Result<Step> {
+        self.state.step(self.cred.raw(), token)
+    }
+
+    /// Whether the context is established.
+    pub fn is_established(&self) -> bool {
+        self.state.established
+    }
+
+    /// The authenticated initiator, once established, and `None` while the
+    /// handshake is under way, so a caller cannot read an identity the
+    /// exchange has not yet proven.
+    /// This is the name to map to a local account with
+    /// [`Name::localname`](crate::Name::localname).
+    pub fn source_name(&self) -> Option<&Name> {
+        self.state.source_name()
+    }
+
+    /// The mechanism that settled the context (Kerberos, once SPNEGO has
+    /// negotiated it).
+    pub fn mechanism(&self) -> Option<&Oid> {
+        self.state.mech.as_ref()
+    }
+
+    /// The flags the established context reports.
+    pub fn flags(&self) -> ContextFlags {
+        self.state.flags
+    }
+
+    /// The established context on its own, which no longer needs the
+    /// credential and signs, checks, seals and opens messages. An
+    /// acceptor whose exchange has not completed is refused with the
+    /// routine error `NO_CONTEXT`, and keeps its state.
+    pub fn into_context(mut self) -> Result<Context> {
+        self.state.take_context()
+    }
+}
+
 impl std::fmt::Debug for Acceptor<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Acceptor")
-            .field("established", &self.established)
-            .field("mechanism", &self.mech)
+            .field("established", &self.state.established)
+            .field("mechanism", &self.state.mech)
+            .finish_non_exhaustive()
+    }
+}
+
+/// An accept-side security context over a credential of its own, stepped
+/// one token at a time as an [`Acceptor`] is.
+///
+/// It owns the credential, so it moves between threads and outlives the
+/// call that made it, and an exchange that needs another leg can wait for
+/// it. A thread that accepts away from the one that keeps the key table
+/// acquires a credential of its own, as [`AcceptorCred::from_keytab`]
+/// does, and steps here.
+pub struct OwningAcceptor {
+    cred: AcceptorCred,
+    state: State,
+}
+
+// SAFETY: the credential is `Send` and read only, and the context is used
+// from one thread at a time, which the raw pointer field guarantees by
+// denying `Sync`, and the library binds neither to a thread.
+unsafe impl Send for OwningAcceptor {}
+
+impl OwningAcceptor {
+    /// Start an acceptor over `cred`, which it keeps.
+    pub fn new(cred: AcceptorCred) -> OwningAcceptor {
+        OwningAcceptor {
+            cred,
+            state: State::new(),
+        }
+    }
+
+    /// Feed one initiator token, as [`Acceptor::step`] does.
+    pub fn step(&mut self, token: &[u8]) -> Result<Step> {
+        self.state.step(self.cred.raw(), token)
+    }
+
+    /// Whether the context is established.
+    pub fn is_established(&self) -> bool {
+        self.state.established
+    }
+
+    /// The authenticated initiator, once established, as
+    /// [`Acceptor::source_name`] gives it.
+    pub fn source_name(&self) -> Option<&Name> {
+        self.state.source_name()
+    }
+
+    /// The mechanism that settled the context.
+    pub fn mechanism(&self) -> Option<&Oid> {
+        self.state.mech.as_ref()
+    }
+
+    /// The flags the established context reports.
+    pub fn flags(&self) -> ContextFlags {
+        self.state.flags
+    }
+
+    /// The credential it accepts with.
+    pub fn credential(&self) -> &AcceptorCred {
+        &self.cred
+    }
+
+    /// The established context on its own, as [`Acceptor::into_context`]
+    /// gives it, and the credential goes with this acceptor.
+    pub fn into_context(mut self) -> Result<Context> {
+        self.state.take_context()
+    }
+}
+
+impl std::fmt::Debug for OwningAcceptor {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OwningAcceptor")
+            .field("established", &self.state.established)
+            .field("mechanism", &self.state.mech)
             .finish_non_exhaustive()
     }
 }

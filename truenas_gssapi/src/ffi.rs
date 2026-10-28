@@ -19,6 +19,7 @@ use std::os::raw::{c_char, c_int, c_void};
 
 pub type OM_uint32 = u32;
 pub type gss_cred_usage_t = c_int;
+pub type gss_qop_t = OM_uint32;
 
 // Opaque handles, only held behind a pointer.
 pub enum gss_name_struct {}
@@ -69,6 +70,31 @@ pub struct gss_key_value_set_desc {
     pub elements: *mut gss_key_value_element_desc,
 }
 
+/// One buffer of an in place call (`gssapi_ext.h`), its kind and flags
+/// packed in `type_`, which the library reads or rewrites where it stands.
+#[repr(C)]
+pub struct gss_iov_buffer_desc {
+    pub type_: OM_uint32,
+    pub buffer: gss_buffer_desc,
+}
+
+// --- the kinds and flags of an IOV buffer --------------------------------
+/// Message bytes, signed and, under wrap, sealed in place.
+pub const GSS_IOV_BUFFER_TYPE_DATA: OM_uint32 = 1;
+/// The mechanism's header before the message.
+pub const GSS_IOV_BUFFER_TYPE_HEADER: OM_uint32 = 2;
+/// The mechanism's trailer after the message and its padding.
+pub const GSS_IOV_BUFFER_TYPE_TRAILER: OM_uint32 = 7;
+/// The padding between the message and the trailer.
+pub const GSS_IOV_BUFFER_TYPE_PADDING: OM_uint32 = 9;
+/// A whole wrap token, opened in place.
+pub const GSS_IOV_BUFFER_TYPE_STREAM: OM_uint32 = 10;
+/// Where a MIC is written.
+pub const GSS_IOV_BUFFER_TYPE_MIC_TOKEN: OM_uint32 = 12;
+/// The library allocated this buffer, and it is released with
+/// `gss_release_iov_buffer`.
+pub const GSS_IOV_BUFFER_FLAG_ALLOCATED: OM_uint32 = 0x0002_0000;
+
 // --- major-status layout --------------------------------------------------
 // One OM_uint32: calling errors in bits 24..32, routine errors in 16..24,
 // supplementary bits in 0..16.
@@ -103,6 +129,8 @@ pub const GSS_C_INDEFINITE: OM_uint32 = 0xffff_ffff;
 pub const GSS_C_GSS_CODE: c_int = 1;
 /// `gss_display_status`: the code is a mechanism minor status.
 pub const GSS_C_MECH_CODE: c_int = 2;
+/// The default quality of protection of a mechanism.
+pub const GSS_C_QOP_DEFAULT: gss_qop_t = 0;
 
 // Every declaration here is `unsafe` to call: raw pointers, no lifetimes,
 // and the C bindings' own preconditions. The safe wrappers uphold those.
@@ -209,6 +237,88 @@ unsafe extern "C" {
         minor_status: *mut OM_uint32,
         context_handle: *mut gss_ctx_id_t,
         output_token: gss_buffer_t,
+    ) -> OM_uint32;
+    pub fn gss_context_time(
+        minor_status: *mut OM_uint32,
+        context_handle: gss_ctx_id_t,
+        time_rec: *mut OM_uint32,
+    ) -> OM_uint32;
+    pub fn gss_get_mic(
+        minor_status: *mut OM_uint32,
+        context_handle: gss_ctx_id_t,
+        qop_req: gss_qop_t,
+        message_buffer: gss_buffer_t,
+        message_token: gss_buffer_t,
+    ) -> OM_uint32;
+    pub fn gss_verify_mic(
+        minor_status: *mut OM_uint32,
+        context_handle: gss_ctx_id_t,
+        message_buffer: gss_buffer_t,
+        message_token: gss_buffer_t,
+        qop_state: *mut gss_qop_t,
+    ) -> OM_uint32;
+    pub fn gss_wrap(
+        minor_status: *mut OM_uint32,
+        context_handle: gss_ctx_id_t,
+        conf_req_flag: c_int,
+        qop_req: gss_qop_t,
+        input_message_buffer: gss_buffer_t,
+        conf_state: *mut c_int,
+        output_message_buffer: gss_buffer_t,
+    ) -> OM_uint32;
+    pub fn gss_unwrap(
+        minor_status: *mut OM_uint32,
+        context_handle: gss_ctx_id_t,
+        input_message_buffer: gss_buffer_t,
+        output_message_buffer: gss_buffer_t,
+        conf_state: *mut c_int,
+        qop_state: *mut gss_qop_t,
+    ) -> OM_uint32;
+    // The in place calls of `gssapi_ext.h`, over a list of buffers.
+    pub fn gss_wrap_iov_length(
+        minor_status: *mut OM_uint32,
+        context_handle: gss_ctx_id_t,
+        conf_req_flag: c_int,
+        qop_req: gss_qop_t,
+        conf_state: *mut c_int,
+        iov: *mut gss_iov_buffer_desc,
+        iov_count: c_int,
+    ) -> OM_uint32;
+    pub fn gss_wrap_iov(
+        minor_status: *mut OM_uint32,
+        context_handle: gss_ctx_id_t,
+        conf_req_flag: c_int,
+        qop_req: gss_qop_t,
+        conf_state: *mut c_int,
+        iov: *mut gss_iov_buffer_desc,
+        iov_count: c_int,
+    ) -> OM_uint32;
+    pub fn gss_unwrap_iov(
+        minor_status: *mut OM_uint32,
+        context_handle: gss_ctx_id_t,
+        conf_state: *mut c_int,
+        qop_state: *mut gss_qop_t,
+        iov: *mut gss_iov_buffer_desc,
+        iov_count: c_int,
+    ) -> OM_uint32;
+    pub fn gss_get_mic_iov_length(
+        minor_status: *mut OM_uint32,
+        context_handle: gss_ctx_id_t,
+        qop_req: gss_qop_t,
+        iov: *mut gss_iov_buffer_desc,
+        iov_count: c_int,
+    ) -> OM_uint32;
+    pub fn gss_get_mic_iov(
+        minor_status: *mut OM_uint32,
+        context_handle: gss_ctx_id_t,
+        qop_req: gss_qop_t,
+        iov: *mut gss_iov_buffer_desc,
+        iov_count: c_int,
+    ) -> OM_uint32;
+    pub fn gss_release_iov_buffer(
+        minor_status: *mut OM_uint32,
+        iov: *mut gss_iov_buffer_desc,
+        iov_count: c_int,
     ) -> OM_uint32;
 }
 
