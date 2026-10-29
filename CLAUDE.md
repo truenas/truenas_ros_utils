@@ -176,6 +176,29 @@ context as a step loop: feed the initiator's token, send back any token the
 step yields, stop when it completes — Kerberos in one step, SPNEGO across an
 extra leg, the same loop either way.
 
+[`OwningAcceptor`](truenas_gssapi/src/accept.rs) runs the same loop over a
+credential of its own, so it is `Send`, moves to the thread that accepts,
+and can be kept for a second leg.
+
+[`Context`](truenas_gssapi/src/context.rs) is the established context taken
+out of an acceptor that completed. It owns itself, so it outlives the
+credential, and it binds `gss_get_mic`, `gss_verify_mic`, `gss_wrap`,
+`gss_unwrap` and `gss_context_time`, each under the mechanism's default
+quality of protection. The per message calls take `&mut self`, since the
+library advances the context's own sequence state in each, and the type is
+`Send` and not `Sync`, so one thread serves a context at a time. The
+lifetime a context reports is the one the initiator's ticket bounds.
+
+The calls that give a buffer back copy once. Beside them, `get_mic_into`
+appends a checksum to a buffer of the caller's, `get_mic_within` appends
+the checksum of bytes already in that buffer, `wrap_lengths` and
+`wrap_in_place` seal a message where it stands with the header, padding
+and trailer written around it, and `unwrap_in_place` opens a token inside
+itself and says where the message lies, through the library's IOV calls,
+so a consumer that protects large messages copies nothing. The tokens made
+in place are the tokens `gss_wrap` makes, and the live suite holds them to
+the initiator's plain calls in both directions.
+
 Identity comes from the mechanism, never a claim. The authenticated name is
 whatever the ticket proves; [`Name::localname`](truenas_gssapi/src/name.rs)
 maps it to a Unix account through the mechanism's own rules (`gss_localname`,
@@ -200,6 +223,11 @@ service key table, and a minimal initiator local to the test — the one place
 over both Kerberos and SPNEGO, then maps the result to a local account. It
 skips without the MIT KDC tools; `TRUENAS_GSSAPI_REQUIRE_KDC=1` makes the
 skip a failure.
+
+The initiator of that test also binds its own per message calls. The context
+taken out of each exchange signs, checks, seals and opens messages with that
+initiator in both directions, and a checksum or a token damaged on the way
+is held to be refused.
 
 The crate knows the GSSAPI accept side and nothing above it. The HTTP
 `Negotiate` framing, the account lookup, and what a mapped identity is

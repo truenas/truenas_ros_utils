@@ -1,20 +1,20 @@
 # SPDX-FileCopyrightText: 2026 iXsystems, Inc, DBA TrueNAS
 # SPDX-License-Identifier: MIT
 # `truenas_gssapi` — an acceptor over the system GSSAPI (`libgssapi_krb5`):
-# names, acceptor credentials from a key table, and the accept-side security
-# context loop, for SPNEGO and Kerberos.
+# names, acceptor credentials from a key table, the accept-side security
+# context loop, for SPNEGO and Kerberos, and the established context that
+# signs, checks, seals and opens messages.
 #
 # Links the system library because a GSSAPI exchange is only meaningful
 # against the host's Kerberos state — the keytab, `/etc/krb5.conf`, and the
 # mechanisms the mechglue carries. Build needs `libkrb5-dev`; runtime needs
 # `libgssapi-krb5-2`.
 #
-# Acceptor only: no initiator side and no per-message wrap/unwrap, which an
-# incoming Negotiate token does not need.
+# Acceptor only, with no initiator side.
 [package]
 name = "truenas_gssapi"
 version = "0.1.0"
-description = "A GSSAPI acceptor over the system libgssapi_krb5: names, keytab credentials, and the accept-side context loop for SPNEGO and Kerberos"
+description = "A GSSAPI acceptor over the system libgssapi_krb5: names, keytab credentials, the accept-side context loop for SPNEGO and Kerberos, and the per message calls of an established context"
 categories = ["authentication", "api-bindings"]
 keywords = ["gssapi", "spnego", "kerberos", "negotiate", "truenas"]
 edition.workspace = true

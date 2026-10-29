@@ -6,10 +6,13 @@
 //!
 //! [`AcceptorCred`] holds the identity tokens are checked against, drawn
 //! from a key table.
-//! [`Acceptor`] runs the accept side one token at a time. [`Name`] carries
-//! the authenticated initiator and maps it to a local account. There is no
-//! initiator side and no per-message wrap/unwrap: an HTTP `Negotiate`
-//! exchange authenticates and stops.
+//! [`Acceptor`] runs the accept side one token at a time, and
+//! [`OwningAcceptor`] does the same over a credential of its own, so that
+//! it can move to another thread and wait for a second leg. [`Name`] carries
+//! the authenticated initiator and maps it to a local account. [`Context`]
+//! is the established context taken out of an acceptor that completed,
+//! which signs, checks, seals and opens the messages that follow. There
+//! is no initiator side.
 //!
 //! ```no_run
 //! use truenas_gssapi::{AcceptorCred, Oid, Step};
@@ -44,7 +47,10 @@
 //! Every handle wraps a library object used from one thread at a time.
 //! [`AcceptorCred`] and [`Name`] are `Send` (immutable once built);
 //! [`Acceptor`] borrows a credential and is stepped in place, so one
-//! exchange stays on one thread. Nothing shares a handle across threads.
+//! exchange stays on one thread, while [`OwningAcceptor`] carries its
+//! credential and is `Send`. [`Context`] is `Send` and owns itself,
+//! so it may move to the thread that serves its messages. Nothing shares
+//! a handle across threads.
 //!
 //! # Errors
 //!
@@ -61,6 +67,7 @@
 
 mod accept;
 mod buf;
+mod context;
 mod cred;
 mod error;
 mod ffi;
@@ -68,7 +75,8 @@ mod name;
 mod oid;
 mod util;
 
-pub use accept::{Acceptor, ContextFlags, Step};
+pub use accept::{Acceptor, ContextFlags, OwningAcceptor, Step};
+pub use context::{Context, Opened, Unwrapped, WrapLengths};
 pub use cred::AcceptorCred;
 pub use error::{Error, Result, RoutineError};
 pub use name::Name;

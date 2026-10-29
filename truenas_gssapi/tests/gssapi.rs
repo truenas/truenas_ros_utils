@@ -11,7 +11,9 @@
 //! OIDs, errors) is checked directly.
 
 use std::process::Command;
-use truenas_gssapi::{Acceptor, AcceptorCred, Name, Oid, RoutineError};
+use truenas_gssapi::{
+    Acceptor, AcceptorCred, Context, Name, Oid, OwningAcceptor, RoutineError,
+};
 
 const MARKER: &str = "TRUENAS_GSSAPI_HERMETIC";
 
@@ -206,4 +208,6 @@ fn handles_are_send() {
     fn is_send<T: Send>() {}
     is_send::<AcceptorCred>();
     is_send::<Name>();
+    is_send::<Context>();
+    is_send::<OwningAcceptor>();
 }
