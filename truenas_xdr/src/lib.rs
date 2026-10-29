@@ -87,7 +87,8 @@
 //! lifetime and needs no attribute on its arms.
 //!
 //! [`VarArrayRef`] borrows a whole array. Decoding it reads each element
-//! once, to find where the array ends, and stores none of them.
+//! once, to find where the array ends, and stores none of them. [`ListRef`]
+//! borrows a whole list of optional data, RFC 4506 §4.19, the same way.
 //!
 //! # Decoding
 //!
@@ -109,8 +110,8 @@ pub use de::Deserializer;
 pub use error::{Error, Result};
 pub use strict::Strictness;
 pub use wrappers::{
-    Bounded, Counted, FixedOpaque, VarArrayIter, VarArrayRef, VarOpaque,
-    VarOpaqueCow, VarOpaqueRef,
+    Bounded, Counted, FixedOpaque, ListIter, ListRef, VarArrayIter,
+    VarArrayRef, VarOpaque, VarOpaqueCow, VarOpaqueRef,
 };
 
 #[cfg(feature = "derive")]
@@ -154,9 +155,9 @@ pub(crate) const SENTINEL_FIXED: &str = "\u{0}truenas-xdr-fixed-opaque";
 /// of a field count. Not a stable part of the API.
 pub(crate) const SENTINEL_BOUNDED: &str = "\u{0}truenas-xdr-bounded";
 
-/// Name by which [`VarArrayRef`] has the codec mark where an array starts, as
-/// a tuple struct, and hand back the input read since then, as a newtype. Not
-/// a stable part of the API.
+/// Name by which [`VarArrayRef`] and [`ListRef`] have the codec mark where
+/// an array or a list starts, as a tuple struct, and hand back the input read
+/// since then, as a newtype. Not a stable part of the API.
 pub(crate) const SENTINEL_ARRAY_REF: &str = "\u{0}truenas-xdr-array-ref";
 
 /// Zero padding needed to bring `len` up to a 4-byte boundary, `0..=3`.
