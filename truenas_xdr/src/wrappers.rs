@@ -665,6 +665,256 @@ impl Serialize for Encoded<'_> {
     }
 }
 
+/// A list of optional data borrowed from the input, RFC 4506 §4.19, which
+/// is how XDR links a chain (`T *next`). Each element comes behind a
+/// boolean of 1, and a boolean of 0 ends the list. It keeps the count and
+/// leaves the elements as the bytes they arrived in, the booleans included.
+///
+/// Decoding reads every element once, to find where the list ends, and
+/// stores none of them. A list of any length therefore costs no allocation
+/// of its own. [`iter`](Self::iter) decodes the elements again, one at a
+/// time, when they are wanted.
+///
+/// A value that was decoded encodes back to the bytes it came from. Two
+/// lists are equal when their counts and their bytes are.
+///
+/// ```
+/// # use truenas_xdr::{from_bytes, to_bytes, ListRef};
+/// let wire = [0, 0, 0, 1, 0, 0, 0, 7, 0, 0, 0, 1, 0, 0, 0, 8, 0, 0, 0, 0];
+/// let list: ListRef<'_, u32> = from_bytes(&wire)?;
+/// assert_eq!(list.len(), 2);
+/// let elements = list.iter().collect::<Result<Vec<u32>, _>>()?;
+/// assert_eq!(elements, [7, 8]);
+/// // The elements are the caller's bytes and not a copy of them.
+/// assert!(std::ptr::eq(list.encoded().as_ptr(), wire.as_ptr()));
+/// assert_eq!(to_bytes(&list)?, wire);
+/// # Ok::<(), truenas_xdr::Error>(())
+/// ```
+pub struct ListRef<'a, T> {
+    len: usize,
+    encoded: &'a [u8],
+    element: PhantomData<fn() -> T>,
+}
+
+impl<'a, T: Deserialize<'a>> ListRef<'a, T> {
+    /// The list that `encoded` holds whole, each element behind a boolean
+    /// of 1 and a boolean of 0 after the last.
+    ///
+    /// Every element is decoded once, to count them and to check that
+    /// `encoded` holds the list and nothing else. A list that runs short is
+    /// [`Error::Eof`](crate::Error::Eof) and bytes left over are
+    /// [`Error::TrailingBytes`](crate::Error::TrailingBytes).
+    pub fn from_encoded(encoded: &'a [u8]) -> crate::Result<Self> {
+        let mut de =
+            crate::Deserializer::new(encoded, crate::Strictness::Strict);
+        let mut len = 0;
+        while Option::<T>::deserialize(&mut de)?.is_some() {
+            len += 1;
+        }
+        match de.remaining().len() {
+            0 => Ok(ListRef {
+                len,
+                encoded,
+                element: PhantomData,
+            }),
+            rest => Err(crate::Error::TrailingBytes { rest }),
+        }
+    }
+
+    /// The elements in order, each decoded when it is reached.
+    ///
+    /// The bytes were decoded once already, so an element is not expected
+    /// to fail here. An error ends the iteration.
+    pub fn iter(&self) -> ListIter<'a, T> {
+        ListIter {
+            rest: self.encoded,
+            left: self.len,
+            element: PhantomData,
+        }
+    }
+}
+
+impl<'a, T> ListRef<'a, T> {
+    /// The number of elements.
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    /// Whether the list has no elements.
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// The list as it is encoded, the booleans included.
+    pub fn encoded(&self) -> &'a [u8] {
+        self.encoded
+    }
+}
+
+// The impls below are written out because a derive would ask the same of
+// `T`, and the list holds no `T`.
+
+impl<T> Clone for ListRef<'_, T> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<T> Copy for ListRef<'_, T> {}
+
+impl<T> Default for ListRef<'_, T> {
+    /// The empty list, which is the boolean of 0 alone.
+    fn default() -> Self {
+        ListRef {
+            len: 0,
+            encoded: &[0, 0, 0, 0],
+            element: PhantomData,
+        }
+    }
+}
+
+impl<T> PartialEq for ListRef<'_, T> {
+    fn eq(&self, other: &Self) -> bool {
+        self.len == other.len && self.encoded == other.encoded
+    }
+}
+
+impl<T> Eq for ListRef<'_, T> {}
+
+impl<T> std::hash::Hash for ListRef<'_, T> {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.len.hash(state);
+        self.encoded.hash(state);
+    }
+}
+
+impl<T> fmt::Debug for ListRef<'_, T> {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        f.debug_struct("ListRef")
+            .field("len", &self.len)
+            .field("encoded", &self.encoded)
+            .finish()
+    }
+}
+
+impl<T> Serialize for ListRef<'_, T> {
+    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        // The bytes are already XDR, the booleans among them.
+        Encoded(self.encoded).serialize(s)
+    }
+}
+
+impl<'de: 'a, 'a, T: Deserialize<'de>> Deserialize<'de> for ListRef<'a, T> {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        // The sentinel name has the codec mark where the list starts. The
+        // two fields are then the list and the span it turned out to cover.
+        d.deserialize_tuple_struct(
+            SENTINEL_ARRAY_REF,
+            2,
+            ListRefVisitor(PhantomData),
+        )
+    }
+}
+
+struct ListRefVisitor<'a, T>(PhantomData<ListRef<'a, T>>);
+
+impl<'de: 'a, 'a, T: Deserialize<'de>> Visitor<'de> for ListRefVisitor<'a, T> {
+    type Value = ListRef<'a, T>;
+
+    fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        f.write_str("a list of optional data to borrow")
+    }
+
+    fn visit_seq<A: SeqAccess<'de>>(
+        self,
+        mut fields: A,
+    ) -> Result<Self::Value, A::Error> {
+        let Some(ListCount(len, _)) = fields.next_element::<ListCount<T>>()?
+        else {
+            return Err(de::Error::invalid_length(0, &self));
+        };
+        let Some(Span(encoded)) = fields.next_element::<Span<'de>>()? else {
+            return Err(de::Error::invalid_length(1, &self));
+        };
+        Ok(ListRef {
+            len,
+            encoded,
+            element: PhantomData,
+        })
+    }
+}
+
+/// A list read for its count alone. Every element is decoded and dropped.
+struct ListCount<T>(usize, PhantomData<fn() -> T>);
+
+impl<'de, T: Deserialize<'de>> Deserialize<'de> for ListCount<T> {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        struct V<T>(PhantomData<fn() -> T>);
+        impl<'de, T: Deserialize<'de>> Visitor<'de> for V<T> {
+            type Value = ListCount<T>;
+            fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                f.write_str("a list of optional data")
+            }
+            fn visit_seq<A: SeqAccess<'de>>(
+                self,
+                mut elements: A,
+            ) -> Result<ListCount<T>, A::Error> {
+                let mut len = 0;
+                // Each element is optional data, a boolean and then the
+                // element behind a 1. The list has no count in front, so
+                // it is read as a tuple of no fixed length and ends at the
+                // boolean of 0.
+                while let Some(Some(_)) =
+                    elements.next_element::<Option<T>>()?
+                {
+                    len += 1;
+                }
+                Ok(ListCount(len, PhantomData))
+            }
+        }
+        d.deserialize_tuple(usize::MAX, V(PhantomData))
+    }
+}
+
+/// The elements of a [`ListRef`], decoded one at a time.
+pub struct ListIter<'a, T> {
+    rest: &'a [u8],
+    left: usize,
+    element: PhantomData<fn() -> T>,
+}
+
+impl<T> fmt::Debug for ListIter<'_, T> {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        f.debug_struct("ListIter")
+            .field("left", &self.left)
+            .field("rest", &self.rest)
+            .finish()
+    }
+}
+
+impl<'a, T: Deserialize<'a>> Iterator for ListIter<'a, T> {
+    type Item = crate::Result<T>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.left = self.left.checked_sub(1)?;
+        // As for an array, the list was read whole when it was decoded, so
+        // neither the strictness nor the depth is held again here.
+        let mut de =
+            crate::Deserializer::new(self.rest, crate::Strictness::Lenient)
+                .with_max_depth(usize::MAX);
+        let element = match Option::<T>::deserialize(&mut de) {
+            Ok(Some(element)) => Ok(element),
+            Ok(None) => Err(crate::Error::Eof { need: 0 }),
+            Err(error) => Err(error),
+        };
+        match element {
+            Ok(_) => self.rest = de.remaining(),
+            Err(_) => self.left = 0,
+        }
+        Some(element)
+    }
+}
+
 /// The elements of a [`VarArrayRef`], decoded one at a time.
 pub struct VarArrayIter<'a, T> {
     rest: &'a [u8],
