@@ -322,6 +322,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "truenas_metafmt"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "truenas_xdr",
+]
+
+[[package]]
 name = "truenas_nss"
 version = "0.1.0"
 dependencies = [

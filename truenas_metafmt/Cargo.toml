@@ -1,0 +1,31 @@
+# SPDX-FileCopyrightText: 2026 iXsystems, Inc, DBA TrueNAS
+# SPDX-License-Identifier: MIT
+# `truenas_metafmt` is the record of how a dataset's files are laid out on
+# disk, kept in the `trusted.truenas_metafmt` xattr of the dataset's root.
+#
+# It does no I/O, so a consumer reads and writes the xattr with the calls it
+# already has.
+[package]
+name = "truenas_metafmt"
+version = "0.1.0"
+description = "A versioned record of how a dataset's files are laid out on disk, with no I/O"
+categories = ["encoding", "filesystem"]
+keywords = ["xattr", "xdr", "dataset", "truenas"]
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+# The version is read before the body, so the union derive is not needed.
+truenas_xdr = { path = "../truenas_xdr", version = "0.1.0", default-features = false }
+
+[lints]
+workspace = true
+
+# The bytes of the record, written out by hand, and each comparison result.
+[[test]]
+name = "metafmt"
+path = "tests/metafmt.rs"

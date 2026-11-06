@@ -378,6 +378,34 @@ environment ([`tests/python_interop.rs`](truenas_mdb/tests/python_interop.rs)).
 It must be the distro package, which links `liblmdb0`; `pip install lmdb`
 bundles its own copy and would test nothing.
 
+## `truenas_metafmt`
+
+The record of how a dataset's files are laid out on disk: the charset of file
+names, SFM normalization, and the form of the xattr that holds a named stream.
+One record describes the dataset, whichever protocol writes to it, and it is
+kept in the `trusted.truenas_metafmt` xattr of the dataset's root. It is XDR
+through `truenas_xdr`, the one member this crate takes.
+
+Sans-io. `pack` and `unpack` convert a record, and `compare_stored` says how
+stored bytes relate to the settings a writer wants. Reading and writing the
+xattr, finding out whether a dataset holds files, and what to do about a
+`Verdict` are the consumer's. `Verdict::Newer` stays apart from
+`Verdict::Unreadable` because a record of a later version is not damaged.
+
+A change to the fields or to their meaning is a new version. `unpack` converts
+every version up to `VERSION` to the current fields, so a comparison goes by
+the fields and an older record with the wanted settings is `Verdict::Same`.
+The version is read before the body, so a later version is reported whatever
+its body holds.
+
+`unpack` is `Strictness::Strict`: one set of settings has one encoding.
+`pack` refuses a string with a NUL, which the codec would write and `unpack`
+would refuse, so no record is written that cannot be read.
+
+[`tests/metafmt.rs`](truenas_metafmt/tests/metafmt.rs) holds the bytes of each
+shape of the record, written out by hand from the definition in the crate
+documentation.
+
 ## `truenas_nss`
 
 Consumes the system NSS service modules directly: `libnss_files.so.2`,
