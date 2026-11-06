@@ -15,6 +15,7 @@ members = [
     "truenas_krb5",
     "truenas_ktls",
     "truenas_mdb",
+    "truenas_metafmt",
     "truenas_nss",
     "truenas_pam",
     "truenas_siphash",
