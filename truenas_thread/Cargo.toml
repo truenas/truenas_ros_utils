@@ -1,0 +1,28 @@
+# SPDX-FileCopyrightText: 2026 iXsystems, Inc, DBA TrueNAS
+# SPDX-License-Identifier: MIT
+# `truenas_thread` is the state of the calling thread that a server keeps
+# apart from the rest of its process, which so far is its umask.
+#
+# It calls `unshare(2)` and `umask(2)` through `libc` and links nothing else.
+[package]
+name = "truenas_thread"
+version = "0.1.0"
+description = "The umask of the calling thread, apart from the rest of its process"
+categories = ["os::unix-apis"]
+keywords = ["umask", "unshare", "thread"]
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+libc = "0.2.186"
+
+[lints]
+workspace = true
+
+# A thread's own umask, against the rest of the process.
+[[test]]
+name = "umask"
+path = "tests/umask.rs"

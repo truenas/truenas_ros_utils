@@ -20,6 +20,7 @@ other; depend on the one you need.
 | [`truenas_nss`](truenas_nss/) | Direct passwd, group, and group-membership lookups against the system NSS service modules (`libnss_files`, `libnss_sss`, `libnss_winbind`), bypassing `nsswitch.conf`, and netgroup membership and the names of addresses through glibc's `innetgr` and `getnameinfo` |
 | [`truenas_pam`](truenas_pam/) | A PAM client over the system `libpam`: transactions, and a login sequence driven one round at a time |
 | [`truenas_siphash`](truenas_siphash/) | SipHash-2-4, a keyed hash for short inputs, under a key that never prints itself |
+| [`truenas_thread`](truenas_thread/) | The umask of the calling thread, kept apart from the rest of its process through an `fs_struct` of its own |
 | [`truenas_xdr`](truenas_xdr/) | A serde codec for XDR (RFC 4506) |
 | [`truenas_xdr_derive`](truenas_xdr_derive/) | `XdrEnum` and `XdrUnion` derive macros, used through `truenas_xdr`'s `derive` feature |
 
@@ -38,6 +39,7 @@ other; depend on the one you need.
 - Nothing extra to build `truenas_jsonrpc`, `truenas_metafmt` or
   `truenas_xdr`; none links a C library and none needs anything at run time
 - Nothing extra to build or run `truenas_siphash`, which has no dependencies
+- Nothing extra to build or run `truenas_thread`
 - Nothing extra to build `truenas_chrony`; at run time it needs chronyd
   4.6.1 or later and root or the chrony user, and, where AppArmor mediates
   sends to pathname sockets, chronyd allowed to write
