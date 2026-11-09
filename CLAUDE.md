@@ -558,6 +558,20 @@ The crate knows SipHash-2-4 and nothing above it. Other round counts, the
 output of 128 bits and input given in pieces wait for a caller that needs
 them.
 
+## `truenas_thread`
+
+`unshare_fs` and `umask` are the crate's whole binding, so `lib.rs` lifts
+`unsafe_code` for both. A thread's umask lives in the `fs_struct` it shares
+with the rest of its process until it unshares one of its own, and the
+threads it creates after share that copy. The kernel keeps the permission
+bits of a umask alone, and the crate takes that as given.
+
+Each test unshares in a thread of its own, which ends with it, and reads a
+umask from `/proc/thread-self/status` rather than by setting one. The
+process's umask never changes, so tests that run at once see nothing of each
+other's, and an `unshare_fs` that did nothing shows as a umask that reached a
+thread which never set it.
+
 ## `truenas_xdr`
 
 Conforms to RFC 4506 (STD 67).

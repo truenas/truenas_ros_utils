@@ -19,6 +19,7 @@ members = [
     "truenas_nss",
     "truenas_pam",
     "truenas_siphash",
+    "truenas_thread",
     "truenas_xdr",
     "truenas_xdr_derive",
 ]
